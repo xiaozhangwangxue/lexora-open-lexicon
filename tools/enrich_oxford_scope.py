@@ -41,8 +41,9 @@ def unique(values: list[str], limit: int = 40) -> list[str]:
             break
     return result
 
-def init_state() -> sqlite3.Connection:
-    db = sqlite3.connect(STATE)
+def init_state(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
     db.execute("""CREATE TABLE IF NOT EXISTS provider_state(
       term TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
       attempts INTEGER NOT NULL DEFAULT 0, http_status INTEGER, last_error TEXT,
@@ -202,8 +203,8 @@ async def translate(client: httpx.AsyncClient, gate: HostGate, text: str) -> tup
     except Exception:
         return "", status, error or "translation missing"
 
-async def run(dataset: Path, limit: int, delay: float, workers: int, translation_delay: float, retry_after_hours: float) -> None:
-    state = init_state()
+async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers: int, translation_delay: float, retry_after_hours: float, start_id: int | None, end_id: int | None, shard_index: int | None, shard_count: int) -> None:
+    state = init_state(state_path)
     workers = max(1, workers)
     gates = {
         "edge": HostGate(delay, min(4, workers)),
@@ -215,7 +216,24 @@ async def run(dataset: Path, limit: int, delay: float, workers: int, translation
     client = httpx.AsyncClient(timeout=client_timeout, follow_redirects=True)
     try:
         db = sqlite3.connect(dataset)
-        rows = db.execute("SELECT id,word,normalized_word,definition,definition_zh,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,related_words_json,frequency,difficulty,enrichment_json FROM entries ORDER BY id").fetchall()
+        if shard_index is not None:
+            if shard_count < 1 or not 0 <= shard_index < shard_count:
+                raise ValueError("--shard-index must be within [0, --shard-count)")
+            min_id, max_id = db.execute("SELECT COALESCE(MIN(id), 0), COALESCE(MAX(id), -1) FROM entries").fetchone()
+            total = max(0, max_id - min_id + 1)
+            start_id = min_id + (total * shard_index) // shard_count
+            end_id = min_id + (total * (shard_index + 1)) // shard_count - 1
+        where: list[str] = []
+        params: list[int] = []
+        if start_id is not None:
+            where.append("id >= ?"); params.append(start_id)
+        if end_id is not None:
+            where.append("id <= ?"); params.append(end_id)
+        query = "SELECT id,word,normalized_word,definition,definition_zh,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,related_words_json,frequency,difficulty,enrichment_json FROM entries"
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY id"
+        rows = db.execute(query, params).fetchall()
         processed = 0
         async def process_row(row: tuple[Any, ...]) -> tuple[str, str]:
             entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, related_json, freq, diff, enrich_json = row
@@ -287,13 +305,20 @@ async def run(dataset: Path, limit: int, delay: float, workers: int, translation
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", type=Path, default=BUILD / "lexora-open-oxford-scope.sqlite")
+    ap.add_argument("--state", type=Path, default=STATE, help="provider state SQLite path")
     ap.add_argument("--limit", type=int, default=0, help="0 means all pending terms")
     ap.add_argument("--delay", type=float, default=0.5, help="minimum seconds between requests per provider host")
     ap.add_argument("--workers", type=int, default=16, help="number of terms processed concurrently")
     ap.add_argument("--translation-delay", type=float, default=1.0, help="minimum seconds between translation requests")
     ap.add_argument("--retry-after-hours", type=float, default=24.0, help="retry partial/not-found terms only after this many hours")
+    ap.add_argument("--start-id", type=int, default=None, help="inclusive entry ID start")
+    ap.add_argument("--end-id", type=int, default=None, help="inclusive entry ID end")
+    ap.add_argument("--shard-index", type=int, default=None, help="zero-based shard index")
+    ap.add_argument("--shard-count", type=int, default=1, help="number of contiguous shards")
     args = ap.parse_args()
-    asyncio.run(run(args.dataset, args.limit, args.delay, args.workers, args.translation_delay, args.retry_after_hours))
+    if args.shard_index is not None and (args.start_id is not None or args.end_id is not None):
+        ap.error("use either --shard-index/--shard-count or --start-id/--end-id, not both")
+    asyncio.run(run(args.dataset, args.state, args.limit, args.delay, args.workers, args.translation_delay, args.retry_after_hours, args.start_id, args.end_id, args.shard_index, args.shard_count))
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,24 @@
+[Unit]
+Description=Lexora open lexicon enrichment shard %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/opt/lexora
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/lexora/tools/enrich_oxford_scope.py \
+  --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+  --state /opt/lexora/state/shard-%i.sqlite \
+  --shard-index %i --shard-count 4 \
+  --workers 4 --delay 0.75 --translation-delay 1.5 --retry-after-hours 24
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/lexora/build /opt/lexora/state
+
+[Install]
+WantedBy=multi-user.target
