@@ -52,10 +52,11 @@ def init_state() -> sqlite3.Connection:
     return db
 
 class HostGate:
-    def __init__(self, interval: float):
+    def __init__(self, interval: float, concurrency: int = 1):
         self.interval = interval
         self.lock = asyncio.Lock()
         self.last = 0.0
+        self.semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def wait(self) -> None:
         async with self.lock:
@@ -66,8 +67,9 @@ class HostGate:
 
 async def request_json(client: httpx.AsyncClient, gate: HostGate, url: str, source: str, attempts: int = 3) -> tuple[Any | None, int | None, str | None]:
     for attempt in range(attempts):
-        await gate.wait()
+        await gate.semaphore.acquire()
         try:
+            await gate.wait()
             response = await client.get(url, headers={"User-Agent": "LexoraOpenLexicon/1.0 (open-data enrichment)"})
             if response.status_code == 200:
                 return response.json(), 200, None
@@ -82,6 +84,8 @@ async def request_json(client: httpx.AsyncClient, gate: HostGate, url: str, sour
                 await asyncio.sleep(min(60.0, 2 ** attempt))
             else:
                 return None, None, str(exc)
+        finally:
+            gate.semaphore.release()
     return None, None, f"{source} exhausted retries"
 
 def dictionary_fields(data: Any) -> dict[str, Any]:
@@ -115,6 +119,24 @@ def difficulty(score: float) -> str:
     if score >= 3.4: return "C1–C2"
     return "C2+"
 
+def should_process_marker(raw: str | None, retry_after_hours: float) -> bool:
+    """Resume efficiently without re-querying a recently attempted term."""
+    marker = json.loads(raw or "{}")
+    status = marker.get("status")
+    if not status:
+        return True
+    if status == "completed":
+        return False
+    last_attempt = marker.get("lastAttempt")
+    if not last_attempt:
+        return True
+    try:
+        attempted_at = dt.datetime.fromisoformat(last_attempt)
+        age = dt.datetime.now(dt.timezone.utc) - attempted_at
+        return age.total_seconds() >= max(0.0, retry_after_hours) * 3600
+    except ValueError:
+        return True
+
 async def enrich_term(client: httpx.AsyncClient, gates: dict[str, HostGate], term: str, state: sqlite3.Connection, existing: dict[str, Any]) -> dict[str, Any]:
     encoded = quote(term, safe="")
     urls = {
@@ -142,9 +164,16 @@ async def enrich_term(client: httpx.AsyncClient, gates: dict[str, HostGate], ter
         sources.append("datamuse_synonyms")
     if not existing.get("antonyms"):
         sources.append("datamuse_antonyms")
-    for source in sources:
+    async def fetch(source: str) -> tuple[str, Any | None, int | None, str | None]:
         gate = gates["datamuse"] if source.startswith("datamuse") else gates[source]
         data, status, error = await request_json(client, gate, urls[source], source)
+        return source, data, status, error
+
+    # Sources for one term are independent.  Fetching them together removes
+    # the previous per-term serial bottleneck while HostGate still limits each
+    # provider's request rate and in-flight concurrency.
+    fetched = await asyncio.gather(*(fetch(source) for source in sources))
+    for source, data, status, error in fetched:
         state.execute("""INSERT INTO provider_state(term,source,status,attempts,http_status,last_error,updated_at)
           VALUES(?,?,?,?,?,?,?) ON CONFLICT(term,source) DO UPDATE SET status=excluded.status,attempts=provider_state.attempts+1,http_status=excluded.http_status,last_error=excluded.last_error,updated_at=excluded.updated_at""",
           (term, source, "completed" if status == 200 else "failed", 1, status, error, now()))
@@ -173,9 +202,15 @@ async def translate(client: httpx.AsyncClient, gate: HostGate, text: str) -> tup
     except Exception:
         return "", status, error or "translation missing"
 
-async def run(dataset: Path, limit: int, delay: float) -> None:
+async def run(dataset: Path, limit: int, delay: float, workers: int, translation_delay: float, retry_after_hours: float) -> None:
     state = init_state()
-    gates = {name: HostGate(delay) for name in ("edge", "dictionary", "datamuse", "translation")}
+    workers = max(1, workers)
+    gates = {
+        "edge": HostGate(delay, min(4, workers)),
+        "dictionary": HostGate(delay, min(4, workers)),
+        "datamuse": HostGate(delay, min(8, workers)),
+        "translation": HostGate(max(delay, translation_delay), min(2, workers)),
+    }
     client_timeout = httpx.Timeout(20.0, connect=10.0)
     client = httpx.AsyncClient(timeout=client_timeout, follow_redirects=True)
     try:
@@ -222,10 +257,10 @@ async def run(dataset: Path, limit: int, delay: float) -> None:
         for row in rows:
             if limit and processed + len(pending) >= limit:
                 break
-            if json.loads(row[-1] or "{}").get("status") == "completed":
+            if not should_process_marker(row[-1], retry_after_hours):
                 continue
             pending.append(row)
-            if len(pending) < 8:
+            if len(pending) < workers:
                 continue
             results = await asyncio.gather(*(process_row(item) for item in pending), return_exceptions=True)
             for result in results:
@@ -253,9 +288,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", type=Path, default=BUILD / "lexora-open-oxford-scope.sqlite")
     ap.add_argument("--limit", type=int, default=0, help="0 means all pending terms")
-    ap.add_argument("--delay", type=float, default=1.0, help="minimum seconds between requests per provider host")
+    ap.add_argument("--delay", type=float, default=0.5, help="minimum seconds between requests per provider host")
+    ap.add_argument("--workers", type=int, default=16, help="number of terms processed concurrently")
+    ap.add_argument("--translation-delay", type=float, default=1.0, help="minimum seconds between translation requests")
+    ap.add_argument("--retry-after-hours", type=float, default=24.0, help="retry partial/not-found terms only after this many hours")
     args = ap.parse_args()
-    asyncio.run(run(args.dataset, args.limit, args.delay))
+    asyncio.run(run(args.dataset, args.limit, args.delay, args.workers, args.translation_delay, args.retry_after_hours))
 
 if __name__ == "__main__":
     main()
