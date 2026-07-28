@@ -10,14 +10,14 @@
     "full_600k": {
       "file": "lexora-english-600k.sqlite",
       "rows": 600000,
-      "bytes": 411316224,
-      "sha256": "00830f50a3f0adc5ba7bdb0b4c8a8fe28ad3951dd11efeadc70249e03cba42cb"
+      "bytes": 509063168,
+      "sha256": "385b4f24711f0a1c678c20ea2b0002f83fce138edd582b166b1db038f80178c2"
     },
     "frequency_20k": {
       "file": "lexora-frequency-20k.sqlite",
       "rows": 20000,
-      "bytes": 22900736,
-      "sha256": "58942c18a67a8c924802543f2d000aeb259b215c22ef725e319a5be243fc1789"
+      "bytes": 26075136,
+      "sha256": "557bdede2e07d30ec7123ffa817b24e95197ce07592b68d5088121fc51a367d8"
     }
   }
 }
