@@ -1,0 +1,8 @@
+.venv/
+source/*.gz
+source/ecdict.csv
+ssh/
+build/*.sqlite
+build/*.sqlite-*
+__pycache__/
+*.pyc
