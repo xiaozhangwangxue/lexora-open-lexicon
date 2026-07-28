@@ -4,6 +4,7 @@ source/ecdict.csv
 ssh/
 build/*.sqlite
 build/*.sqlite-*
+build/*.sqlite.zst
 __pycache__/
 *.pyc
 .DS_Store
