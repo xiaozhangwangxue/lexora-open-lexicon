@@ -28,3 +28,9 @@ curl http://127.0.0.1:8080/v1/suggest?prefix=wor
 
 See `LICENSES.md` before redistributing. This is an open-data English lexicon,
 not a copy of Oxford/OED proprietary definitions.
+
+## Downloads
+
+The current SQLite snapshots are published as release assets:
+
+https://github.com/xiaozhangwangxue/lexora-open-lexicon/releases/tag/lexicon-2026.07
