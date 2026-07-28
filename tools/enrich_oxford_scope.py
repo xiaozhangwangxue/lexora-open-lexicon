@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import datetime as dt
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -21,7 +22,7 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
 STATE = BUILD / "oxford-enrichment-state.sqlite"
-SOURCES = ("edge", "dictionary", "datamuse_related", "datamuse_exact", "datamuse_synonyms", "datamuse_antonyms", "translation")
+EDGE_BASE = os.environ.get("LEXORA_EDGE_URL", "").rstrip("/")
 
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -114,23 +115,41 @@ def difficulty(score: float) -> str:
     if score >= 3.4: return "C1–C2"
     return "C2+"
 
-async def enrich_term(client: httpx.AsyncClient, gates: dict[str, HostGate], term: str, state: sqlite3.Connection) -> dict[str, Any]:
+async def enrich_term(client: httpx.AsyncClient, gates: dict[str, HostGate], term: str, state: sqlite3.Connection, existing: dict[str, Any]) -> dict[str, Any]:
     encoded = quote(term, safe="")
     urls = {
-      "edge": f"https://lexora.12323456.xyz/api/dictionary/full?term={encoded}",
+      "edge": f"{EDGE_BASE}/api/dictionary/full?term={encoded}" if EDGE_BASE else "",
       "dictionary": f"https://api.dictionaryapi.dev/api/v2/entries/en/{encoded}",
       "datamuse_related": f"https://api.datamuse.com/words?ml={encoded}&md=dfr&ipa=1&max=30",
       "datamuse_exact": f"https://api.datamuse.com/words?sp={encoded}&md=dfrp&ipa=1&max=8",
       "datamuse_synonyms": f"https://api.datamuse.com/words?rel_syn={encoded}&md=f&max=12",
       "datamuse_antonyms": f"https://api.datamuse.com/words?rel_ant={encoded}&max=12",
     }
-    result: dict[str, Any] = {"_statuses": []}
-    for source in ("edge", "dictionary", "datamuse_related", "datamuse_exact", "datamuse_synonyms", "datamuse_antonyms"):
-        data, status, error = await request_json(client, gates[source.split("_")[-1] if source.startswith("datamuse") else source], urls[source], source)
+    result: dict[str, Any] = {"_statuses": [], "_attempted": []}
+    sources: list[str] = []
+    needs_definition = not existing.get("definition")
+    needs_phonetic = not existing.get("us") or not existing.get("uk")
+    needs_examples = not existing.get("examples")
+    if EDGE_BASE and (needs_definition or needs_phonetic or needs_examples):
+        sources.append("edge")
+    if needs_definition or needs_phonetic or needs_examples:
+        sources.append("dictionary")
+    if not existing.get("related"):
+        sources.append("datamuse_related")
+    if needs_definition:
+        sources.append("datamuse_exact")
+    if not existing.get("synonyms"):
+        sources.append("datamuse_synonyms")
+    if not existing.get("antonyms"):
+        sources.append("datamuse_antonyms")
+    for source in sources:
+        gate = gates["datamuse"] if source.startswith("datamuse") else gates[source]
+        data, status, error = await request_json(client, gate, urls[source], source)
         state.execute("""INSERT INTO provider_state(term,source,status,attempts,http_status,last_error,updated_at)
           VALUES(?,?,?,?,?,?,?) ON CONFLICT(term,source) DO UPDATE SET status=excluded.status,attempts=provider_state.attempts+1,http_status=excluded.http_status,last_error=excluded.last_error,updated_at=excluded.updated_at""",
           (term, source, "completed" if status == 200 else "failed", 1, status, error, now()))
         result["_statuses"].append("completed" if status == 200 else "failed")
+        result["_attempted"].append(source)
         if source == "dictionary": result.update(dictionary_fields(data))
         elif source.startswith("datamuse"):
             parsed = datamuse_fields(data)
@@ -156,7 +175,7 @@ async def translate(client: httpx.AsyncClient, gate: HostGate, text: str) -> tup
 
 async def run(dataset: Path, limit: int, delay: float) -> None:
     state = init_state()
-    gates = {name: HostGate(delay) for name in ("edge", "dictionary", "related", "exact", "synonyms", "antonyms", "translation")}
+    gates = {name: HostGate(delay) for name in ("edge", "dictionary", "datamuse", "translation")}
     client_timeout = httpx.Timeout(20.0, connect=10.0)
     client = httpx.AsyncClient(timeout=client_timeout, follow_redirects=True)
     try:
@@ -168,7 +187,14 @@ async def run(dataset: Path, limit: int, delay: float) -> None:
             entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, related_json, freq, diff, enrich_json = row
             marker = json.loads(enrich_json or "{}")
             if marker.get("status") == "completed": continue
-            data = await enrich_term(client, gates, term, state)
+            existing = {
+                "definition": definition or "", "us": us or "", "uk": uk or "",
+                "examples": json.loads(examples_json or "[]"),
+                "synonyms": json.loads(synonyms_json or "[]"),
+                "antonyms": json.loads(antonyms_json or "[]"),
+                "related": json.loads(related_json or "[]"),
+            }
+            data = await enrich_term(client, gates, term, state, existing)
             definition = definition or data.get("definition", "")
             us = us or data.get("us", "") or data.get("us_phonetic", "")
             uk = uk or data.get("uk", "") or data.get("uk_phonetic", "")
@@ -185,7 +211,8 @@ async def run(dataset: Path, limit: int, delay: float) -> None:
                 data.setdefault("_statuses", []).append("completed" if zh else "failed")
             score = max(float(freq or 0), float(data.get("frequency", 0) or 0))
             statuses = data.pop("_statuses", [])
-            marker_status = "completed" if statuses and all(item == "completed" for item in statuses) else ("partial" if any(statuses) and any(item == "completed" for item in statuses) else "not_found")
+            attempted = data.pop("_attempted", [])
+            marker_status = "completed" if not attempted or all(item == "completed" for item in statuses) else ("partial" if any(item == "completed" for item in statuses) else "not_found")
             marker = {"status": marker_status, "lastAttempt": now(), "sources": sorted(set(["open-data", "network"]))}
             db.execute("""UPDATE entries SET definition=?,definition_zh=?,us_phonetic=?,uk_phonetic=?,synonyms_json=?,antonyms_json=?,examples_json=?,related_words_json=?,frequency=?,difficulty=?,enrichment_json=? WHERE id=?""",
               (definition, zh, us, uk, j(synonyms), j(antonyms), j(examples), j(related), score, diff or difficulty(score), j(marker), entry_id))
