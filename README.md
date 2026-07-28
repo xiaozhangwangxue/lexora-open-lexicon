@@ -18,6 +18,19 @@ python tools/build_dataset.py
 The builder streams the compressed Wiktionary dump and never loads it all into
 memory. It writes FTS5 indexes and `build/manifest.json` plus a coverage report.
 
+## Oxford-oriented open-data scope
+
+```bash
+python tools/build_oxford_scope.py
+python tools/enrich_oxford_scope.py --limit 100
+```
+
+The second command is resumable and rate-limited. Omit `--limit` to process
+all pending terms. It creates `lexora-open-oxford-scope.sqlite`, the extracted
+`lexora-open-oxford-frequency-20k.sqlite`, and a separate
+`build/oxford-enrichment-state.sqlite`. This scope is an open-data approximation
+of Oxford-oriented vocabulary, not an official Oxford/OED dataset.
+
 ## API
 
 ```bash

@@ -14,7 +14,12 @@ BUILD = ROOT / "build"
 app = FastAPI(title="Lexora Open Lexicon API", version="1.0")
 
 def db_path(dataset: str) -> Path:
-    name = {"full": "lexora-english-600k.sqlite", "top20k": "lexora-frequency-20k.sqlite"}.get(dataset, "lexora-frequency-20k.sqlite")
+    name = {
+        "full": "lexora-english-600k.sqlite",
+        "top20k": "lexora-frequency-20k.sqlite",
+        "oxford": "lexora-open-oxford-scope.sqlite",
+        "oxford20k": "lexora-open-oxford-frequency-20k.sqlite",
+    }.get(dataset, "lexora-frequency-20k.sqlite")
     path = BUILD / name
     if not path.exists():
         raise HTTPException(503, "dataset is not built")
@@ -22,7 +27,7 @@ def db_path(dataset: str) -> Path:
 
 def row_json(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
-    for field in ("synonyms_json", "antonyms_json", "examples_json", "phrases_json", "related_words_json", "senses_json", "source_json"):
+    for field in ("synonyms_json", "antonyms_json", "examples_json", "phrases_json", "related_words_json", "senses_json", "source_json", "scope_json", "enrichment_json"):
         key = field[:-5] if field.endswith("_json") else field
         result[key] = json.loads(result.pop(field) or "[]")
     return result
@@ -36,6 +41,13 @@ def manifest():
     path = BUILD / "manifest.json"
     if not path.exists():
         raise HTTPException(503, "manifest is not built")
+    return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+
+@app.get("/oxford-manifest")
+def oxford_manifest():
+    path = BUILD / "oxford-scope-manifest.json"
+    if not path.exists():
+        raise HTTPException(503, "Oxford-oriented scope is still building")
     return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
 
 @app.get("/v1/lookup")
@@ -74,7 +86,7 @@ def suggest(prefix: str = Query(min_length=1, max_length=80), dataset: str = "to
 
 @app.api_route("/downloads/{filename}", methods=["GET", "HEAD"])
 def download(filename: str):
-    if filename not in {"lexora-english-600k.sqlite", "lexora-frequency-20k.sqlite", "manifest.json"}:
+    if filename not in {"lexora-english-600k.sqlite", "lexora-frequency-20k.sqlite", "lexora-open-oxford-scope.sqlite", "lexora-open-oxford-frequency-20k.sqlite", "manifest.json", "oxford-scope-manifest.json"}:
         raise HTTPException(404, "file not found")
     path = BUILD / filename
     if not path.exists():
