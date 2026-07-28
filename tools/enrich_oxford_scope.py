@@ -182,11 +182,9 @@ async def run(dataset: Path, limit: int, delay: float) -> None:
         db = sqlite3.connect(dataset)
         rows = db.execute("SELECT id,word,normalized_word,definition,definition_zh,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,related_words_json,frequency,difficulty,enrichment_json FROM entries ORDER BY id").fetchall()
         processed = 0
-        for row in rows:
-            if limit and processed >= limit: break
+        async def process_row(row: tuple[Any, ...]) -> tuple[str, str]:
             entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, related_json, freq, diff, enrich_json = row
             marker = json.loads(enrich_json or "{}")
-            if marker.get("status") == "completed": continue
             existing = {
                 "definition": definition or "", "us": us or "", "uk": uk or "",
                 "examples": json.loads(examples_json or "[]"),
@@ -218,9 +216,35 @@ async def run(dataset: Path, limit: int, delay: float) -> None:
               (definition, zh, us, uk, j(synonyms), j(antonyms), j(examples), j(related), score, diff or difficulty(score), j(marker), entry_id))
             db.execute("""INSERT OR REPLACE INTO entries_fts(rowid,word,definition,definition_zh,examples,phrases)
               SELECT id,word,definition,definition_zh,examples_json,phrases_json FROM entries WHERE id=?""", (entry_id,))
-            db.commit(); state.commit(); processed += 1
-            if processed % 25 == 0:
-                print(f"enriched={processed} term={term} status={marker_status}", flush=True)
+            db.commit(); state.commit()
+            return term, marker_status
+        pending: list[tuple[Any, ...]] = []
+        for row in rows:
+            if limit and processed + len(pending) >= limit:
+                break
+            if json.loads(row[-1] or "{}").get("status") == "completed":
+                continue
+            pending.append(row)
+            if len(pending) < 8:
+                continue
+            results = await asyncio.gather(*(process_row(item) for item in pending), return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    print(f"enrichment-error={result!r}", flush=True)
+                else:
+                    processed += 1
+                    if processed % 25 == 0:
+                        print(f"enriched={processed} term={result[0]} status={result[1]}", flush=True)
+            pending.clear()
+        if pending:
+            results = await asyncio.gather(*(process_row(item) for item in pending), return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    print(f"enrichment-error={result!r}", flush=True)
+                else:
+                    processed += 1
+                    if processed % 25 == 0:
+                        print(f"enriched={processed} term={result[0]} status={result[1]}", flush=True)
         db.close()
     finally:
         await client.aclose(); state.close()
