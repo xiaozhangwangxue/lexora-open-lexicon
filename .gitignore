@@ -5,6 +5,7 @@ ssh/
 build/*.sqlite
 build/*.sqlite-*
 build/*.sqlite.zst
+build/*.log
 __pycache__/
 *.pyc
 .DS_Store

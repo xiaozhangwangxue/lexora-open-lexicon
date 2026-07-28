@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "scope": "open-data approximation of Oxford-oriented vocabulary",
+  "built_at": "2026-07-28T04:34:57.131975+00:00",
+  "candidate_sources": [
+    "ECDICT",
+    "English Wiktionary/Wiktextract",
+    "wordfreq"
+  ],
+  "counts": {
+    "ecdict_rows_seen": 766337,
+    "kaikki_words_seen": 1357586
+  },
+  "datasets": {
+    "scope": {
+      "file": "lexora-open-oxford-scope.sqlite",
+      "rows": 1772276,
+      "bytes": 1142591488,
+      "sha256": "092133f2815951d8ba25503b6ac1f0fb5bd15e8417aa5bb895ff6c82868b3d7b"
+    },
+    "frequency_20k": {
+      "file": "lexora-open-oxford-frequency-20k.sqlite",
+      "rows": 20000,
+      "bytes": 24211456,
+      "sha256": "24491ae21d876728a8723f3b80849da5dd9950af18a0ddb04f5ab517b16310ff"
+    }
+  }
+}
