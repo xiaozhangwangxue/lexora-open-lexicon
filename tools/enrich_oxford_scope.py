@@ -219,6 +219,8 @@ async def run(dataset: Path, limit: int, delay: float) -> None:
             db.execute("""INSERT OR REPLACE INTO entries_fts(rowid,word,definition,definition_zh,examples,phrases)
               SELECT id,word,definition,definition_zh,examples_json,phrases_json FROM entries WHERE id=?""", (entry_id,))
             db.commit(); state.commit(); processed += 1
+            if processed % 25 == 0:
+                print(f"enriched={processed} term={term} status={marker_status}", flush=True)
         db.close()
     finally:
         await client.aclose(); state.close()
