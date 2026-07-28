@@ -97,8 +97,8 @@ def dictionary_fields(data: Any) -> dict[str, Any]:
             for item in meaning.get("definitions", []) or []:
                 if item.get("definition"): definitions.append(item["definition"])
                 if item.get("example"): examples.append(item["example"])
-            synonyms.extend(x.get("word", "") for x in meaning.get("synonyms", []) or [])
-            antonyms.extend(x.get("word", "") for x in meaning.get("antonyms", []) or [])
+            synonyms.extend((x.get("word", "") if isinstance(x, dict) else str(x)) for x in meaning.get("synonyms", []) or [])
+            antonyms.extend((x.get("word", "") if isinstance(x, dict) else str(x)) for x in meaning.get("antonyms", []) or [])
     return {"definition": "\n".join(unique(definitions, 24)), "examples": unique(examples, 8), "synonyms": unique(synonyms), "antonyms": unique(antonyms), "us": us, "uk": uk}
 
 def datamuse_fields(data: Any) -> dict[str, Any]:
