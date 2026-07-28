@@ -4,8 +4,8 @@
 
 | Asset | Rows | Size | SHA-256 |
 |---|---:|---:|---|
-| `lexora-english-600k.sqlite` | 600,000 | 411,316,224 bytes | `00830f50a3f0adc5ba7bdb0b4c8a8fe28ad3951dd11efeadc70249e03cba42cb` |
-| `lexora-frequency-20k.sqlite` | 20,000 | 22,900,736 bytes | `58942c18a67a8c924802543f2d000aeb259b215c22ef725e319a5be243fc1789` |
+| `lexora-english-600k.sqlite` | 600,000 | 509,063,168 bytes | `385b4f24711f0a1c678c20ea2b0002f83fce138edd582b166b1db038f80178c2` |
+| `lexora-frequency-20k.sqlite` | 20,000 | 26,075,136 bytes | `557bdede2e07d30ec7123ffa817b24e95197ce07592b68d5088121fc51a367d8` |
 
 Both snapshots include exact, normalized, prefix and FTS5 indexes. The builder
 uses wordfreq Zipf scores, falling back to ECDICT frequency rank only when a

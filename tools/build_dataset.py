@@ -183,6 +183,7 @@ def extract_kaikki(data: dict[str, Any]) -> dict[str, Any]:
         "synonyms": clean_list(synonyms),
         "antonyms": clean_list(antonyms),
         "related": clean_list(related),
+        "phrases": clean_list([x for x in related if " " in x or "-" in x]),
         "senses": senses[:24],
         "us": us,
         "uk": uk,
@@ -197,15 +198,15 @@ def merge_kaikki(db: sqlite3.Connection, selected: set[str]) -> int:
         nonlocal updated, aggregate, current_key
         if not current_key or not aggregate:
             return
-        row = db.execute("SELECT pos,definition,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,related_words_json,senses_json,source_json FROM entries WHERE normalized_word=?", (current_key,)).fetchone()
+        row = db.execute("SELECT pos,definition,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,phrases_json,related_words_json,senses_json,source_json FROM entries WHERE normalized_word=?", (current_key,)).fetchone()
         if not row:
             return
         def combine_json(index: int, new: list[str]) -> list[str]:
             old = json.loads(row[index] or "[]")
             return clean_list([*old, *new])
-        sources = clean_list([*json.loads(row[9] or "[]"), "kaikki"])
+        sources = clean_list([*json.loads(row[10] or "[]"), "kaikki"])
         db.execute("""UPDATE entries SET pos=?, definition=?, us_phonetic=?, uk_phonetic=?,
-          synonyms_json=?, antonyms_json=?, examples_json=?, related_words_json=?, senses_json=?, source_json=?
+          synonyms_json=?, antonyms_json=?, examples_json=?, phrases_json=?, related_words_json=?, senses_json=?, source_json=?
           WHERE normalized_word=?""", (
             row[0] or aggregate["pos"],
             "\n".join(clean_list([row[1] or "", aggregate["definition"]], 24)),
@@ -213,8 +214,9 @@ def merge_kaikki(db: sqlite3.Connection, selected: set[str]) -> int:
             json_text(combine_json(4, aggregate["synonyms"])),
             json_text(combine_json(5, aggregate["antonyms"])),
             json_text(combine_json(6, aggregate["examples"])),
-            json_text(combine_json(7, aggregate["related"])),
-            json_text([*json.loads(row[8] or "[]"), *aggregate["senses"]]),
+            json_text(combine_json(7, aggregate["phrases"])),
+            json_text(combine_json(8, aggregate["related"])),
+            json_text([*json.loads(row[9] or "[]"), *aggregate["senses"]]),
             json_text(sources), current_key))
         updated += 1
     with gzip.open(path, "rt", encoding="utf-8") as fh:
@@ -236,7 +238,7 @@ def merge_kaikki(db: sqlite3.Connection, selected: set[str]) -> int:
                 item = extract_kaikki(data)
                 for k in ("definition",):
                     aggregate[k] = "\n".join(clean_list([aggregate[k], item[k]], 24))
-                for k in ("synonyms", "antonyms", "examples", "related", "senses"):
+                for k in ("synonyms", "antonyms", "examples", "related", "phrases", "senses"):
                     aggregate[k].extend(item[k])
                     aggregate[k] = clean_list(aggregate[k]) if k != "senses" else aggregate[k][:24]
                 aggregate["us"] = aggregate["us"] or item["us"]
@@ -252,8 +254,8 @@ def make_db(name: str, keys: list[str], records: dict[str, dict[str, Any]], scor
     db.executescript(SCHEMA)
     for rank, key in enumerate(keys, 1):
         row = records[key]
-        db.execute("""INSERT INTO entries(word,normalized_word,pos,frequency,frequency_rank,definition,definition_zh,us_phonetic,uk_phonetic,source_json)
-          VALUES(?,?,?,?,?,?,?,?,?,?)""", (row["word"], key, row["pos"], scores[key], rank, row["definition"], row["translation"], row["phonetic"], row["phonetic"], json_text(["ecdict"])))
+        db.execute("""INSERT INTO entries(word,normalized_word,pos,frequency,frequency_rank,definition,definition_zh,us_phonetic,uk_phonetic,phrases_json,source_json)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (row["word"], key, row["pos"], scores[key], rank, row["definition"], row["translation"], row["phonetic"], row["phonetic"], json_text([row["word"]] if " " in row["word"] or "-" in row["word"] else []), json_text(["ecdict"])))
     db.commit()
     merge_kaikki(db, set(keys))
     db.execute("DELETE FROM entries_fts")
