@@ -23,6 +23,7 @@ memory. It writes FTS5 indexes and `build/manifest.json` plus a coverage report.
 ```bash
 python tools/build_oxford_scope.py
 python tools/enrich_oxford_scope.py --limit 100
+python tools/finalize_oxford_scope.py
 ```
 
 The second command is resumable and rate-limited. Omit `--limit` to process
