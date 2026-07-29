@@ -383,6 +383,10 @@ class EdgeDictionaryBatcher:
             "examples": True,
             "frequency": True,
             "deep": self.profile == "deep",
+            "synonyms": self.profile == "deep",
+            "antonyms": self.profile == "deep",
+            "phrases": self.profile == "deep",
+            "related": self.profile == "deep",
             "usPhonetic": True,
             "ukPhonetic": True,
         }
@@ -396,6 +400,10 @@ class EdgeDictionaryBatcher:
                 "examples",
                 "frequency",
                 "deep",
+                "synonyms",
+                "antonyms",
+                "phrases",
+                "related",
                 "usPhonetic",
                 "ukPhonetic",
             )
@@ -771,6 +779,22 @@ def dictionary_fields(data: Any) -> dict[str, Any]:
             for item in meaning.get("definitions", []) or []:
                 if item.get("definition"): definitions.append(item["definition"])
                 if item.get("example"): examples.append(item["example"])
+                synonyms.extend(
+                    (
+                        x.get("word", "")
+                        if isinstance(x, dict)
+                        else str(x)
+                    )
+                    for x in item.get("synonyms", []) or []
+                )
+                antonyms.extend(
+                    (
+                        x.get("word", "")
+                        if isinstance(x, dict)
+                        else str(x)
+                    )
+                    for x in item.get("antonyms", []) or []
+                )
             synonyms.extend((x.get("word", "") if isinstance(x, dict) else str(x)) for x in meaning.get("synonyms", []) or [])
             antonyms.extend((x.get("word", "") if isinstance(x, dict) else str(x)) for x in meaning.get("antonyms", []) or [])
     return {
@@ -980,6 +1004,21 @@ def needs_deep_enrichment(
     )
 
 
+def deep_enrichment_needs(
+    synonyms: Any,
+    antonyms: Any,
+    phrases: Any,
+    related: Any,
+) -> dict[str, bool]:
+    """Return the exact relationship fields absent from the local row."""
+    return {
+        "synonyms": not bool(synonyms),
+        "antonyms": not bool(antonyms),
+        "phrases": not bool(phrases),
+        "related": not bool(related),
+    }
+
+
 def needs_deep_profile_pass(
     raw: str | None,
     profile: str,
@@ -1059,15 +1098,22 @@ async def enrich_term(
     needs_phonetic = needs_phonetic_repair(existing.get("us")) or needs_phonetic_repair(existing.get("uk"))
     needs_examples = not existing.get("examples")
     needs_frequency = needs_frequency_repair(existing.get("frequency"))
-    needs_deep = (
-        profile == "deep"
-        and needs_deep_enrichment(
+    deep_needs = (
+        deep_enrichment_needs(
             existing.get("synonyms"),
             existing.get("antonyms"),
             existing.get("phrases"),
             existing.get("related"),
         )
+        if profile == "deep"
+        else {
+            "synonyms": False,
+            "antonyms": False,
+            "phrases": False,
+            "related": False,
+        }
     )
+    needs_deep = any(deep_needs.values())
     needs_network = any(
         (
             needs_definition,
@@ -1083,13 +1129,13 @@ async def enrich_term(
     elif needs_definition or needs_phonetic or needs_examples:
         sources.append("dictionary")
     if not EDGE_BASE:
-        if not existing.get("related") or not existing.get("phrases"):
+        if deep_needs["related"] or deep_needs["phrases"]:
             sources.append("datamuse_related")
         if needs_definition or needs_pos or needs_frequency:
             sources.append("datamuse_exact")
-        if not existing.get("synonyms"):
+        if deep_needs["synonyms"]:
             sources.append("datamuse_synonyms")
-        if not existing.get("antonyms"):
+        if deep_needs["antonyms"]:
             sources.append("datamuse_antonyms")
     async def fetch(source: str) -> tuple[str, Any | None, int | None, str | None]:
         if source == "edge" and edge_batcher is not None:
@@ -1102,6 +1148,10 @@ async def enrich_term(
                     "examples": needs_examples,
                     "frequency": needs_frequency,
                     "deep": needs_deep,
+                    "synonyms": deep_needs["synonyms"],
+                    "antonyms": deep_needs["antonyms"],
+                    "phrases": deep_needs["phrases"],
+                    "related": deep_needs["related"],
                     # The public need remains ``phonetic``.  The two optional
                     # dialect hints let the edge avoid spending an exact
                     # lookup when only a UK transcription is absent:

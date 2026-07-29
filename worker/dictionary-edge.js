@@ -186,24 +186,39 @@ const enrichmentNeedNames = [
   "examples",
   "frequency",
   "deep",
+  "synonyms",
+  "antonyms",
+  "phrases",
+  "related",
   "usPhonetic",
   "ukPhonetic",
 ];
 
 function legacyEnrichmentNeeds(profile) {
+  const deep = profile === "deep";
   return {
     definition: true,
     pos: true,
     phonetic: true,
     examples: true,
     frequency: true,
-    deep: profile === "deep",
+    deep,
+    synonyms: deep,
+    antonyms: deep,
+    phrases: deep,
+    related: deep,
     usPhonetic: true,
     ukPhonetic: true,
   };
 }
 
 function normalizeEnrichmentNeeds(value, profile, legacy = false) {
+  const granularDeepNames = [
+    "synonyms",
+    "antonyms",
+    "phrases",
+    "related",
+  ];
   const source =
     !legacy && value && typeof value === "object" && !Array.isArray(value)
       ? value
@@ -220,8 +235,24 @@ function normalizeEnrichmentNeeds(value, profile, legacy = false) {
     // pronunciation lookup.
     needs.usPhonetic = true;
   }
-  // A core request cannot accidentally opt into the three deep providers.
-  needs.deep = profile === "deep" && needs.deep;
+  // A core request cannot accidentally opt into relationship providers.
+  if (profile !== "deep") {
+    needs.deep = false;
+    for (const name of granularDeepNames) needs[name] = false;
+    return needs;
+  }
+  const hasGranularDeepNeeds =
+    !legacy &&
+    granularDeepNames.some((name) =>
+      Object.prototype.hasOwnProperty.call(source, name),
+    );
+  // ``deep: true`` was the only relationship selector used by v5 clients.
+  // Preserve that exact all-relationship meaning unless a newer client sent
+  // at least one granular selector.
+  if (needs.deep && !hasGranularDeepNeeds) {
+    for (const name of granularDeepNames) needs[name] = true;
+  }
+  needs.deep = granularDeepNames.some((name) => needs[name]);
   return needs;
 }
 
@@ -242,7 +273,7 @@ function enrichmentNeedSignature(needs) {
 
 function enrichmentCacheKey(term, profile, needs) {
   return new Request(
-    `https://lexora-enrichment-cache.invalid/v5/${profile}/${enrichmentNeedSignature(needs)}/${encodeURIComponent(term)}`,
+    `https://lexora-enrichment-cache.invalid/v6/${profile}/${enrichmentNeedSignature(needs)}/${encodeURIComponent(term)}`,
   );
 }
 
@@ -407,10 +438,15 @@ async function enrichmentTerm(
       definition: false,
       pos: false,
       examples: false,
+      synonyms: false,
+      antonyms: false,
       usPhonetic: false,
       ukPhonetic: false,
     };
     if (!Array.isArray(data)) return capabilities;
+    const hasValues = (value) =>
+      Array.isArray(value) &&
+      value.some((item) => String(item ?? "").trim());
     for (const entry of data) {
       if (!entry || typeof entry !== "object") continue;
       for (const phonetic of Array.isArray(entry.phonetics)
@@ -431,6 +467,8 @@ async function enrichmentTerm(
         if (String(meaning?.partOfSpeech ?? "").trim()) {
           capabilities.pos = true;
         }
+        if (hasValues(meaning?.synonyms)) capabilities.synonyms = true;
+        if (hasValues(meaning?.antonyms)) capabilities.antonyms = true;
         for (const definition of Array.isArray(meaning?.definitions)
           ? meaning.definitions
           : []) {
@@ -439,6 +477,12 @@ async function enrichmentTerm(
           }
           if (String(definition?.example ?? "").trim()) {
             capabilities.examples = true;
+          }
+          if (hasValues(definition?.synonyms)) {
+            capabilities.synonyms = true;
+          }
+          if (hasValues(definition?.antonyms)) {
+            capabilities.antonyms = true;
           }
         }
       }
@@ -493,7 +537,8 @@ async function enrichmentTerm(
     needs.pos ||
     needs.phonetic ||
     needs.examples ||
-    needs.deep;
+    needs.synonyms ||
+    needs.antonyms;
   const providerResults = new Map();
   if (dictionaryNeeded) {
     providerResults.set(
@@ -515,16 +560,16 @@ async function enrichmentTerm(
     (needs.phonetic &&
       needs.usPhonetic &&
       !dictionary.usPhonetic);
-  const datamuseNames = needs.deep
-    ? [
-        "related",
-        ...(exactFallbackNeeded ? ["exact"] : []),
-        "synonyms",
-        "antonyms",
-      ]
-    : exactFallbackNeeded
-      ? ["exact"]
-      : [];
+  const datamuseNames = [
+    ...(needs.related || needs.phrases ? ["related"] : []),
+    ...(exactFallbackNeeded ? ["exact"] : []),
+    ...(needs.synonyms && !dictionary.synonyms
+      ? ["synonyms"]
+      : []),
+    ...(needs.antonyms && !dictionary.antonyms
+      ? ["antonyms"]
+      : []),
+  ];
   const lease = await quotaLease(datamuseNames.length);
   if (!lease.granted) {
     return Response.json(
@@ -577,11 +622,17 @@ async function enrichmentTerm(
       dictionary.usPhonetic ||
       exact.usPhonetic) &&
       (!needs.ukPhonetic || dictionary.ukPhonetic));
-  const deepComplete =
-    !needs.deep ||
-    ["related", "synonyms", "antonyms"].every(
-      (name) => providerResults.get(name)?.provider?.ok === true,
-    );
+  const relatedComplete =
+    (!needs.related && !needs.phrases) ||
+    providerResults.get("related")?.provider?.ok === true;
+  const synonymsComplete =
+    !needs.synonyms ||
+    dictionary.synonyms ||
+    providerResults.get("synonyms")?.provider?.ok === true;
+  const antonymsComplete =
+    !needs.antonyms ||
+    dictionary.antonyms ||
+    providerResults.get("antonyms")?.provider?.ok === true;
   result._complete =
     (!needs.definition ||
       dictionary.definition ||
@@ -590,7 +641,9 @@ async function enrichmentTerm(
     phoneticComplete &&
     (!needs.examples || dictionary.examples) &&
     (!needs.frequency || exact.frequency) &&
-    deepComplete;
+    relatedComplete &&
+    synonymsComplete &&
+    antonymsComplete;
 
   const allProvidersSucceeded = outcomes.every(
     (outcome) => outcome.provider.ok,

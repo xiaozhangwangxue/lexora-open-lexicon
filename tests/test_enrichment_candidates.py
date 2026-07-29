@@ -34,6 +34,10 @@ def edge_payload(
                 "examples": True,
                 "frequency": True,
                 "deep": profile == "deep",
+                "synonyms": profile == "deep",
+                "antonyms": profile == "deep",
+                "phrases": profile == "deep",
+                "related": profile == "deep",
                 "usPhonetic": True,
                 "ukPhonetic": True,
             }
@@ -297,6 +301,10 @@ class CandidateBatchTest(unittest.TestCase):
                                 "examples": False,
                                 "frequency": False,
                                 "deep": True,
+                                "synonyms": True,
+                                "antonyms": True,
+                                "phrases": True,
+                                "related": True,
                                 "usPhonetic": False,
                                 "ukPhonetic": False,
                             }
@@ -306,6 +314,107 @@ class CandidateBatchTest(unittest.TestCase):
                     self.assertEqual(result["synonyms"], ["term"])
                     self.assertEqual(result["antonyms"], ["silence"])
                     self.assertEqual(result["phrases"], ["written word"])
+                finally:
+                    state.close()
+
+        asyncio.run(scenario())
+
+    def test_deep_enrichment_sends_only_each_rows_missing_relationships(
+        self,
+    ) -> None:
+        class RecordingBatcher:
+            def __init__(self) -> None:
+                self.needs: list[dict[str, bool]] = []
+
+            async def request(
+                self,
+                term: str,
+                needs: dict[str, bool],
+            ) -> tuple[Any, int, None]:
+                self.needs.append(needs)
+                return (
+                    {
+                        "related": [{"word": "spoken word"}],
+                        "antonyms": [{"word": "silence"}],
+                        "_providers": {
+                            "related": {
+                                "ok": True,
+                                "status": 200,
+                                "found": True,
+                            },
+                            "antonyms": {
+                                "ok": True,
+                                "status": 200,
+                                "found": True,
+                            },
+                        },
+                        "_found": True,
+                        "_complete": True,
+                        "_profile": "deep",
+                    },
+                    200,
+                    None,
+                )
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = enrichment.init_state(
+                    Path(temp_dir) / "state.sqlite"
+                )
+                batcher = RecordingBatcher()
+                try:
+                    async with httpx.AsyncClient() as client:
+                        with patch.object(
+                            enrichment,
+                            "EDGE_BASE",
+                            "https://edge.example",
+                        ):
+                            result = await enrichment.enrich_term(
+                                client,
+                                {
+                                    "edge": enrichment.HostGate(0),
+                                    "dictionary": enrichment.HostGate(0),
+                                    "datamuse": enrichment.HostGate(0),
+                                },
+                                "word",
+                                state,
+                                {
+                                    "definition": "A unit of language.",
+                                    "pos": "noun",
+                                    "us": "wɝːd",
+                                    "uk": "wɜːd",
+                                    "examples": ["This is a word."],
+                                    "frequency": 5.0,
+                                    "phrases": ["word for word"],
+                                    "synonyms": ["term"],
+                                    "antonyms": [],
+                                    "related": [],
+                                },
+                                edge_batcher=batcher,
+                                profile="deep",
+                            )
+                    self.assertEqual(
+                        batcher.needs,
+                        [
+                            {
+                                "definition": False,
+                                "pos": False,
+                                "phonetic": False,
+                                "examples": False,
+                                "frequency": False,
+                                "deep": True,
+                                "synonyms": False,
+                                "antonyms": True,
+                                "phrases": False,
+                                "related": True,
+                                "usPhonetic": False,
+                                "ukPhonetic": False,
+                            }
+                        ],
+                    )
+                    self.assertNotIn("synonyms", result)
+                    self.assertEqual(result["antonyms"], ["silence"])
+                    self.assertEqual(result["related"], ["spoken word"])
                 finally:
                     state.close()
 
@@ -649,6 +758,10 @@ class CandidateBatchTest(unittest.TestCase):
                                 "examples": False,
                                 "frequency": False,
                                 "deep": False,
+                                "synonyms": False,
+                                "antonyms": False,
+                                "phrases": False,
+                                "related": False,
                                 "usPhonetic": True,
                                 "ukPhonetic": False,
                             },
@@ -659,6 +772,10 @@ class CandidateBatchTest(unittest.TestCase):
                                 "examples": False,
                                 "frequency": True,
                                 "deep": False,
+                                "synonyms": False,
+                                "antonyms": False,
+                                "phrases": False,
+                                "related": False,
                                 "usPhonetic": False,
                                 "ukPhonetic": False,
                             },

@@ -535,6 +535,256 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
         self.assertEqual(result["datamuseRequests"], 3)
         self.assertEqual(result["leaseCosts"], [3])
 
+    def test_granular_deep_needs_call_only_the_required_provider(
+        self,
+    ) -> None:
+        script = f"""
+          {RATE_LIMITER_JS}
+          globalThis.caches = {{
+            default: {{
+              match: async () => null,
+              put: async () => undefined,
+            }},
+          }};
+          const urls = [];
+          globalThis.fetch = async (input) => {{
+            urls.push(String(input));
+            return Response.json([]);
+          }};
+          const {{ default: worker }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const lookup = async (term, field) => {{
+            const start = urls.length;
+            const response = await worker.fetch(
+              new Request(
+                "https://dict.example/internal/api/dictionary/batch",
+                {{
+                  method: "POST",
+                  headers: {{
+                    "Content-Type": "application/json",
+                    "X-Lexora-Origin-Token": "test-token",
+                  }},
+                  body: JSON.stringify({{
+                    profile: "deep",
+                    terms: [term],
+                    needs: {{ [term]: {{ [field]: true }} }},
+                  }}),
+                }},
+              ),
+              {{
+                ORIGIN_TOKEN: "test-token",
+                DATAMUSE_RATE_LIMITER: quota,
+              }},
+              {{ waitUntil: () => undefined }},
+            );
+            const item = (await response.json()).results[term];
+            return {{
+              status: item.status,
+              providers: Object.keys(item.data._providers),
+              complete: item.data._complete,
+              urls: urls.slice(start),
+            }};
+          }};
+          const related = await lookup("related-only", "related");
+          const synonyms = await lookup("synonyms-only", "synonyms");
+          const antonyms = await lookup("antonyms-only", "antonyms");
+          console.log(JSON.stringify({{
+            related,
+            synonyms,
+            antonyms,
+            leaseCosts,
+          }}));
+        """
+        result = self.run_node(script)
+        self.assertEqual(
+            result["related"]["providers"],
+            ["related"],
+        )
+        self.assertEqual(
+            result["synonyms"]["providers"],
+            ["dictionary", "synonyms"],
+        )
+        self.assertEqual(
+            result["antonyms"]["providers"],
+            ["dictionary", "antonyms"],
+        )
+        self.assertNotIn(
+            "dictionaryapi.dev",
+            " ".join(result["related"]["urls"]),
+        )
+        for name in ("related", "synonyms", "antonyms"):
+            self.assertEqual(result[name]["status"], 200)
+            self.assertTrue(result[name]["complete"])
+        self.assertEqual(result["leaseCosts"], [1, 1, 1])
+
+    def test_dictionary_relationships_skip_matching_datamuse_providers(
+        self,
+    ) -> None:
+        script = f"""
+          globalThis.caches = {{
+            default: {{
+              match: async () => null,
+              put: async () => undefined,
+            }},
+          }};
+          const urls = [];
+          globalThis.fetch = async (input) => {{
+            const url = String(input);
+            urls.push(url);
+            if (!url.includes("dictionaryapi.dev")) {{
+              throw new Error(`unexpected provider: ${{url}}`);
+            }}
+            return Response.json([{{
+              word: "word",
+              meanings: [{{
+                partOfSpeech: "noun",
+                synonyms: ["term"],
+                antonyms: ["silence"],
+                definitions: [],
+              }}],
+            }}]);
+          }};
+          const {{ default: worker }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const response = await worker.fetch(
+            new Request(
+              "https://dict.example/internal/api/dictionary/batch",
+              {{
+                method: "POST",
+                headers: {{
+                  "Content-Type": "application/json",
+                  "X-Lexora-Origin-Token": "test-token",
+                }},
+                body: JSON.stringify({{
+                  profile: "deep",
+                  terms: ["word"],
+                  needs: {{
+                    word: {{ synonyms: true, antonyms: true }},
+                  }},
+                }}),
+              }},
+            ),
+            {{ ORIGIN_TOKEN: "test-token" }},
+            {{ waitUntil: () => undefined }},
+          );
+          const item = (await response.json()).results.word;
+          console.log(JSON.stringify({{
+            status: response.status,
+            providers: Object.keys(item.data._providers),
+            complete: item.data._complete,
+            needs: item.data._needs,
+            urls,
+          }}));
+        """
+        result = self.run_node(script)
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["providers"], ["dictionary"])
+        self.assertTrue(result["complete"])
+        self.assertTrue(result["needs"]["synonyms"])
+        self.assertTrue(result["needs"]["antonyms"])
+        self.assertEqual(len(result["urls"]), 1)
+        self.assertIn("dictionaryapi.dev", result["urls"][0])
+
+    def test_mixed_granular_batch_coordinates_one_quota_lease_without_hanging(
+        self,
+    ) -> None:
+        script = f"""
+          {RATE_LIMITER_JS}
+          globalThis.caches = {{
+            default: {{
+              match: async () => null,
+              put: async () => undefined,
+            }},
+          }};
+          const urls = [];
+          globalThis.fetch = async (input) => {{
+            const url = String(input);
+            urls.push(url);
+            if (url.includes("dictionaryapi.dev") &&
+                url.endsWith("/local")) {{
+              return Response.json([{{
+                word: "local",
+                meanings: [{{
+                  synonyms: ["nearby"],
+                  antonyms: ["remote"],
+                  definitions: [],
+                }}],
+              }}]);
+            }}
+            return Response.json([]);
+          }};
+          const {{ default: worker }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const work = worker.fetch(
+            new Request(
+              "https://dict.example/internal/api/dictionary/batch",
+              {{
+                method: "POST",
+                headers: {{
+                  "Content-Type": "application/json",
+                  "X-Lexora-Origin-Token": "test-token",
+                }},
+                body: JSON.stringify({{
+                  profile: "deep",
+                  terms: ["local", "remote", "related"],
+                  needs: {{
+                    local: {{ synonyms: true, antonyms: true }},
+                    remote: {{ synonyms: true }},
+                    related: {{ related: true }},
+                  }},
+                }}),
+              }},
+            ),
+            {{
+              ORIGIN_TOKEN: "test-token",
+              DATAMUSE_RATE_LIMITER: quota,
+            }},
+            {{ waitUntil: () => undefined }},
+          );
+          const response = await Promise.race([
+            work,
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error("coordinated lease deadlocked")),
+                2000,
+              ),
+            ),
+          ]);
+          const body = await response.json();
+          console.log(JSON.stringify({{
+            status: response.status,
+            resultKeys: Object.keys(body.results),
+            completes: Object.fromEntries(
+              Object.entries(body.results).map(
+                ([term, item]) => [term, item.data._complete],
+              ),
+            ),
+            dictionaryRequests: urls.filter(
+              (url) => url.includes("dictionaryapi.dev"),
+            ).length,
+            datamuseRequests: urls.filter(
+              (url) => url.includes("api.datamuse.com"),
+            ).length,
+            leaseCosts,
+          }}));
+        """
+        result = self.run_node(script)
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(
+            result["resultKeys"],
+            ["local", "remote", "related"],
+        )
+        self.assertEqual(
+            result["completes"],
+            {"local": True, "remote": True, "related": True},
+        )
+        self.assertEqual(result["dictionaryRequests"], 2)
+        self.assertEqual(result["datamuseRequests"], 2)
+        self.assertEqual(result["leaseCosts"], [2])
+
     def test_batch_accepts_dataset_dots_and_120_character_terms(self) -> None:
         script = f"""
           {RATE_LIMITER_JS}
@@ -663,7 +913,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
                 {"ok": True, "status": 200, "found": False},
             )
         self.assertIn(
-            "/v5/deep/11111111/unfindable",
+            "/v6/deep/111111111111/unfindable",
             result["matchedCacheUrl"],
         )
         self.assertEqual(result["putCacheUrl"], result["matchedCacheUrl"])
@@ -724,6 +974,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
           console.log(JSON.stringify({{
             status: response.status,
             found: item.data._found,
+            complete: item.data._complete,
             providers: item.data._providers,
             putCacheControl,
             leaseCosts,
@@ -732,6 +983,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
         result = self.run_node(script)
         self.assertEqual(result["status"], 200)
         self.assertTrue(result["found"])
+        self.assertFalse(result["complete"])
         self.assertEqual(
             result["providers"]["dictionary"],
             {"ok": True, "status": 200, "found": True},
@@ -918,12 +1170,79 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
         """
         result = self.run_node(script)
         self.assertEqual(result["statuses"], [200, 200])
-        self.assertIn("/v5/core/10000000/word", result["matchedUrls"][0])
-        self.assertIn("/v5/core/00001000/word", result["matchedUrls"][1])
+        self.assertIn(
+            "/v6/core/100000000000/word",
+            result["matchedUrls"][0],
+        )
+        self.assertIn(
+            "/v6/core/000010000000/word",
+            result["matchedUrls"][1],
+        )
         self.assertNotEqual(
             result["matchedUrls"][0],
             result["matchedUrls"][1],
         )
+
+    def test_cache_key_isolates_each_granular_deep_capability(self) -> None:
+        script = f"""
+          const matchedUrls = [];
+          globalThis.caches = {{
+            default: {{
+              match: async (request) => {{
+                matchedUrls.push(request.url);
+                return Response.json({{
+                  _providers: {{}},
+                  _found: false,
+                  _complete: true,
+                  _profile: "deep",
+                }});
+              }},
+              put: async () => undefined,
+            }},
+          }};
+          globalThis.fetch = async () => {{
+            throw new Error("cache hits must not fetch");
+          }};
+          const {{ default: worker }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const lookup = async (needs) => {{
+            const response = await worker.fetch(
+              new Request(
+                "https://dict.example/internal/api/dictionary/batch",
+                {{
+                  method: "POST",
+                  headers: {{
+                    "Content-Type": "application/json",
+                    "X-Lexora-Origin-Token": "test-token",
+                  }},
+                  body: JSON.stringify({{
+                    profile: "deep",
+                    terms: ["word"],
+                    needs: {{ word: needs }},
+                  }}),
+                }},
+              ),
+              {{ ORIGIN_TOKEN: "test-token" }},
+              {{ waitUntil: () => undefined }},
+            );
+            return response.status;
+          }};
+          const statuses = [
+            await lookup({{ synonyms: true }}),
+            await lookup({{ antonyms: true }}),
+            await lookup({{ phrases: true }}),
+            await lookup({{ related: true }}),
+          ];
+          console.log(JSON.stringify({{ statuses, matchedUrls }}));
+        """
+        result = self.run_node(script)
+        self.assertEqual(result["statuses"], [200, 200, 200, 200])
+        self.assertEqual(len(set(result["matchedUrls"])), 4)
+        for url in result["matchedUrls"]:
+            self.assertIn("/v6/deep/", url)
+            signature = url.split("/v6/deep/", 1)[1].split("/", 1)[0]
+            self.assertEqual(len(signature), 12)
 
     def test_mixed_batch_leases_only_uncached_datamuse_requests(self) -> None:
         script = f"""
