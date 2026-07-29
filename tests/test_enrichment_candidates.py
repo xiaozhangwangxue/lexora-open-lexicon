@@ -994,6 +994,13 @@ class CandidateBatchTest(unittest.TestCase):
         )
 
     def test_rate_limited_batch_does_not_mark_or_advance_entry(self) -> None:
+        class TrackingConnection(sqlite3.Connection):
+            closed_by_run = False
+
+            def close(self) -> None:
+                self.closed_by_run = True
+                super().close()
+
         async def fail_request(
             batcher: enrichment.EdgeDictionaryBatcher,
             term: str,
@@ -1013,6 +1020,17 @@ class CandidateBatchTest(unittest.TestCase):
             state_path = root / "state.sqlite"
             database = create_database(dataset)
             database.close()
+            tracked_connections: list[TrackingConnection] = []
+            original_connect = sqlite3.connect
+
+            def tracking_connect(
+                *args: Any,
+                **kwargs: Any,
+            ) -> TrackingConnection:
+                kwargs["factory"] = TrackingConnection
+                connection = original_connect(*args, **kwargs)
+                tracked_connections.append(connection)
+                return connection
 
             with (
                 patch.object(
@@ -1024,6 +1042,11 @@ class CandidateBatchTest(unittest.TestCase):
                     enrichment.EdgeDictionaryBatcher,
                     "request",
                     new=fail_request,
+                ),
+                patch.object(
+                    enrichment.sqlite3,
+                    "connect",
+                    side_effect=tracking_connect,
                 ),
             ):
                 with self.assertRaises(
@@ -1044,6 +1067,13 @@ class CandidateBatchTest(unittest.TestCase):
                             1,
                         )
                     )
+            self.assertEqual(len(tracked_connections), 2)
+            self.assertTrue(
+                all(
+                    connection.closed_by_run
+                    for connection in tracked_connections
+                )
+            )
 
             database = sqlite3.connect(dataset)
             marker = database.execute(

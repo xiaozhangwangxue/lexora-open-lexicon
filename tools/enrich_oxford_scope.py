@@ -1311,6 +1311,7 @@ async def run(
         if EDGE_BASE
         else None
     )
+    db: sqlite3.Connection | None = None
     try:
         db = sqlite3.connect(dataset)
         ensure_dataset_columns(db)
@@ -1521,9 +1522,11 @@ async def run(
                     await flush_pending()
         if pending:
             await flush_pending()
-        db.close()
     finally:
-        await client.aclose(); state.close()
+        if db is not None:
+            db.close()
+        await client.aclose()
+        state.close()
 
 def main() -> None:
     ap = argparse.ArgumentParser()
