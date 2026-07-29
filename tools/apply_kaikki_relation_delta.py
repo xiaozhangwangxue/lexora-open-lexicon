@@ -303,7 +303,9 @@ def merge_paired_field(
     }
     word_maximum = max(limit, len(words))
     entry_maximum = max(limit, len(entries))
-    for addition, raw in zip(additions, entry_payloads, strict=True):
+    if len(additions) != len(entry_payloads):
+        raise ValueError("flat/rich relation pair counts do not match")
+    for addition, raw in zip(additions, entry_payloads):
         word = " ".join(str(raw.get("word") or "").split()).strip()
         definition = " ".join(
             str(raw.get("definition") or "").split()
