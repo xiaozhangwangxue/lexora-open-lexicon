@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import tempfile
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
@@ -30,6 +31,7 @@ from prefill_kaikki_sense_relations import (
     SOURCE_PROVIDER,
     SOURCE_URL,
     aggregate_patches,
+    append_unique_strings,
     extract_relation_senses,
     json_list,
     json_object,
@@ -58,6 +60,12 @@ CREATE TABLE relation_delta (
 );
 CREATE UNIQUE INDEX idx_relation_delta_term
   ON relation_delta(normalized_word);
+"""
+BUILD_SCHEMA = """
+CREATE TABLE build_terms (
+  normalized_word TEXT PRIMARY KEY,
+  matched INTEGER NOT NULL CHECK(matched IN (0, 1))
+);
 """
 
 
@@ -322,8 +330,280 @@ def paired_field_delta(
     return words_add, entries_add
 
 
-def temporary_output_path(output: Path) -> Path:
-    return output.with_name(f".{output.name}.tmp-{os.getpid()}")
+def merge_compact_sense_patches(
+    existing: list[Any],
+    additions: list[Any],
+) -> list[dict[str, Any]]:
+    """Merge compact patches without losing their verified sense identity.
+
+    Indexed patches are bound to both an immutable canonical sense index and
+    its fingerprint.  Full patches use the same sense matching rules as the
+    applier.  Relation values are merged with the same 40-value cap used when
+    applying patches, so combining non-contiguous Kaikki records cannot change
+    the eventual result.
+    """
+    merged: list[dict[str, Any]] = []
+    for raw in [*existing, *additions]:
+        if not isinstance(raw, dict):
+            raise ValueError("delta has a non-object sense patch")
+        relations = raw.get("relations")
+        if not isinstance(relations, dict):
+            raise ValueError("delta has an invalid sense relation patch")
+
+        target: dict[str, Any] | None = None
+        if "sense_index" in raw:
+            index = raw.get("sense_index")
+            fingerprint = str(raw.get("sense_fingerprint") or "")
+            if not isinstance(index, int) or not fingerprint:
+                raise ValueError("delta has an invalid indexed sense patch")
+            for candidate in merged:
+                if candidate.get("sense_index") != index:
+                    continue
+                if candidate.get("sense_fingerprint") != fingerprint:
+                    raise ValueError(
+                        "conflicting fingerprints for one sense index"
+                    )
+                target = candidate
+                break
+        else:
+            if not isinstance(raw.get("definitions"), list):
+                raise ValueError("delta has an invalid full sense patch")
+            for candidate in merged:
+                if "sense_index" in candidate:
+                    continue
+                if sense_matches(candidate, raw):
+                    target = candidate
+                    break
+
+        if target is None:
+            target = {
+                key: (
+                    list(value)
+                    if isinstance(value, list)
+                    else dict(value)
+                    if isinstance(value, dict)
+                    else value
+                )
+                for key, value in raw.items()
+            }
+            target["relations"] = {}
+            merged.append(target)
+
+        target_relations = target["relations"]
+        assert isinstance(target_relations, dict)
+        for field, values in relations.items():
+            if not isinstance(values, list) or not all(
+                isinstance(value, str) for value in values
+            ):
+                raise ValueError(
+                    f"delta sense relation {field} has invalid values"
+                )
+            current = target_relations.get(field) or []
+            if not isinstance(current, list):
+                raise ValueError(
+                    f"delta sense relation {field} is not a list"
+                )
+            target_relations[field] = append_unique_strings(
+                current,
+                values,
+            )
+    return merged
+
+
+def validate_paired_delta(
+    words: list[Any],
+    entries: list[Any],
+    label: str,
+    entry_id: int,
+) -> None:
+    word_keys = [
+        norm(clean_text(value))
+        for value in words
+        if isinstance(value, str)
+    ]
+    entry_keys = [
+        norm(clean_text(value.get("word")))
+        for value in entries
+        if isinstance(value, dict)
+    ]
+    if (
+        len(word_keys) != len(words)
+        or len(entry_keys) != len(entries)
+        or any(not value for value in word_keys)
+        or word_keys != entry_keys
+    ):
+        raise ValueError(
+            f"entry {entry_id} has unsynchronized {label} flat/rich "
+            "delta values"
+        )
+
+
+def merge_delta_record(
+    row: tuple[Any, ...],
+    existing: tuple[Any, ...] | None,
+    incoming: dict[str, Any],
+    *,
+    has_named_columns: bool,
+) -> dict[str, Any]:
+    """Merge one source chunk with an already staged delta row."""
+    entry_id = int(row[0])
+    old_phrases = json_list(row[2], "phrases_json", entry_id)
+    old_related = json_list(row[3], "related_words_json", entry_id)
+    old_senses = json_list(row[4], "senses_json", entry_id)
+    old_source = json_list(row[5], "source_json", entry_id)
+    old_related_entries = (
+        json_list(row[7], "related_entries_json", entry_id)
+        if has_named_columns
+        else []
+    )
+    old_phrase_entries = (
+        json_list(row[8], "phrase_entries_json", entry_id)
+        if has_named_columns
+        else []
+    )
+
+    prior_related: list[Any] = []
+    prior_phrases: list[Any] = []
+    prior_related_entries: list[Any] = []
+    prior_phrase_entries: list[Any] = []
+    prior_senses: list[Any] = []
+    prior_source: list[Any] = []
+    if existing is not None:
+        if (
+            int(existing[0]) != entry_id
+            or str(existing[1]) != str(row[1])
+        ):
+            raise ValueError(
+                f"conflicting staged identity for entry {entry_id}"
+            )
+        prior_related = json_list(
+            existing[2],
+            "delta.related_add_json",
+            entry_id,
+        )
+        prior_phrases = json_list(
+            existing[3],
+            "delta.phrases_add_json",
+            entry_id,
+        )
+        prior_related_entries = json_list(
+            existing[4],
+            "delta.related_entries_add_json",
+            entry_id,
+        )
+        prior_phrase_entries = json_list(
+            existing[5],
+            "delta.phrase_entries_add_json",
+            entry_id,
+        )
+        prior_senses = json_list(
+            existing[6],
+            "delta.senses_patch_json",
+            entry_id,
+        )
+        prior_source = json_list(
+            existing[7],
+            "delta.source_add_json",
+            entry_id,
+        )
+        validate_paired_delta(
+            prior_related,
+            prior_related_entries,
+            "related",
+            entry_id,
+        )
+        validate_paired_delta(
+            prior_phrases,
+            prior_phrase_entries,
+            "phrases",
+            entry_id,
+        )
+
+    incoming_related = list(incoming["related_add"])
+    incoming_phrases = list(incoming["phrases_add"])
+    incoming_related_entries = list(incoming["related_entries_add"])
+    incoming_phrase_entries = list(incoming["phrase_entries_add"])
+    validate_paired_delta(
+        incoming_related,
+        incoming_related_entries,
+        "related",
+        entry_id,
+    )
+    validate_paired_delta(
+        incoming_phrases,
+        incoming_phrase_entries,
+        "phrases",
+        entry_id,
+    )
+
+    # Recompute additions from the canonical row plus every staged candidate.
+    # This preserves first-seen order and enforces the shared 40-item capacity
+    # across non-contiguous chunks instead of allowing every chunk 40 slots.
+    related_add, related_entries_add = paired_field_delta(
+        old_related,
+        old_related_entries,
+        [
+            *prior_related_entries,
+            *incoming_related_entries,
+        ],
+    )
+    phrases_add, phrase_entries_add = paired_field_delta(
+        old_phrases,
+        old_phrase_entries,
+        [
+            *prior_phrase_entries,
+            *incoming_phrase_entries,
+        ],
+    )
+    senses_patch = merge_compact_sense_patches(
+        prior_senses,
+        list(incoming["senses_patch"]),
+    )
+    source_add = append_unique_strings(
+        prior_source,
+        list(incoming["source_add"]),
+        limit=max(
+            40,
+            len(prior_source) + len(incoming["source_add"]),
+        ),
+    )
+    return {
+        "entry_id": entry_id,
+        "normalized_word": str(row[1]),
+        "related_add": related_add,
+        "phrases_add": phrases_add,
+        "related_entries_add": related_entries_add,
+        "phrase_entries_add": phrase_entries_add,
+        "senses_patch": senses_patch,
+        "source_add": source_add,
+        "has_changes": bool(
+            related_add
+            or phrases_add
+            or related_entries_add
+            or phrase_entries_add
+            or senses_patch
+            or (
+                source_add
+                and any(value not in old_source for value in source_add)
+            )
+        ),
+    }
+
+
+def create_temporary_database(output: Path | None) -> Path:
+    if output is None:
+        descriptor, raw = tempfile.mkstemp(
+            prefix="lexora-kaikki-delta-",
+            suffix=".sqlite",
+        )
+    else:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, raw = tempfile.mkstemp(
+            prefix=f".{output.name}.tmp-",
+            dir=output.parent,
+        )
+    os.close(descriptor)
+    return Path(raw)
 
 
 def build_delta(
@@ -386,6 +666,7 @@ def build_delta(
     }
     current_key: str | None = None
     current_patches: list[dict[str, Any]] = []
+    processed_chunks = 0
 
     try:
         validate_schema(source)
@@ -422,22 +703,17 @@ def build_delta(
                 result["definition_zh"] = definition_zh
             return result
 
-        if output is not None:
-            output.parent.mkdir(parents=True, exist_ok=True)
-            temporary = temporary_output_path(output)
-            if temporary.exists():
-                raise FileExistsError(
-                    f"temporary output already exists: {temporary}"
-                )
-            destination = sqlite3.connect(temporary)
-            destination.executescript(DELTA_SCHEMA)
+        temporary = create_temporary_database(output)
+        destination = sqlite3.connect(temporary)
+        destination.executescript(DELTA_SCHEMA)
+        destination.executescript(BUILD_SCHEMA)
 
         def flush_current() -> None:
-            nonlocal current_patches
+            nonlocal current_patches, processed_chunks
             if not current_key or not current_patches:
                 current_patches = []
                 return
-            stats["relationTerms"] += 1
+            processed_chunks += 1
             _, _, _, counts = aggregate_patches(current_patches)
             stats["relationValuesSeen"].update(counts)
             row = lookup_entry(
@@ -447,83 +723,103 @@ def build_delta(
                 end_id,
                 has_named_columns=has_named_columns,
             )
+            destination.execute(
+                """
+                INSERT INTO build_terms(normalized_word,matched)
+                VALUES(?,?)
+                ON CONFLICT(normalized_word) DO UPDATE SET
+                  matched=MAX(build_terms.matched,excluded.matched)
+                """,
+                (current_key, int(row is not None)),
+            )
             if row is None:
-                stats["unmatchedTerms"] += 1
                 current_patches = []
+                if processed_chunks % commit_size == 0:
+                    destination.commit()
                 return
-            stats["matchedTerms"] += 1
-            delta = delta_for_entry(
+            incoming = delta_for_entry(
                 row,
                 current_patches,
                 resolve_entry,
                 has_named_columns=has_named_columns,
             )
             current_patches = []
+            existing = destination.execute(
+                """
+                SELECT entry_id,normalized_word,related_add_json,
+                       phrases_add_json,related_entries_add_json,
+                       phrase_entries_add_json,senses_patch_json,
+                       source_add_json
+                FROM relation_delta
+                WHERE entry_id=?
+                """,
+                (int(row[0]),),
+            ).fetchone()
+            delta = merge_delta_record(
+                row,
+                existing,
+                incoming,
+                has_named_columns=has_named_columns,
+            )
             if not delta["has_changes"]:
-                return
-            stats["deltaRows"] += 1
-            stats["valuesIncluded"]["related"] += len(
-                delta["related_add"]
-            )
-            stats["valuesIncluded"]["phrases"] += len(
-                delta["phrases_add"]
-            )
-            stats["valuesIncluded"]["senses"] += len(
-                delta["senses_patch"]
-            )
-            stats["valuesIncluded"]["relatedEntries"] += len(
-                delta["related_entries_add"]
-            )
-            stats["valuesIncluded"]["phraseEntries"] += len(
-                delta["phrase_entries_add"]
-            )
-            if destination is not None:
-                destination.execute(
-                    """
-                    INSERT INTO relation_delta(
-                      entry_id,normalized_word,related_add_json,
-                      phrases_add_json,related_entries_add_json,
-                      phrase_entries_add_json,senses_patch_json,
-                      source_add_json
-                    ) VALUES(?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        delta["entry_id"],
-                        delta["normalized_word"],
-                        json.dumps(
-                            delta["related_add"],
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                        json.dumps(
-                            delta["phrases_add"],
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                        json.dumps(
-                            delta["related_entries_add"],
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                        json.dumps(
-                            delta["phrase_entries_add"],
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                        json.dumps(
-                            delta["senses_patch"],
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                        json.dumps(
-                            delta["source_add"],
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                    ),
-                )
-                if stats["deltaRows"] % commit_size == 0:
+                if processed_chunks % commit_size == 0:
                     destination.commit()
+                return
+            values = (
+                delta["entry_id"],
+                delta["normalized_word"],
+                json.dumps(
+                    delta["related_add"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    delta["phrases_add"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    delta["related_entries_add"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    delta["phrase_entries_add"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    delta["senses_patch"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                json.dumps(
+                    delta["source_add"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+            destination.execute(
+                """
+                INSERT INTO relation_delta(
+                  entry_id,normalized_word,related_add_json,
+                  phrases_add_json,related_entries_add_json,
+                  phrase_entries_add_json,senses_patch_json,
+                  source_add_json
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(entry_id) DO UPDATE SET
+                  normalized_word=excluded.normalized_word,
+                  related_add_json=excluded.related_add_json,
+                  phrases_add_json=excluded.phrases_add_json,
+                  related_entries_add_json=excluded.related_entries_add_json,
+                  phrase_entries_add_json=excluded.phrase_entries_add_json,
+                  senses_patch_json=excluded.senses_patch_json,
+                  source_add_json=excluded.source_add_json
+                """,
+                values,
+            )
+            if processed_chunks % commit_size == 0:
+                destination.commit()
 
         with gzip.open(kaikki, "rt", encoding="utf-8") as stream:
             for line in stream:
@@ -544,7 +840,52 @@ def build_delta(
                     current_patches.extend(extract_relation_senses(data))
         flush_current()
 
-        if destination is not None and output is not None:
+        destination.commit()
+        term_counts = destination.execute(
+            """
+            SELECT COUNT(*),COALESCE(SUM(matched),0)
+            FROM build_terms
+            """
+        ).fetchone()
+        stats["relationTerms"] = int(term_counts[0])
+        stats["matchedTerms"] = int(term_counts[1])
+        stats["unmatchedTerms"] = (
+            stats["relationTerms"] - stats["matchedTerms"]
+        )
+        stats["deltaRows"] = int(
+            destination.execute(
+                "SELECT COUNT(*) FROM relation_delta"
+            ).fetchone()[0]
+        )
+        for staged in destination.execute(
+            """
+            SELECT entry_id,related_add_json,phrases_add_json,
+                   related_entries_add_json,phrase_entries_add_json,
+                   senses_patch_json
+            FROM relation_delta
+            """
+        ):
+            entry_id = int(staged[0])
+            for name, raw, column in (
+                ("related", staged[1], "related_add_json"),
+                ("phrases", staged[2], "phrases_add_json"),
+                (
+                    "relatedEntries",
+                    staged[3],
+                    "related_entries_add_json",
+                ),
+                (
+                    "phraseEntries",
+                    staged[4],
+                    "phrase_entries_add_json",
+                ),
+                ("senses", staged[5], "senses_patch_json"),
+            ):
+                stats["valuesIncluded"][name] += len(
+                    json_list(raw, f"delta.{column}", entry_id)
+                )
+
+        if output is not None:
             final_stat = kaikki.stat()
             final_identity = (
                 final_stat.st_dev,
@@ -577,6 +918,12 @@ def build_delta(
                 "end_id": "" if end_id is None else str(end_id),
                 "rows": str(stats["deltaRows"]),
             }
+            destination.execute("DROP TABLE build_terms")
+            destination.commit()
+            # DROP releases pages to SQLite's freelist but does not reduce the
+            # artifact size. Rebuild the unpublished temporary database before
+            # atomic publication so the processing index is not shipped.
+            destination.execute("VACUUM")
             destination.executemany(
                 "INSERT INTO metadata(key,value) VALUES(?,?)",
                 metadata.items(),

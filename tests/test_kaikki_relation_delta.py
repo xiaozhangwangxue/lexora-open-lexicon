@@ -165,6 +165,60 @@ def create_dump(path: Path) -> None:
             stream.write(json.dumps(row) + "\n")
 
 
+def create_noncontiguous_dump(path: Path) -> None:
+    """Put one normalized term in two source regions."""
+    rows = [
+        {
+            "word": "colour",
+            "lang_code": "en",
+            "pos": "noun",
+            "senses": [
+                {
+                    "glosses": ["A property of visible light."],
+                    "form_of": [{"word": "color"}],
+                    "coordinate_terms": [{"word": "visual property"}],
+                }
+            ],
+        },
+        {
+            "word": "beta",
+            "lang_code": "en",
+            "pos": "noun",
+            "senses": [
+                {
+                    "glosses": ["A test release."],
+                    "hypernyms": [{"word": "software release"}],
+                }
+            ],
+        },
+        {
+            "word": "colour",
+            "lang_code": "en",
+            "pos": "noun",
+            "senses": [
+                {
+                    "glosses": ["A property of visible light."],
+                    "hypernyms": [{"word": "software release"}],
+                }
+            ],
+        },
+        {
+            "word": "colour",
+            "lang_code": "en",
+            "pos": "verb",
+            "senses": [
+                {
+                    "glosses": ["To add colour."],
+                    "alt_of": [{"word": "color in"}],
+                }
+            ],
+        },
+    ]
+    with gzip.open(path, "wt", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row) + "\n")
+
+
 class KaikkiRelationDeltaTest(unittest.TestCase):
     def test_delta_builder_defaults_to_read_only_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -260,6 +314,105 @@ class KaikkiRelationDeltaTest(unittest.TestCase):
                 database.close()
             with self.assertRaises(FileExistsError):
                 build_delta(dataset, dump, output=delta)
+
+    def test_noncontiguous_term_chunks_merge_into_one_safe_delta(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "local.sqlite"
+            remote = root / "remote.sqlite"
+            dump = root / "kaikki.jsonl.gz"
+            delta = root / "relations.sqlite"
+            create_dataset(local)
+            create_dataset(remote, remote=True)
+            create_noncontiguous_dump(dump)
+
+            dry_run = build_delta(local, dump, commit_size=1)
+            report = build_delta(
+                local,
+                dump,
+                output=delta,
+                commit_size=1,
+            )
+
+            for result in (dry_run, report):
+                self.assertEqual(result["relationTerms"], 2)
+                self.assertEqual(result["matchedTerms"], 2)
+                self.assertEqual(result["unmatchedTerms"], 0)
+                self.assertEqual(result["deltaRows"], 2)
+                self.assertEqual(result["valuesIncluded"]["related"], 3)
+                self.assertEqual(
+                    result["valuesIncluded"]["relatedEntries"],
+                    3,
+                )
+
+            database = sqlite3.connect(delta)
+            try:
+                rows = database.execute(
+                    "SELECT COUNT(*) FROM relation_delta"
+                ).fetchone()[0]
+                self.assertEqual(rows, 2)
+                row = database.execute(
+                    """
+                    SELECT related_add_json,related_entries_add_json,
+                           phrases_add_json,phrase_entries_add_json,
+                           senses_patch_json
+                    FROM relation_delta WHERE entry_id=1
+                    """
+                ).fetchone()
+            finally:
+                database.close()
+
+            related = json.loads(row[0])
+            related_entries = json.loads(row[1])
+            phrases = json.loads(row[2])
+            phrase_entries = json.loads(row[3])
+            self.assertEqual(
+                related,
+                ["visual property", "software release"],
+            )
+            self.assertEqual(
+                [value["word"] for value in related_entries],
+                related,
+            )
+            self.assertEqual(phrases, related)
+            self.assertEqual(
+                [value["word"] for value in phrase_entries],
+                phrases,
+            )
+
+            senses = json.loads(row[4])
+            indexed = [
+                value for value in senses if "sense_index" in value
+            ]
+            self.assertEqual(len(indexed), 1)
+            self.assertEqual(indexed[0]["sense_index"], 0)
+            self.assertRegex(
+                indexed[0]["sense_fingerprint"],
+                r"^[0-9a-f]{24}$",
+            )
+            self.assertEqual(
+                indexed[0]["relations"],
+                {
+                    "form_of": ["color"],
+                    "coordinate_terms": ["visual property"],
+                    "hypernyms": ["software release"],
+                },
+            )
+            full = [
+                value for value in senses if "sense_index" not in value
+            ]
+            self.assertEqual(len(full), 1)
+            self.assertEqual(
+                full[0]["relations"],
+                {"alt_of": ["color in"]},
+            )
+
+            first = apply_delta(remote, delta, apply=True, batch_size=1)
+            second = apply_delta(remote, delta, apply=True, batch_size=1)
+            self.assertEqual(first["changedRows"], 2)
+            self.assertEqual(second["changedRows"], 0)
 
     def test_remote_apply_preserves_collected_data_and_is_idempotent(
         self,
