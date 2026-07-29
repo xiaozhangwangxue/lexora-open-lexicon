@@ -14,7 +14,7 @@ ExecStart=/usr/bin/python3 /opt/lexora/tools/enrich_oxford_scope.py \
   --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
   --state /opt/lexora/state/shard-%i.sqlite \
   --shard-index %i --shard-count 2 \
-  --workers 8 --delay 6 --translation-delay 6 --retry-after-hours 24
+  --workers 8 --delay 5 --translation-delay 6 --retry-after-hours 24
 Restart=on-failure
 RestartSec=30
 Nice=10
