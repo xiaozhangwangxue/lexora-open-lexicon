@@ -43,6 +43,36 @@ def unique(values: list[str], limit: int = 40) -> list[str]:
     return result
 
 
+def normalize_phonetic(value: Any) -> str:
+    """Normalize common legacy ECDICT symbols to Unicode IPA."""
+    text = str(value or "").strip().strip("/")
+    return (
+        text.replace("ә", "ə")
+        .replace(":", "ː")
+        .replace("'", "ˈ")
+        .replace("ˈˈ", "ˈ")
+    )
+
+
+def needs_phonetic_repair(value: Any) -> bool:
+    """Treat empty and known legacy transcription forms as incomplete."""
+    text = str(value or "").strip()
+    return not text or "ә" in text or ":" in text
+
+
+def needs_definition_translation(definition: Any, translation: Any) -> bool:
+    """Detect missing or obviously abbreviated translations of long entries."""
+    source = " ".join(str(definition or "").split()).strip()
+    target = " ".join(str(translation or "").split()).strip()
+    if not source:
+        return False
+    if not target:
+        return True
+    if len(source) <= 120:
+        return False
+    return len(target) < max(20, int(len(source) * 0.15))
+
+
 def translation_chunks(text: str, limit: int = 450) -> list[str]:
     """Split long definitions without dropping content or breaking most words."""
     remaining = " ".join(str(text).split()).strip()
@@ -305,20 +335,35 @@ async def request_json(client: httpx.AsyncClient, gate: HostGate, url: str, sour
 def dictionary_fields(data: Any) -> dict[str, Any]:
     if not isinstance(data, list): return {}
     definitions: list[str] = []; examples: list[str] = []; synonyms: list[str] = []; antonyms: list[str] = []
-    us = ""; uk = ""
+    us = ""; uk = ""; fallback = ""
     for entry in data:
+        entry_fallback = normalize_phonetic(entry.get("phonetic"))
+        if entry_fallback and not fallback:
+            fallback = entry_fallback
         for phonetic in entry.get("phonetics", []) or []:
-            text = phonetic.get("text") or ""
+            text = normalize_phonetic(phonetic.get("text"))
             if not text: continue
-            if not us: us = text
-            if not uk: uk = text
+            audio = str(phonetic.get("audio") or "").lower()
+            if ("-us." in audio or "/us/" in audio) and not us:
+                us = text
+            elif ("-uk." in audio or "/uk/" in audio) and not uk:
+                uk = text
+            elif not fallback:
+                fallback = text
         for meaning in entry.get("meanings", []) or []:
             for item in meaning.get("definitions", []) or []:
                 if item.get("definition"): definitions.append(item["definition"])
                 if item.get("example"): examples.append(item["example"])
             synonyms.extend((x.get("word", "") if isinstance(x, dict) else str(x)) for x in meaning.get("synonyms", []) or [])
             antonyms.extend((x.get("word", "") if isinstance(x, dict) else str(x)) for x in meaning.get("antonyms", []) or [])
-    return {"definition": "\n".join(unique(definitions, 24)), "examples": unique(examples, 8), "synonyms": unique(synonyms), "antonyms": unique(antonyms), "us": us, "uk": uk}
+    return {
+        "definition": "\n".join(unique(definitions, 24)),
+        "examples": unique(examples, 8),
+        "synonyms": unique(synonyms),
+        "antonyms": unique(antonyms),
+        "us": us or fallback or uk,
+        "uk": uk or fallback or us,
+    }
 
 def datamuse_fields(data: Any) -> dict[str, Any]:
     if not isinstance(data, list): return {}
@@ -394,7 +439,7 @@ async def enrich_term(
     result: dict[str, Any] = {"_statuses": [], "_attempted": []}
     sources: list[str] = []
     needs_definition = not existing.get("definition")
-    needs_phonetic = not existing.get("us") or not existing.get("uk")
+    needs_phonetic = needs_phonetic_repair(existing.get("us")) or needs_phonetic_repair(existing.get("uk"))
     needs_examples = not existing.get("examples")
     needs_network = any(
         (
@@ -539,9 +584,17 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
         if end_id is not None:
             where.append("id <= ?"); params.append(end_id)
         query = "SELECT id,word,normalized_word,definition,definition_zh,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,phrases_json,related_words_json,frequency,difficulty,enrichment_json FROM entries"
+        if shard_index is not None:
+            # Each rank is unique, so scanning the existing frequency index
+            # lets both shards complete the future 20k snapshot first without
+            # allocating a large temporary sort on a 1 GB micro instance.
+            query = query.replace(
+                " FROM entries",
+                " FROM entries INDEXED BY idx_entries_freq",
+            )
         if where:
             query += " WHERE " + " AND ".join(where)
-        query += " ORDER BY id"
+        query += " ORDER BY frequency_rank" if shard_index is not None else " ORDER BY id"
         # Stream the shard instead of materializing hundreds of thousands of
         # rows.  This keeps the worker within an E2.1.Micro's 1 GB memory
         # envelope and still allows the cursor to resume after each commit.
@@ -551,7 +604,9 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
             entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, phrases_json, related_json, freq, diff, enrich_json = row
             marker = json.loads(enrich_json or "{}")
             existing = {
-                "definition": definition or "", "us": us or "", "uk": uk or "",
+                "definition": definition or "",
+                "us": "" if needs_phonetic_repair(us) else normalize_phonetic(us),
+                "uk": "" if needs_phonetic_repair(uk) else normalize_phonetic(uk),
                 "examples": json.loads(examples_json or "[]"),
                 "phrases": json.loads(phrases_json or "[]"),
                 "synonyms": json.loads(synonyms_json or "[]"),
@@ -567,25 +622,37 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                 edge_batcher=edge_batcher,
             )
             definition = definition or data.get("definition", "")
-            us = us or data.get("us", "") or data.get("us_phonetic", "")
-            uk = uk or data.get("uk", "") or data.get("uk_phonetic", "")
+            if needs_phonetic_repair(us):
+                us = normalize_phonetic(
+                    data.get("us", "") or data.get("us_phonetic", "")
+                ) or normalize_phonetic(us)
+            else:
+                us = normalize_phonetic(us)
+            if needs_phonetic_repair(uk):
+                uk = normalize_phonetic(
+                    data.get("uk", "") or data.get("uk_phonetic", "")
+                ) or normalize_phonetic(uk)
+            else:
+                uk = normalize_phonetic(uk)
             synonyms = unique([*json.loads(synonyms_json or "[]"), *data.get("synonyms", [])])
             antonyms = unique([*json.loads(antonyms_json or "[]"), *data.get("antonyms", [])])
             examples = unique([*json.loads(examples_json or "[]"), *data.get("examples", [])])
             phrases = unique([*json.loads(phrases_json or "[]"), *data.get("phrases", [])])
             related = unique([*json.loads(related_json or "[]"), *data.get("related", [])])
             zh = definition_zh
-            if not zh and definition:
-                zh, status, error = await translate(
+            if needs_definition_translation(definition, zh):
+                translated_zh, status, error = await translate(
                     client,
                     gates["translation"],
                     definition[:1800],
                     translation_batcher=translation_batcher,
                 )
+                if translated_zh:
+                    zh = translated_zh
                 state.execute("""INSERT INTO provider_state(term,source,status,attempts,http_status,last_error,updated_at) VALUES(?,?,?,?,?,?,?)
                   ON CONFLICT(term,source) DO UPDATE SET status=excluded.status,attempts=provider_state.attempts+1,http_status=excluded.http_status,last_error=excluded.last_error,updated_at=excluded.updated_at""",
-                  (term, "translation", "completed" if zh else "failed", 1, status, error, now()))
-                data.setdefault("_statuses", []).append("completed" if zh else "failed")
+                  (term, "translation", "completed" if translated_zh else "failed", 1, status, error, now()))
+                data.setdefault("_statuses", []).append("completed" if translated_zh else "failed")
             score = max(float(freq or 0), float(data.get("frequency", 0) or 0))
             statuses = data.pop("_statuses", [])
             attempted = data.pop("_attempted", [])
@@ -601,7 +668,15 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
         for row in rows:
             if limit and processed + len(pending) >= limit:
                 break
-            if not should_process_marker(row[-1], retry_after_hours):
+            needs_quality_repair = (
+                needs_phonetic_repair(row[5])
+                or needs_phonetic_repair(row[6])
+                or needs_definition_translation(row[3], row[4])
+            )
+            if (
+                not should_process_marker(row[-1], retry_after_hours)
+                and not needs_quality_repair
+            ):
                 continue
             pending.append(row)
             if len(pending) < workers:
