@@ -323,6 +323,41 @@ async function leaseDatamuseQuota(env, cost) {
   }
 }
 
+async function datamuseQuotaStatus(env) {
+  if (!env.DATAMUSE_RATE_LIMITER) {
+    return Response.json(
+      { error: "Datamuse quota limiter is unavailable" },
+      {
+        status: 503,
+        headers: { "Cache-Control": "no-store" },
+      },
+    );
+  }
+  try {
+    const objectId =
+      env.DATAMUSE_RATE_LIMITER.idFromName(datamuseLimiterObjectName);
+    const stub = env.DATAMUSE_RATE_LIMITER.get(objectId);
+    const response = await stub.fetch(
+      "https://datamuse-rate-limiter.invalid/status",
+    );
+    const headers = new Headers(response.headers);
+    headers.set("Cache-Control", "no-store");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  } catch {
+    return Response.json(
+      { error: "Datamuse quota status is unavailable" },
+      {
+        status: 503,
+        headers: { "Cache-Control": "no-store" },
+      },
+    );
+  }
+}
+
 async function enrichmentTerm(
   term,
   profile,
@@ -986,6 +1021,62 @@ export class DatamuseRateLimiter {
 
   async fetch(request) {
     const url = new URL(request.url);
+    if (request.method === "GET" && url.pathname === "/status") {
+      const now = Date.now();
+      const today = utcDay(now);
+      const rows = Array.from(
+        this.state.storage.sql.exec(
+          `
+            SELECT utc_day, used, tokens, last_refill_ms
+            FROM datamuse_quota
+            WHERE singleton = 1
+          `,
+        ),
+      );
+      const row = rows[0];
+      if (!row) {
+        return Response.json(
+          { error: "quota state unavailable" },
+          {
+            status: 503,
+            headers: { "Cache-Control": "no-store" },
+          },
+        );
+      }
+      const elapsedSeconds = Math.max(
+        0,
+        (now - Number(row.last_refill_ms)) / 1000,
+      );
+      const tokens = Math.min(
+        datamuseBurstCapacity,
+        Number(row.tokens) + elapsedSeconds * datamuseRefillPerSecond,
+      );
+      const used = row.utc_day === today ? Number(row.used) : 0;
+      this.state.storage.sql.exec(
+        `
+          UPDATE datamuse_quota
+          SET utc_day = ?, used = ?, tokens = ?, last_refill_ms = ?
+          WHERE singleton = 1
+        `,
+        today,
+        used,
+        tokens,
+        now,
+      );
+      return Response.json(
+        {
+          utcDay: today,
+          dailyLimit: datamuseDailyLimit,
+          dailyUsed: used,
+          dailyRemaining: Math.max(0, datamuseDailyLimit - used),
+          burstCapacity: datamuseBurstCapacity,
+          burstRemaining: Math.floor(tokens),
+          refillPerSecond: datamuseRefillPerSecond,
+          resetsInSeconds: secondsUntilNextUtcDay(now),
+        },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
     if (request.method !== "POST" || url.pathname !== "/lease") {
       return Response.json({ error: "not found" }, { status: 404 });
     }
@@ -1156,6 +1247,12 @@ export default {
         request.method === "POST"
       ) {
         return enrichmentTranslationBatch(request, ctx);
+      }
+      if (
+        url.pathname === "/internal/api/datamuse-quota" &&
+        request.method === "GET"
+      ) {
+        return datamuseQuotaStatus(env);
       }
       return Response.json({ detail: "not found" }, { status: 404 });
     }

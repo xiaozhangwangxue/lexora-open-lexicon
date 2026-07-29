@@ -86,6 +86,18 @@ Cloudflare 中转层合并为每批最多 8 个词条。核心采集每个缓存
 Cloudflare 中转层还会使用全局免费额度限流器作为第二道保护；静态间隔仍需保留，
 避免持续产生 429 重试并消耗 Workers 免费请求量。
 
+运维时可用源站令牌读取只读的 Datamuse 全局额度状态；该接口不会消耗额度，
+也不会对未携带正确令牌的请求暴露数据：
+
+```sh
+curl -H "X-Lexora-Origin-Token: $LEXORA_ORIGIN_TOKEN" \
+  https://dict.12323456.xyz/internal/api/datamuse-quota
+```
+
+`dailyUsed`、`dailyRemaining` 和 `burstRemaining` 是决定是否调速的依据。不要仅因
+机器 CPU 空闲就缩短静态间隔；只有持续观测仍有突发令牌余量、没有 429，且上游
+请求速率仍符合免费政策时才可调整。
+
 查询中转使用 `deploy/lexora-lexicon-micro.service`，由 Cloudflare Worker
 `worker/dictionary-edge.js` 通过 `dict.12323456.xyz` 访问。源站必须设置
 `LEXORA_ORIGIN_TOKEN`，Worker 使用同名 secret；不要把令牌写入仓库。

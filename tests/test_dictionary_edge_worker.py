@@ -1514,6 +1514,133 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
         self.assertGreater(int(result["dailyBlocked"]["retryAfter"]), 0)
         self.assertEqual(result["row"]["used"], 89999)
 
+    def test_durable_object_reports_quota_without_consuming_it(self) -> None:
+        script = f"""
+          let now = Date.UTC(2026, 6, 29, 12, 0, 0);
+          Date.now = () => now;
+          const database = {{ row: null }};
+          const sql = {{
+            exec: (query, ...bindings) => {{
+              const normalized = query.replace(/\\s+/g, " ").trim();
+              if (normalized.startsWith("CREATE TABLE")) return [];
+              if (normalized.startsWith("INSERT OR IGNORE")) {{
+                if (!database.row) {{
+                  database.row = {{
+                    utc_day: bindings[0],
+                    used: 0,
+                    tokens: bindings[1],
+                    last_refill_ms: bindings[2],
+                  }};
+                }}
+                return [];
+              }}
+              if (normalized.startsWith("SELECT utc_day")) {{
+                return database.row ? [{{ ...database.row }}] : [];
+              }}
+              if (normalized.startsWith("UPDATE datamuse_quota")) {{
+                database.row = {{
+                  utc_day: bindings[0],
+                  used: bindings[1],
+                  tokens: bindings[2],
+                  last_refill_ms: bindings[3],
+                }};
+                return [];
+              }}
+              throw new Error(`unexpected SQL: ${{normalized}}`);
+            }},
+          }};
+          let ready = Promise.resolve();
+          const state = {{
+            storage: {{ sql }},
+            blockConcurrencyWhile: (callback) => {{
+              ready = callback();
+              return ready;
+            }},
+          }};
+          const {{ DatamuseRateLimiter }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const limiter = new DatamuseRateLimiter(state);
+          await ready;
+          const leaseResponse = await limiter.fetch(
+            new Request(
+              "https://datamuse-rate-limiter.invalid/lease",
+              {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/json" }},
+                body: JSON.stringify({{ cost: 7 }}),
+              }},
+            ),
+          );
+          await leaseResponse.json();
+          now += 3000;
+          const statusResponse = await limiter.fetch(
+            new Request("https://datamuse-rate-limiter.invalid/status"),
+          );
+          console.log(JSON.stringify({{
+            status: statusResponse.status,
+            cacheControl: statusResponse.headers.get("Cache-Control"),
+            body: await statusResponse.json(),
+            row: database.row,
+          }}));
+        """
+        result = self.run_node(script)
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["cacheControl"], "no-store")
+        self.assertEqual(result["body"]["dailyLimit"], 90000)
+        self.assertEqual(result["body"]["dailyUsed"], 7)
+        self.assertEqual(result["body"]["dailyRemaining"], 89993)
+        self.assertEqual(result["body"]["burstRemaining"], 28)
+        self.assertEqual(result["row"]["used"], 7)
+
+    def test_internal_quota_status_requires_origin_token(self) -> None:
+        script = f"""
+          const requestedPaths = [];
+          const quota = {{
+            idFromName: (name) => name,
+            get: () => ({{
+              fetch: async (input) => {{
+                requestedPaths.push(new URL(String(input)).pathname);
+                return Response.json({{
+                  utcDay: "2026-07-29",
+                  dailyLimit: 90000,
+                  dailyUsed: 321,
+                  dailyRemaining: 89679,
+                }});
+              }},
+            }}),
+          }};
+          const {{ default: worker }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const call = (token) => worker.fetch(
+            new Request(
+              "https://dict.example/internal/api/datamuse-quota",
+              {{ headers: {{ "X-Lexora-Origin-Token": token }} }},
+            ),
+            {{
+              ORIGIN_TOKEN: "test-token",
+              DATAMUSE_RATE_LIMITER: quota,
+            }},
+            {{ waitUntil: () => undefined }},
+          );
+          const denied = await call("wrong-token");
+          const allowed = await call("test-token");
+          console.log(JSON.stringify({{
+            deniedStatus: denied.status,
+            allowedStatus: allowed.status,
+            cacheControl: allowed.headers.get("Cache-Control"),
+            body: await allowed.json(),
+            requestedPaths,
+          }}));
+        """
+        result = self.run_node(script)
+        self.assertEqual(result["deniedStatus"], 404)
+        self.assertEqual(result["allowedStatus"], 200)
+        self.assertEqual(result["cacheControl"], "no-store")
+        self.assertEqual(result["body"]["dailyUsed"], 321)
+        self.assertEqual(result["requestedPaths"], ["/status"])
+
     def test_translation_batch_keeps_each_google_result_mapped_to_its_text(
         self,
     ) -> None:
