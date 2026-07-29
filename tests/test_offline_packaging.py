@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from build_oxford_scope import SCHEMA  # noqa: E402
+from auto_export_ready_shard import export_if_ready  # noqa: E402
 from export_enrichment_shard import export_delta  # noqa: E402
 from package_offline_lexicons import compress, copy_fast, copy_full  # noqa: E402
 
@@ -78,6 +79,43 @@ def build_source(path: Path) -> None:
 
 
 class OfflinePackagingTest(unittest.TestCase):
+    def test_auto_export_waits_and_then_creates_an_atomic_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sqlite"
+            output = root / "exports" / "fast.sqlite"
+            build_source(source)
+            database = sqlite3.connect(source)
+            database.execute(
+                "UPDATE entries SET enrichment_json='{}' WHERE id=2"
+            )
+            database.commit()
+            database.close()
+
+            self.assertEqual(
+                export_if_ready(source, output, 0, 1, 2),
+                "waiting finished=1 total=2",
+            )
+            self.assertFalse(output.exists())
+
+            database = sqlite3.connect(source)
+            database.execute(
+                "UPDATE entries SET enrichment_json='{\"status\":\"partial\"}' "
+                "WHERE id=2"
+            )
+            database.commit()
+            database.close()
+            self.assertTrue(
+                export_if_ready(source, output, 0, 1, 2).startswith(
+                    "created rows=2"
+                )
+            )
+            self.assertTrue(
+                export_if_ready(source, output, 0, 1, 2).startswith(
+                    "ready rows=2"
+                )
+            )
+
     def test_exports_only_the_requested_shard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
