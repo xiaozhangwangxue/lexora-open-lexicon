@@ -80,6 +80,18 @@ class DeploymentConfigTest(unittest.TestCase):
         )
         self.assertNotIn("lexora-enrich-micro@", timer)
 
+    def test_progress_snapshot_is_low_priority_and_cached(self) -> None:
+        service = (
+            ROOT / "deploy" / "lexora-progress-snapshot@.service"
+        ).read_text(encoding="utf-8")
+        timer = (
+            ROOT / "deploy" / "lexora-progress-snapshot@.timer"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Nice=19", service)
+        self.assertIn("IOSchedulingClass=idle", service)
+        self.assertIn("progress-shard-%i.json", service)
+        self.assertIn("OnUnitActiveSec=30min", timer)
+
 
 if __name__ == "__main__":
     unittest.main()
