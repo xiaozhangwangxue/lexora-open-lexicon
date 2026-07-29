@@ -357,19 +357,51 @@ class EdgeDictionaryBatcher:
             min(0.5, retry_jitter_ratio),
         )
         self.pending: list[
-            tuple[str, asyncio.Future[tuple[Any | None, int | None, str | None]]]
+            tuple[
+                str,
+                dict[str, bool],
+                asyncio.Future[
+                    tuple[Any | None, int | None, str | None]
+                ],
+            ]
         ] = []
         self.lock = asyncio.Lock()
         self.flush_task: asyncio.Task[None] | None = None
 
     async def request(
-        self, term: str
+        self,
+        term: str,
+        needs: dict[str, bool] | None = None,
     ) -> tuple[Any | None, int | None, str | None]:
         future: asyncio.Future[tuple[Any | None, int | None, str | None]] = (
             asyncio.get_running_loop().create_future()
         )
+        legacy_needs = {
+            "definition": True,
+            "pos": True,
+            "phonetic": True,
+            "examples": True,
+            "frequency": True,
+            "deep": self.profile == "deep",
+            "usPhonetic": True,
+            "ukPhonetic": True,
+        }
+        requested_needs = legacy_needs if needs is None else needs
+        normalized_needs = {
+            name: bool(requested_needs.get(name))
+            for name in (
+                "definition",
+                "pos",
+                "phonetic",
+                "examples",
+                "frequency",
+                "deep",
+                "usPhonetic",
+                "ukPhonetic",
+            )
+        }
         async with self.lock:
-            self.pending.append((term, future))
+            self.pending.append((term, normalized_needs, future))
             if self.flush_task is None:
                 self.flush_task = asyncio.create_task(self._flush())
         return await future
@@ -384,7 +416,21 @@ class EdgeDictionaryBatcher:
                 if not batch:
                     self.flush_task = None
                     return
-            terms = [term for term, _ in batch]
+            # A dataset normally contains each normalized term once, but
+            # merging duplicate requests here keeps result mapping correct
+            # when concurrent callers ask for different fields.
+            terms: list[str] = []
+            needs_by_term: dict[str, dict[str, bool]] = {}
+            for term, needs, _ in batch:
+                if term not in needs_by_term:
+                    terms.append(term)
+                    needs_by_term[term] = dict(needs)
+                    continue
+                for name, required in needs.items():
+                    needs_by_term[term][name] = (
+                        needs_by_term[term].get(name, False)
+                        or required
+                    )
             status: int | None = None
             error: str | None = None
             results: dict[str, Any] = {}
@@ -399,7 +445,11 @@ class EdgeDictionaryBatcher:
                     await self.gate.wait()
                     response = await self.client.post(
                         f"{EDGE_BASE}/api/dictionary/batch",
-                        json={"terms": terms, "profile": self.profile},
+                        json={
+                            "terms": terms,
+                            "profile": self.profile,
+                            "needs": needs_by_term,
+                        },
                         headers={
                             "Accept": "application/json",
                             "User-Agent": "LexoraOpenLexicon/1.0 (open-data enrichment)",
@@ -498,12 +548,12 @@ class EdgeDictionaryBatcher:
                     queued = self.pending
                     self.pending = []
                     self.flush_task = None
-                for _, future in [*batch, *queued]:
+                for _, _, future in [*batch, *queued]:
                     if not future.done():
                         future.set_exception(fatal_error)
                 return
 
-            for term, future in batch:
+            for term, _, future in batch:
                 item = results.get(term)
                 if not isinstance(item, dict):
                     # A successful outer batch response does not mean every
@@ -1043,7 +1093,27 @@ async def enrich_term(
             sources.append("datamuse_antonyms")
     async def fetch(source: str) -> tuple[str, Any | None, int | None, str | None]:
         if source == "edge" and edge_batcher is not None:
-            data, status, error = await edge_batcher.request(term)
+            data, status, error = await edge_batcher.request(
+                term,
+                {
+                    "definition": needs_definition,
+                    "pos": needs_pos,
+                    "phonetic": needs_phonetic,
+                    "examples": needs_examples,
+                    "frequency": needs_frequency,
+                    "deep": needs_deep,
+                    # The public need remains ``phonetic``.  The two optional
+                    # dialect hints let the edge avoid spending an exact
+                    # lookup when only a UK transcription is absent:
+                    # Datamuse exact can currently fill US IPA only.
+                    "usPhonetic": needs_phonetic_repair(
+                        existing.get("us")
+                    ),
+                    "ukPhonetic": needs_phonetic_repair(
+                        existing.get("uk")
+                    ),
+                },
+            )
             return source, data, status, error
         gate = gates["datamuse"] if source.startswith("datamuse") else gates[source]
         data, status, error = await request_json(client, gate, urls[source], source)
@@ -1069,6 +1139,8 @@ async def enrich_term(
                 ]
                 if not bool(data.get("_found")):
                     provider_status = "not_found"
+                elif data.get("_complete") is False:
+                    provider_status = "partial"
                 elif provider_ok and all(provider_ok):
                     provider_status = "completed"
                 elif any(provider_ok):

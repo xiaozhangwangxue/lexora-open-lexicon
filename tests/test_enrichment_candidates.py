@@ -19,6 +19,29 @@ import enrich_oxford_scope as enrichment  # noqa: E402
 from enrich_oxford_scope import fetch_candidate_batch  # noqa: E402
 
 
+def edge_payload(
+    terms: list[str],
+    profile: str = "core",
+    *,
+    needs: dict[str, dict[str, bool]] | None = None,
+) -> dict[str, Any]:
+    if needs is None:
+        needs = {
+            term: {
+                "definition": True,
+                "pos": True,
+                "phonetic": True,
+                "examples": True,
+                "frequency": True,
+                "deep": profile == "deep",
+                "usPhonetic": True,
+                "ukPhonetic": True,
+            }
+            for term in terms
+        }
+    return {"terms": terms, "profile": profile, "needs": needs}
+
+
 class _TrackedReadCursor:
     def __init__(
         self,
@@ -184,12 +207,15 @@ class CandidateBatchTest(unittest.TestCase):
         class RecordingBatcher:
             def __init__(self) -> None:
                 self.terms: list[str] = []
+                self.needs: list[dict[str, bool]] = []
 
             async def request(
                 self,
                 term: str,
+                needs: dict[str, bool],
             ) -> tuple[Any, int, None]:
                 self.terms.append(term)
+                self.needs.append(needs)
                 return (
                     {
                         "dictionary": None,
@@ -261,6 +287,21 @@ class CandidateBatchTest(unittest.TestCase):
                                 profile="deep",
                             )
                     self.assertEqual(batcher.terms, ["word"])
+                    self.assertEqual(
+                        batcher.needs,
+                        [
+                            {
+                                "definition": False,
+                                "pos": False,
+                                "phonetic": False,
+                                "examples": False,
+                                "frequency": False,
+                                "deep": True,
+                                "usPhonetic": False,
+                                "ukPhonetic": False,
+                            }
+                        ],
+                    )
                     self.assertEqual(result["_attempted"], ["edge"])
                     self.assertEqual(result["synonyms"], ["term"])
                     self.assertEqual(result["antonyms"], ["silence"])
@@ -301,7 +342,12 @@ class CandidateBatchTest(unittest.TestCase):
 
     def test_edge_provider_metadata_marks_partial_success(self) -> None:
         class PartialBatcher:
-            async def request(self, term: str) -> tuple[Any, int, None]:
+            async def request(
+                self,
+                term: str,
+                needs: dict[str, bool],
+            ) -> tuple[Any, int, None]:
+                self.assert_needs = needs
                 return (
                     {
                         "dictionary": [
@@ -456,7 +502,7 @@ class CandidateBatchTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     json.loads(request.content),
-                    {"terms": ["word", "e.g."], "profile": "core"},
+                    edge_payload(["word", "e.g."]),
                 )
                 results = {
                     "word": {
@@ -507,7 +553,7 @@ class CandidateBatchTest(unittest.TestCase):
             def handler(request: httpx.Request) -> httpx.Response:
                 self.assertEqual(
                     json.loads(request.content),
-                    {"terms": ["word"], "profile": "deep"},
+                    edge_payload(["word"], "deep"),
                 )
                 return httpx.Response(
                     200,
@@ -539,6 +585,87 @@ class CandidateBatchTest(unittest.TestCase):
                     result = await batcher.request("word")
 
             self.assertEqual(result, ({"_profile": "deep"}, 200, None))
+
+        asyncio.run(scenario())
+
+    def test_edge_batch_sends_each_terms_missing_field_needs(self) -> None:
+        async def scenario() -> None:
+            posted: list[dict[str, Any]] = []
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                posted.append(json.loads(request.content))
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": {
+                            term: {
+                                "status": 200,
+                                "data": {"dictionary": []},
+                            }
+                            for term in ("definition-gap", "frequency-gap")
+                        }
+                    },
+                )
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                batcher = enrichment.EdgeDictionaryBatcher(
+                    client,
+                    enrichment.HostGate(0),
+                    batch_size=8,
+                    flush_delay=0,
+                )
+                with patch.object(
+                    enrichment,
+                    "EDGE_BASE",
+                    "https://edge.example",
+                ):
+                    await asyncio.gather(
+                        batcher.request(
+                            "definition-gap",
+                            {
+                                "definition": True,
+                                "phonetic": True,
+                                "usPhonetic": True,
+                            },
+                        ),
+                        batcher.request(
+                            "frequency-gap",
+                            {"frequency": True},
+                        ),
+                    )
+
+            self.assertEqual(
+                posted,
+                [
+                    edge_payload(
+                        ["definition-gap", "frequency-gap"],
+                        needs={
+                            "definition-gap": {
+                                "definition": True,
+                                "pos": False,
+                                "phonetic": True,
+                                "examples": False,
+                                "frequency": False,
+                                "deep": False,
+                                "usPhonetic": True,
+                                "ukPhonetic": False,
+                            },
+                            "frequency-gap": {
+                                "definition": False,
+                                "pos": False,
+                                "phonetic": False,
+                                "examples": False,
+                                "frequency": True,
+                                "deep": False,
+                                "usPhonetic": False,
+                                "ukPhonetic": False,
+                            },
+                        },
+                    )
+                ],
+            )
 
         asyncio.run(scenario())
 
@@ -602,8 +729,8 @@ class CandidateBatchTest(unittest.TestCase):
             self.assertEqual(
                 requests,
                 [
-                    {"terms": ["word"], "profile": "core"},
-                    {"terms": ["word"], "profile": "core"},
+                    edge_payload(["word"]),
+                    edge_payload(["word"]),
                 ],
             )
             self.assertEqual(sleeps, [2.25])
@@ -657,7 +784,7 @@ class CandidateBatchTest(unittest.TestCase):
 
             self.assertEqual(
                 requests,
-                [{"terms": ["word"], "profile": "core"}] * 3,
+                [edge_payload(["word"])] * 3,
             )
             self.assertEqual(sleeps, [1.0, 2.0])
             failure = outcomes[0]
@@ -707,7 +834,7 @@ class CandidateBatchTest(unittest.TestCase):
 
             self.assertEqual(
                 requests,
-                [{"terms": ["word"], "profile": "core"}],
+                [edge_payload(["word"])],
             )
             self.assertTrue(
                 all(
@@ -753,8 +880,9 @@ class CandidateBatchTest(unittest.TestCase):
         async def fail_request(
             batcher: enrichment.EdgeDictionaryBatcher,
             term: str,
+            needs: dict[str, bool],
         ) -> tuple[Any | None, int | None, str | None]:
-            del batcher, term
+            del batcher, term, needs
             raise enrichment.EdgeBatchRetryExhausted(
                 status=429,
                 attempts=1,

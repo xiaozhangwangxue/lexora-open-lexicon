@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically watch Lexora four-shard enrichment shard %i
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Persistent=true
+Unit=lexora-enrich-full-watch@%i.service
+
+[Install]
+WantedBy=timers.target

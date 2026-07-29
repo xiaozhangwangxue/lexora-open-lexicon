@@ -29,6 +29,57 @@ class DeploymentConfigTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("--profile auto", service)
 
+    def test_micro_watchdog_only_restarts_micro_service(self) -> None:
+        watch = (
+            ROOT / "deploy" / "lexora-enrich-watch@.service"
+        ).read_text(encoding="utf-8")
+        recover = (
+            ROOT / "deploy" / "lexora-enrich-recover@.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn("After=lexora-enrich-micro@%i.service", watch)
+        self.assertIn("OnFailure=lexora-enrich-recover@%i.service", watch)
+        self.assertIn(
+            "systemctl is-active --quiet lexora-enrich-micro@%i.service",
+            watch,
+        )
+        self.assertIn(
+            "systemctl restart lexora-enrich-micro@%i.service",
+            recover,
+        )
+
+    def test_full_watchdog_only_restarts_full_service(self) -> None:
+        watch = (
+            ROOT / "deploy" / "lexora-enrich-full-watch@.service"
+        ).read_text(encoding="utf-8")
+        recover = (
+            ROOT / "deploy" / "lexora-enrich-full-recover@.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn("After=lexora-enrich@%i.service", watch)
+        self.assertIn(
+            "OnFailure=lexora-enrich-full-recover@%i.service",
+            watch,
+        )
+        self.assertIn(
+            "systemctl is-active --quiet lexora-enrich@%i.service",
+            watch,
+        )
+        self.assertIn(
+            "systemctl restart lexora-enrich@%i.service",
+            recover,
+        )
+        self.assertNotIn("lexora-enrich-micro@", watch)
+        self.assertNotIn("lexora-enrich-micro@", recover)
+
+    def test_full_watchdog_timer_targets_full_watchdog(self) -> None:
+        timer = (
+            ROOT / "deploy" / "lexora-enrich-full-watch@.timer"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "Unit=lexora-enrich-full-watch@%i.service",
+            timer,
+        )
+        self.assertNotIn("lexora-enrich-micro@", timer)
+
 
 if __name__ == "__main__":
     unittest.main()

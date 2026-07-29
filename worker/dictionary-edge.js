@@ -179,21 +179,70 @@ function isValidTerm(term) {
   return /^[a-z][a-z' .-]{0,119}$/.test(term);
 }
 
-function enrichmentProviderNames(profile) {
-  return profile === "deep"
-    ? ["dictionary", "related", "exact", "synonyms", "antonyms"]
-    : ["dictionary", "exact"];
+const enrichmentNeedNames = [
+  "definition",
+  "pos",
+  "phonetic",
+  "examples",
+  "frequency",
+  "deep",
+  "usPhonetic",
+  "ukPhonetic",
+];
+
+function legacyEnrichmentNeeds(profile) {
+  return {
+    definition: true,
+    pos: true,
+    phonetic: true,
+    examples: true,
+    frequency: true,
+    deep: profile === "deep",
+    usPhonetic: true,
+    ukPhonetic: true,
+  };
 }
 
-function datamuseRequestCount(profile) {
-  return enrichmentProviderNames(profile).filter(
-    (name) => name !== "dictionary",
-  ).length;
+function normalizeEnrichmentNeeds(value, profile, legacy = false) {
+  const source =
+    !legacy && value && typeof value === "object" && !Array.isArray(value)
+      ? value
+      : legacyEnrichmentNeeds(profile);
+  const needs = Object.fromEntries(
+    enrichmentNeedNames.map((name) => [name, source[name] === true]),
+  );
+  // Dialect hints refine ``phonetic`` and are never standalone requests.
+  if (!needs.phonetic) {
+    needs.usPhonetic = false;
+    needs.ukPhonetic = false;
+  } else if (!needs.usPhonetic && !needs.ukPhonetic) {
+    // Clients predating the optional hints still get a useful generic
+    // pronunciation lookup.
+    needs.usPhonetic = true;
+  }
+  // A core request cannot accidentally opt into the three deep providers.
+  needs.deep = profile === "deep" && needs.deep;
+  return needs;
 }
 
-function enrichmentCacheKey(term, profile) {
+function mergeEnrichmentNeeds(target, incoming) {
+  return Object.fromEntries(
+    enrichmentNeedNames.map((name) => [
+      name,
+      Boolean(target?.[name] || incoming?.[name]),
+    ]),
+  );
+}
+
+function enrichmentNeedSignature(needs) {
+  return enrichmentNeedNames
+    .map((name) => (needs[name] ? "1" : "0"))
+    .join("");
+}
+
+function enrichmentCacheKey(term, profile, needs) {
   return new Request(
-    `https://lexora-enrichment-cache.invalid/v4/${profile}/${encodeURIComponent(term)}`,
+    `https://lexora-enrichment-cache.invalid/v5/${profile}/${enrichmentNeedSignature(needs)}/${encodeURIComponent(term)}`,
   );
 }
 
@@ -246,31 +295,20 @@ async function leaseDatamuseQuota(env, cost) {
 async function enrichmentTerm(
   term,
   profile,
+  needs,
+  quotaLease,
   ctx,
   {
     cachedResponse = null,
     cacheChecked = false,
-    quotaGranted = false,
   } = {},
 ) {
   const cache = caches.default;
-  const cacheKey = enrichmentCacheKey(term, profile);
+  const cacheKey = enrichmentCacheKey(term, profile, needs);
   if (cachedResponse) return cachedResponse;
   if (!cacheChecked) {
     const cached = await cache.match(cacheKey);
     if (cached) return cached;
-  }
-  if (!quotaGranted) {
-    return Response.json(
-      { error: "Datamuse quota lease required" },
-      {
-        status: 429,
-        headers: {
-          "Cache-Control": "no-store",
-          "Retry-After": "60",
-        },
-      },
-    );
   }
 
   const availableRequests = {
@@ -297,14 +335,6 @@ async function enrichmentTerm(
       max: "12",
     })}`,
   };
-  // The first pass only needs the exact result for definition/POS/IPA/frequency.
-  // Synonym, antonym and related-word gaps are handled from local open datasets
-  // and by an explicit deep pass.  This keeps the public Datamuse workload
-  // within its documented daily free allowance.
-  const requestNames = enrichmentProviderNames(profile);
-  const requests = Object.fromEntries(
-    requestNames.map((name) => [name, availableRequests[name]]),
-  );
 
   const jsonProvider = async (input) => {
     try {
@@ -371,71 +401,131 @@ async function enrichmentTerm(
       };
     }
   };
-  const outcomes = await Promise.all(
-    Object.values(requests).map(jsonProvider),
-  );
-  if (outcomes.every((outcome) => !outcome.provider.ok)) {
-    return Response.json(
-      { error: "Dictionary providers are temporarily unavailable" },
-      { status: 504, headers: { "Cache-Control": "no-store" } },
+
+  const dictionaryCapabilities = (data) => {
+    const capabilities = {
+      definition: false,
+      pos: false,
+      examples: false,
+      usPhonetic: false,
+      ukPhonetic: false,
+    };
+    if (!Array.isArray(data)) return capabilities;
+    for (const entry of data) {
+      if (!entry || typeof entry !== "object") continue;
+      for (const phonetic of Array.isArray(entry.phonetics)
+        ? entry.phonetics
+        : []) {
+        const text = String(phonetic?.text ?? "").trim();
+        if (!text) continue;
+        const audio = String(phonetic?.audio ?? "").toLowerCase();
+        if (audio.includes("-us.") || audio.includes("/us/")) {
+          capabilities.usPhonetic = true;
+        } else if (audio.includes("-uk.") || audio.includes("/uk/")) {
+          capabilities.ukPhonetic = true;
+        }
+      }
+      for (const meaning of Array.isArray(entry.meanings)
+        ? entry.meanings
+        : []) {
+        if (String(meaning?.partOfSpeech ?? "").trim()) {
+          capabilities.pos = true;
+        }
+        for (const definition of Array.isArray(meaning?.definitions)
+          ? meaning.definitions
+          : []) {
+          if (String(definition?.definition ?? "").trim()) {
+            capabilities.definition = true;
+          }
+          if (String(definition?.example ?? "").trim()) {
+            capabilities.examples = true;
+          }
+        }
+      }
+    }
+    return capabilities;
+  };
+
+  const exactCapabilities = (data) => {
+    const capabilities = {
+      definition: false,
+      pos: false,
+      usPhonetic: false,
+      frequency: false,
+    };
+    if (!Array.isArray(data)) return capabilities;
+    for (const item of data) {
+      if (
+        !item ||
+        typeof item !== "object" ||
+        normalizeTerm(item.word) !== term
+      ) {
+        continue;
+      }
+      if (
+        Array.isArray(item.defs) &&
+        item.defs.some((value) => String(value ?? "").trim())
+      ) {
+        capabilities.definition = true;
+      }
+      for (const tag of Array.isArray(item.tags) ? item.tags : []) {
+        const value = String(tag);
+        if (["n", "v", "adj", "adv"].includes(value)) {
+          capabilities.pos = true;
+        } else if (
+          value.startsWith("ipa_pron:") &&
+          value.slice("ipa_pron:".length).trim()
+        ) {
+          capabilities.usPhonetic = true;
+        } else if (value.startsWith("f:")) {
+          const frequency = Number(value.slice(2));
+          if (Number.isFinite(frequency) && frequency > 0) {
+            capabilities.frequency = true;
+          }
+        }
+      }
+    }
+    return capabilities;
+  };
+
+  const dictionaryNeeded =
+    needs.definition ||
+    needs.pos ||
+    needs.phonetic ||
+    needs.examples ||
+    needs.deep;
+  const providerResults = new Map();
+  if (dictionaryNeeded) {
+    providerResults.set(
+      "dictionary",
+      await jsonProvider(availableRequests.dictionary),
     );
   }
-
-  const providerNames = Object.keys(requests);
-  const result = Object.fromEntries(
-    providerNames.map((key, index) => [key, outcomes[index].data]),
+  const dictionary = dictionaryCapabilities(
+    providerResults.get("dictionary")?.data,
   );
-  result._providers = Object.fromEntries(
-    providerNames.map((key, index) => [key, outcomes[index].provider]),
-  );
-  result._found = outcomes.some((outcome) => outcome.provider.found);
-  result._profile = profile;
 
-  const allProvidersSucceeded = outcomes.every(
-    (outcome) => outcome.provider.ok,
-  );
-  const cacheTtl = allProvidersSucceeded ? 604800 : 3600;
-  const response = Response.json(result, {
-    headers: { "Cache-Control": `public, max-age=${cacheTtl}` },
-  });
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
-  return response;
-}
-
-async function enrichmentDictionaryBatch(request, env, ctx) {
-  let terms;
-  // Older collectors did not send a profile.  Default them to the bounded
-  // core pass so a rolling deployment can never multiply Datamuse usage.
-  let profile = "core";
-  try {
-    const payload = await request.json();
-    profile = payload.profile === "deep" ? "deep" : "core";
-    const seen = new Set();
-    terms = Array.isArray(payload.terms)
-      ? payload.terms
-          .map(normalizeTerm)
-          .filter((term) => {
-            if (!isValidTerm(term) || seen.has(term)) return false;
-            seen.add(term);
-            return true;
-          })
-          .slice(0, 8)
+  // Datamuse exact adds definition/POS/US IPA and frequency.  It cannot add
+  // examples or a UK transcription, so those gaps alone must not consume the
+  // globally limited free allowance.
+  const exactFallbackNeeded =
+    needs.frequency ||
+    (needs.definition && !dictionary.definition) ||
+    (needs.pos && !dictionary.pos) ||
+    (needs.phonetic &&
+      needs.usPhonetic &&
+      !dictionary.usPhonetic);
+  const datamuseNames = needs.deep
+    ? [
+        "related",
+        ...(exactFallbackNeeded ? ["exact"] : []),
+        "synonyms",
+        "antonyms",
+      ]
+    : exactFallbackNeeded
+      ? ["exact"]
       : [];
-  } catch {
-    return Response.json({ error: "Invalid JSON" }, { status: 400 });
-  }
-  if (terms.length === 0) return Response.json({ results: {} });
-
-  const cache = caches.default;
-  const cacheKeys = terms.map((term) => enrichmentCacheKey(term, profile));
-  const cachedResponses = await Promise.all(
-    cacheKeys.map((cacheKey) => cache.match(cacheKey)),
-  );
-  const missingCount = cachedResponses.filter(
-    (response) => !response,
-  ).length;
-  const quotaCost = missingCount * datamuseRequestCount(profile);
-  const lease = await leaseDatamuseQuota(env, quotaCost);
+  const lease = await quotaLease(datamuseNames.length);
   if (!lease.granted) {
     return Response.json(
       {
@@ -451,25 +541,221 @@ async function enrichmentDictionaryBatch(request, env, ctx) {
       },
     );
   }
+  const datamuseOutcomes = await Promise.all(
+    datamuseNames.map((name) => jsonProvider(availableRequests[name])),
+  );
+  datamuseNames.forEach((name, index) => {
+    providerResults.set(name, datamuseOutcomes[index]);
+  });
+
+  const requestNames = Array.from(providerResults.keys());
+  const outcomes = requestNames.map((name) => providerResults.get(name));
+  if (
+    outcomes.length > 0 &&
+    outcomes.every((outcome) => !outcome.provider.ok)
+  ) {
+    return Response.json(
+      { error: "Dictionary providers are temporarily unavailable" },
+      { status: 504, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+
+  const result = Object.fromEntries(
+    requestNames.map((key, index) => [key, outcomes[index].data]),
+  );
+  result._providers = Object.fromEntries(
+    requestNames.map((key, index) => [key, outcomes[index].provider]),
+  );
+  result._found = outcomes.some((outcome) => outcome.provider.found);
+  result._profile = profile;
+  result._needs = needs;
+
+  const exact = exactCapabilities(providerResults.get("exact")?.data);
+  const phoneticComplete =
+    !needs.phonetic ||
+    ((!needs.usPhonetic ||
+      dictionary.usPhonetic ||
+      exact.usPhonetic) &&
+      (!needs.ukPhonetic || dictionary.ukPhonetic));
+  const deepComplete =
+    !needs.deep ||
+    ["related", "synonyms", "antonyms"].every(
+      (name) => providerResults.get(name)?.provider?.ok === true,
+    );
+  result._complete =
+    (!needs.definition ||
+      dictionary.definition ||
+      exact.definition) &&
+    (!needs.pos || dictionary.pos || exact.pos) &&
+    phoneticComplete &&
+    (!needs.examples || dictionary.examples) &&
+    (!needs.frequency || exact.frequency) &&
+    deepComplete;
+
+  const allProvidersSucceeded = outcomes.every(
+    (outcome) => outcome.provider.ok,
+  );
+  const cacheTtl =
+    allProvidersSucceeded && (result._complete || !result._found)
+      ? 604800
+      : 3600;
+  const response = Response.json(result, {
+    headers: { "Cache-Control": `public, max-age=${cacheTtl}` },
+  });
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return response;
+}
+
+async function enrichmentDictionaryBatch(request, env, ctx) {
+  let requests;
+  // Older collectors did not send a profile.  Default them to the bounded
+  // core pass so a rolling deployment can never multiply Datamuse usage.
+  let profile = "core";
+  try {
+    const payload = await request.json();
+    profile = payload.profile === "deep" ? "deep" : "core";
+    const explicitNeeds =
+      payload.needs &&
+      typeof payload.needs === "object" &&
+      !Array.isArray(payload.needs)
+        ? payload.needs
+        : null;
+    const byTerm = new Map();
+    for (const raw of Array.isArray(payload.terms) ? payload.terms : []) {
+      const rawTerm =
+        raw && typeof raw === "object" && !Array.isArray(raw)
+          ? raw.term
+          : raw;
+      const term = normalizeTerm(rawTerm);
+      if (!isValidTerm(term)) continue;
+      const inlineNeeds =
+        raw && typeof raw === "object" && !Array.isArray(raw)
+          ? raw.needs
+          : null;
+      const mappedNeeds =
+        explicitNeeds &&
+        Object.prototype.hasOwnProperty.call(explicitNeeds, term)
+          ? explicitNeeds[term]
+          : null;
+      const rawNeeds = inlineNeeds ?? mappedNeeds;
+      const needs = normalizeEnrichmentNeeds(
+        rawNeeds,
+        profile,
+        rawNeeds === null,
+      );
+      if (byTerm.has(term)) {
+        byTerm.set(
+          term,
+          mergeEnrichmentNeeds(byTerm.get(term), needs),
+        );
+      } else if (byTerm.size < 8) {
+        byTerm.set(term, needs);
+      }
+    }
+    requests = Array.from(byTerm, ([term, needs]) => ({ term, needs }));
+  } catch {
+    return Response.json({ error: "Invalid JSON" }, { status: 400 });
+  }
+  if (requests.length === 0) return Response.json({ results: {} });
+
+  const cache = caches.default;
+  const cacheKeys = requests.map(({ term, needs }) =>
+    enrichmentCacheKey(term, profile, needs),
+  );
+  const cachedResponses = await Promise.all(
+    cacheKeys.map((cacheKey) => cache.match(cacheKey)),
+  );
+  const missingCount = cachedResponses.filter(
+    (response) => !response,
+  ).length;
+  const pendingLeases = [];
+  let leaseStarted = false;
+  const coordinatedLease = (cost) =>
+    new Promise((resolve) => {
+      pendingLeases.push({ cost, resolve });
+      if (leaseStarted || pendingLeases.length < missingCount) return;
+      leaseStarted = true;
+      const totalCost = pendingLeases.reduce(
+        (sum, item) => sum + item.cost,
+        0,
+      );
+      leaseDatamuseQuota(env, totalCost)
+        .then((lease) => {
+          pendingLeases.forEach((item) =>
+            item.resolve(
+              item.cost === 0
+                ? { granted: true, retryAfter: 0 }
+                : lease,
+            ),
+          );
+        })
+        .catch(() => {
+          const failure = { granted: false, retryAfter: 60 };
+          pendingLeases.forEach((item) =>
+            item.resolve(
+              item.cost === 0
+                ? { granted: true, retryAfter: 0 }
+                : failure,
+            ),
+          );
+        });
+    });
 
   const entries = await Promise.all(
-    terms.map(async (term, index) => {
-      const response = await enrichmentTerm(term, profile, ctx, {
-        cachedResponse: cachedResponses[index],
-        cacheChecked: true,
-        quotaGranted: true,
-      });
+    requests.map(async ({ term, needs }, index) => {
+      const response = await enrichmentTerm(
+        term,
+        profile,
+        needs,
+        coordinatedLease,
+        ctx,
+        {
+          cachedResponse: cachedResponses[index],
+          cacheChecked: true,
+        },
+      );
       let data;
       try {
         data = await response.json();
       } catch {
         data = { error: "Invalid upstream response" };
       }
-      return [term, { status: response.status, data }];
+      return {
+        term,
+        response,
+        item: { status: response.status, data },
+      };
     }),
   );
+  const quotaFailures = entries.filter(
+    ({ response }) => response.status === 429,
+  );
+  if (quotaFailures.length > 0) {
+    const retryAfter = Math.max(
+      ...quotaFailures.map(({ response }) =>
+        normalizedRetryAfter(response.headers.get("Retry-After")),
+      ),
+    );
+    return Response.json(
+      {
+        error: "Datamuse free quota is temporarily unavailable",
+        retryAfter,
+      },
+      {
+        status: 429,
+        headers: {
+          "Cache-Control": "no-store",
+          "Retry-After": String(retryAfter),
+        },
+      },
+    );
+  }
   return Response.json(
-    { results: Object.fromEntries(entries) },
+    {
+      results: Object.fromEntries(
+        entries.map(({ term, item }) => [term, item]),
+      ),
+    },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

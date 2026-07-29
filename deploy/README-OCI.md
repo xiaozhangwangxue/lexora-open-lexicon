@@ -11,6 +11,9 @@ sudo mkdir -p /opt/lexora/{build,state,tools}
 sudo chown -R opc:opc /opt/lexora
 python3 -m pip install --user httpx
 sudo install -m 0644 deploy/lexora-enrich@.service /etc/systemd/system/lexora-enrich@.service
+sudo install -m 0644 deploy/lexora-enrich-full-watch@.service /etc/systemd/system/lexora-enrich-full-watch@.service
+sudo install -m 0644 deploy/lexora-enrich-full-recover@.service /etc/systemd/system/lexora-enrich-full-recover@.service
+sudo install -m 0644 deploy/lexora-enrich-full-watch@.timer /etc/systemd/system/lexora-enrich-full-watch@.timer
 sudo systemctl daemon-reload
 ```
 
@@ -19,6 +22,35 @@ sudo systemctl daemon-reload
 `LEXORA_ORIGIN_TOKEN=...`（必须与 Cloudflare Worker secret 一致），再分别启用
 `lexora-enrich@0` 至 `lexora-enrich@3`。由于 OCI A1 容量可能暂时不足，实例创建
 失败时不要切换到收费规格；等待容量恢复后按同样配置重试即可。
+
+每台实例只启用本机分片对应的正式服务和监控定时器，例如分片 `2`：
+
+```sh
+sudo systemctl enable --now lexora-enrich@2.service
+sudo systemctl enable --now lexora-enrich-full-watch@2.timer
+```
+
+`lexora-enrich-full-watch@.service` 只检查 `lexora-enrich@.service`，停滞时也只会
+通过 `lexora-enrich-full-recover@.service` 重启正式四分片服务。不要把下面备用
+方案中的 `lexora-enrich-watch@.timer` 用于四分片服务；它被刻意保留为只监控
+`lexora-enrich-micro@.service`，避免迁移后错误重启旧进程。
+
+## 从双分片切换到四分片
+
+迁移前必须先停止旧的 micro 监控和采集进程，再执行 SQLite checkpoint、完整性
+检查和数据库复制。以下命令中的 `N` 要替换为该 E2 实例当前的旧分片号：
+
+```sh
+sudo systemctl disable --now lexora-enrich-watch@N.timer
+sudo systemctl stop lexora-enrich-watch@N.service lexora-enrich-recover@N.service
+sudo systemctl disable --now lexora-enrich-micro@N.service
+```
+
+确认 `lexora-enrich-micro@N.service` 和 `lexora-enrich-watch@N.timer` 均已停止后，
+才能 checkpoint 和复制数据库。四个新分片的数据库与状态库准备完成后，所有实例
+统一使用 `--shard-count 4 --workers 8 --delay 34` 的
+`lexora-enrich@.service`，并只启用各自的
+`lexora-enrich-full-watch@N.timer`。迁移过程中不能混跑旧的 17 秒 micro 服务。
 
 ## 进度和日志
 
@@ -59,7 +91,9 @@ Cloudflare 中转层还会使用全局免费额度限流器作为第二道保护
 `LEXORA_ORIGIN_TOKEN`，Worker 使用同名 secret；不要把令牌写入仓库。
 
 同时启用 `lexora-enrich-watch@分片.timer`。它每 10 分钟检查一次持久化进度，
-连续 45 分钟没有新记录时自动重启对应采集进程。状态库、数据集和 `.env`
+连续 45 分钟没有新记录时通过 `lexora-enrich-recover@.service` 自动重启对应的
+`lexora-enrich-micro@.service`。这个监控模板只用于双分片备用方案；四分片正式
+服务必须使用上面的 `lexora-enrich-full-watch@.timer`。状态库、数据集和 `.env`
 均保存在实例引导盘中，系统重启后采集会从未完成词条继续。
 
 采集进程自然结束后，再运行 `tools/auto_export_ready_shard.py` 导出常用
