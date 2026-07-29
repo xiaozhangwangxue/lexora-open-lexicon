@@ -43,6 +43,39 @@ def unique(values: list[str], limit: int = 40) -> list[str]:
     return result
 
 
+def merge_named_entries(
+    current: Any,
+    incoming: Any,
+    limit: int = 40,
+) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    positions: dict[str, int] = {}
+    values = [
+        *(current if isinstance(current, list) else []),
+        *(incoming if isinstance(incoming, list) else []),
+    ]
+    for raw in values:
+        if not isinstance(raw, dict):
+            continue
+        word = " ".join(str(raw.get("word") or "").split()).strip()
+        definition = " ".join(
+            str(raw.get("definition") or raw.get("meaning") or "").split()
+        ).strip()
+        if not word or not definition:
+            continue
+        key = word.lower()
+        if key in positions:
+            index = positions[key]
+            if len(definition) > len(result[index]["definition"]):
+                result[index]["definition"] = definition
+            continue
+        positions[key] = len(result)
+        result.append({"word": word, "definition": definition})
+        if len(result) >= limit:
+            break
+    return result
+
+
 def normalize_phonetic(value: Any) -> str:
     """Normalize common legacy ECDICT symbols to Unicode IPA."""
     text = str(value or "").strip().strip("/")
@@ -107,6 +140,21 @@ def init_state(path: Path) -> sqlite3.Connection:
     db.execute("CREATE INDEX IF NOT EXISTS idx_provider_state_updated_at ON provider_state(updated_at)")
     db.commit()
     return db
+
+
+def ensure_dataset_columns(database: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in database.execute("PRAGMA table_info(entries)").fetchall()
+    }
+    for name in ("phrase_entries_json", "related_entries_json"):
+        if name not in columns:
+            database.execute(
+                f"ALTER TABLE entries ADD COLUMN {name} "
+                "TEXT NOT NULL DEFAULT '[]'"
+            )
+    database.commit()
+
 
 class HostGate:
     def __init__(self, interval: float, concurrency: int = 1):
@@ -370,7 +418,34 @@ def datamuse_fields(data: Any) -> dict[str, Any]:
     words = unique([x.get("word", "") for x in data if isinstance(x, dict)])
     definitions = unique([d for x in data if isinstance(x, dict) for d in x.get("defs", [])])
     scores = [float(x.get("score")) for x in data if isinstance(x, dict) and x.get("score") is not None]
-    return {"words": words, "definition": "\n".join(definitions[:24]), "frequency": max(scores) if scores else 0.0}
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        word = " ".join(str(item.get("word") or "").split()).strip()
+        if not word or word in seen:
+            continue
+        cleaned = unique(
+            [
+                str(value).split("\t", 1)[-1].strip()
+                for value in item.get("defs", []) or []
+                if str(value).split("\t", 1)[-1].strip()
+            ],
+            3,
+        )
+        if not cleaned:
+            continue
+        seen.add(word)
+        entries.append({"word": word, "definition": "\n".join(cleaned)})
+        if len(entries) >= 40:
+            break
+    return {
+        "words": words,
+        "entries": entries,
+        "definition": "\n".join(definitions[:24]),
+        "frequency": max(scores) if scores else 0.0,
+    }
 
 
 def edge_fields(data: Any) -> dict[str, Any]:
@@ -391,6 +466,16 @@ def edge_fields(data: Any) -> dict[str, Any]:
     )
     result["related"] = related_words
     result["phrases"] = [word for word in related_words if " " in word]
+    result["related_entries"] = [
+        item
+        for item in related.get("entries", [])
+        if " " not in str(item.get("word") or "")
+    ]
+    result["phrase_entries"] = [
+        item
+        for item in related.get("entries", [])
+        if " " in str(item.get("word") or "")
+    ]
     result["synonyms"] = synonyms.get("words", [])
     result["antonyms"] = antonyms.get("words", [])
     return result
@@ -570,6 +655,7 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
     )
     try:
         db = sqlite3.connect(dataset)
+        ensure_dataset_columns(db)
         if shard_index is not None:
             if shard_count < 1 or not 0 <= shard_index < shard_count:
                 raise ValueError("--shard-index must be within [0, --shard-count)")
@@ -583,7 +669,7 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
             where.append("id >= ?"); params.append(start_id)
         if end_id is not None:
             where.append("id <= ?"); params.append(end_id)
-        query = "SELECT id,word,normalized_word,definition,definition_zh,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,phrases_json,related_words_json,frequency,difficulty,enrichment_json FROM entries"
+        query = "SELECT id,word,normalized_word,definition,definition_zh,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,phrases_json,phrase_entries_json,related_words_json,related_entries_json,frequency,difficulty,enrichment_json FROM entries"
         if shard_index is not None:
             # Each rank is unique, so scanning the existing frequency index
             # lets both shards complete the future 20k snapshot first without
@@ -601,7 +687,7 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
         rows = db.execute(query, params)
         processed = 0
         async def process_row(row: tuple[Any, ...]) -> tuple[str, str]:
-            entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, phrases_json, related_json, freq, diff, enrich_json = row
+            entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, phrases_json, phrase_entries_json, related_json, related_entries_json, freq, diff, enrich_json = row
             marker = json.loads(enrich_json or "{}")
             existing = {
                 "definition": definition or "",
@@ -609,9 +695,11 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                 "uk": "" if needs_phonetic_repair(uk) else normalize_phonetic(uk),
                 "examples": json.loads(examples_json or "[]"),
                 "phrases": json.loads(phrases_json or "[]"),
+                "phrase_entries": json.loads(phrase_entries_json or "[]"),
                 "synonyms": json.loads(synonyms_json or "[]"),
                 "antonyms": json.loads(antonyms_json or "[]"),
                 "related": json.loads(related_json or "[]"),
+                "related_entries": json.loads(related_entries_json or "[]"),
             }
             data = await enrich_term(
                 client,
@@ -638,7 +726,15 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
             antonyms = unique([*json.loads(antonyms_json or "[]"), *data.get("antonyms", [])])
             examples = unique([*json.loads(examples_json or "[]"), *data.get("examples", [])])
             phrases = unique([*json.loads(phrases_json or "[]"), *data.get("phrases", [])])
+            phrase_entries = merge_named_entries(
+                json.loads(phrase_entries_json or "[]"),
+                data.get("phrase_entries", []),
+            )
             related = unique([*json.loads(related_json or "[]"), *data.get("related", [])])
+            related_entries = merge_named_entries(
+                json.loads(related_entries_json or "[]"),
+                data.get("related_entries", []),
+            )
             zh = definition_zh
             if needs_definition_translation(definition, zh):
                 translated_zh, status, error = await translate(
@@ -658,8 +754,8 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
             attempted = data.pop("_attempted", [])
             marker_status = "completed" if not attempted or all(item == "completed" for item in statuses) else ("partial" if any(item == "completed" for item in statuses) else "not_found")
             marker = {"status": marker_status, "lastAttempt": now(), "sources": sorted(set(["open-data", "network"]))}
-            db.execute("""UPDATE entries SET definition=?,definition_zh=?,us_phonetic=?,uk_phonetic=?,synonyms_json=?,antonyms_json=?,examples_json=?,phrases_json=?,related_words_json=?,frequency=?,difficulty=?,enrichment_json=? WHERE id=?""",
-              (definition, zh, us, uk, j(synonyms), j(antonyms), j(examples), j(phrases), j(related), score, diff or difficulty(score), j(marker), entry_id))
+            db.execute("""UPDATE entries SET definition=?,definition_zh=?,us_phonetic=?,uk_phonetic=?,synonyms_json=?,antonyms_json=?,examples_json=?,phrases_json=?,phrase_entries_json=?,related_words_json=?,related_entries_json=?,frequency=?,difficulty=?,enrichment_json=? WHERE id=?""",
+              (definition, zh, us, uk, j(synonyms), j(antonyms), j(examples), j(phrases), j(phrase_entries), j(related), j(related_entries), score, diff or difficulty(score), j(marker), entry_id))
             db.execute("""INSERT OR REPLACE INTO entries_fts(rowid,word,definition,definition_zh,examples,phrases)
               SELECT id,word,definition,definition_zh,examples_json,phrases_json FROM entries WHERE id=?""", (entry_id,))
             db.commit(); state.commit()

@@ -17,7 +17,9 @@ FIELDS = (
     "antonyms_json",
     "examples_json",
     "phrases_json",
+    "phrase_entries_json",
     "related_words_json",
+    "related_entries_json",
 )
 
 

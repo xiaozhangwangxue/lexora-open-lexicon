@@ -39,7 +39,7 @@ def db_path(dataset: str) -> Path:
 
 def row_json(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
-    for field in ("synonyms_json", "antonyms_json", "examples_json", "phrases_json", "related_words_json", "senses_json", "source_json", "scope_json", "enrichment_json"):
+    for field in ("synonyms_json", "antonyms_json", "examples_json", "phrases_json", "phrase_entries_json", "related_words_json", "related_entries_json", "senses_json", "source_json", "scope_json", "enrichment_json"):
         key = field[:-5] if field.endswith("_json") else field
         result[key] = json.loads(result.pop(field) or "[]")
     return result

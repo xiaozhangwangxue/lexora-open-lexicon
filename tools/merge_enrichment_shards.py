@@ -21,7 +21,8 @@ def merge(dataset: Path, shards: list[Path]) -> None:
         seen: set[int] = set()
         columns = (
             "definition,definition_zh,us_phonetic,uk_phonetic,synonyms_json,"
-            "antonyms_json,examples_json,related_words_json,frequency,difficulty,"
+            "antonyms_json,examples_json,phrases_json,phrase_entries_json,"
+            "related_words_json,related_entries_json,frequency,difficulty,"
             "enrichment_json"
         )
         attached: list[str] = []

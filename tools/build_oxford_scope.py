@@ -38,7 +38,9 @@ CREATE TABLE IF NOT EXISTS entries (
   antonyms_json TEXT NOT NULL DEFAULT '[]',
   examples_json TEXT NOT NULL DEFAULT '[]',
   phrases_json TEXT NOT NULL DEFAULT '[]',
+  phrase_entries_json TEXT NOT NULL DEFAULT '[]',
   related_words_json TEXT NOT NULL DEFAULT '[]',
+  related_entries_json TEXT NOT NULL DEFAULT '[]',
   senses_json TEXT NOT NULL DEFAULT '[]',
   source_json TEXT NOT NULL DEFAULT '[]',
   scope_json TEXT NOT NULL DEFAULT '{}',
@@ -49,7 +51,16 @@ CREATE INDEX IF NOT EXISTS idx_entries_freq ON entries(frequency_rank, frequency
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(word,definition,definition_zh,examples,phrases,tokenize='unicode61');
 """
 
-FIELDS = ("synonyms_json", "antonyms_json", "examples_json", "phrases_json", "related_words_json", "senses_json")
+FIELDS = (
+    "synonyms_json",
+    "antonyms_json",
+    "examples_json",
+    "phrases_json",
+    "phrase_entries_json",
+    "related_words_json",
+    "related_entries_json",
+    "senses_json",
+)
 
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
@@ -177,7 +188,7 @@ def make_top(full: Path, top: Path) -> None:
     src.row_factory = sqlite3.Row
     dst = sqlite3.connect(top)
     dst.executescript(SCHEMA)
-    columns = ["word","normalized_word","pos","difficulty","frequency","frequency_rank","us_phonetic","uk_phonetic","definition","definition_zh","synonyms_json","antonyms_json","examples_json","phrases_json","related_words_json","senses_json","source_json","scope_json","enrichment_json"]
+    columns = ["word","normalized_word","pos","difficulty","frequency","frequency_rank","us_phonetic","uk_phonetic","definition","definition_zh","synonyms_json","antonyms_json","examples_json","phrases_json","phrase_entries_json","related_words_json","related_entries_json","senses_json","source_json","scope_json","enrichment_json"]
     query = "INSERT INTO entries(" + ",".join(columns) + ") VALUES(" + ",".join("?" for _ in columns) + ")"
     for row in src.execute("SELECT " + ",".join(columns) + " FROM entries ORDER BY frequency_rank LIMIT 20000"):
         dst.execute(query, tuple(row[column] for column in columns))
