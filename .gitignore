@@ -2,9 +2,12 @@
 source/*.gz
 source/ecdict.csv
 ssh/
+.secrets/
 build/*.sqlite
 build/*.sqlite-*
 build/*.sqlite.zst
+build/*.sqlite.gz
+build/upload-parts/
 build/*.log
 __pycache__/
 *.pyc

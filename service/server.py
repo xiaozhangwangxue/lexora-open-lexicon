@@ -6,12 +6,24 @@ import sqlite3
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
+ORIGIN_TOKEN = os.environ.get("LEXORA_ORIGIN_TOKEN", "")
 app = FastAPI(title="Lexora Open Lexicon API", version="1.0")
+
+@app.middleware("http")
+async def protect_origin(request: Request, call_next):
+    """Keep the public OCI origin private behind the Cloudflare relay."""
+    if (
+        ORIGIN_TOKEN
+        and request.url.path != "/health"
+        and request.headers.get("x-lexora-origin-token") != ORIGIN_TOKEN
+    ):
+        return JSONResponse({"detail": "forbidden"}, status_code=403)
+    return await call_next(request)
 
 def db_path(dataset: str) -> Path:
     name = {
@@ -51,7 +63,7 @@ def oxford_manifest():
     return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
 
 @app.get("/v1/lookup")
-def lookup(term: str = Query(min_length=1, max_length=120), dataset: str = "top20k"):
+def lookup(term: str = Query(min_length=1, max_length=120), dataset: str = "oxford"):
     path = db_path(dataset)
     with sqlite3.connect(path) as db:
         db.row_factory = sqlite3.Row
@@ -77,7 +89,7 @@ def lookup(term: str = Query(min_length=1, max_length=120), dataset: str = "top2
         return result
 
 @app.get("/v1/suggest")
-def suggest(prefix: str = Query(min_length=1, max_length=80), dataset: str = "top20k", limit: int = Query(10, ge=1, le=50)):
+def suggest(prefix: str = Query(min_length=1, max_length=80), dataset: str = "oxford", limit: int = Query(10, ge=1, le=50)):
     path = db_path(dataset)
     with sqlite3.connect(path) as db:
         db.row_factory = sqlite3.Row

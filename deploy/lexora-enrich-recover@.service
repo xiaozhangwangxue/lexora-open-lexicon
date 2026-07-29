@@ -1,0 +1,6 @@
+[Unit]
+Description=Recover stalled Lexora enrichment shard %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart lexora-enrich-micro@%i.service

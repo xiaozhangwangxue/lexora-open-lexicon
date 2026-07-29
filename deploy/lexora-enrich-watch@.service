@@ -1,0 +1,17 @@
+[Unit]
+Description=Watch Lexora enrichment shard %i for stalled progress
+After=lexora-enrich-micro@%i.service
+OnFailure=lexora-enrich-recover@%i.service
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/systemctl is-active --quiet lexora-enrich-micro@%i.service
+User=opc
+WorkingDirectory=/opt/lexora
+ExecStart=/usr/bin/python3 /opt/lexora/tools/watch_enrichment.py \
+  --state /opt/lexora/state/shard-%i.sqlite \
+  --max-stale-minutes 45
+Nice=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full

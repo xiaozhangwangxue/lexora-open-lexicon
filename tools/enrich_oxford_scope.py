@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
 STATE = BUILD / "oxford-enrichment-state.sqlite"
 EDGE_BASE = os.environ.get("LEXORA_EDGE_URL", "").rstrip("/")
+EDGE_TOKEN = os.environ.get("LEXORA_ORIGIN_TOKEN", "")
 
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -41,6 +42,30 @@ def unique(values: list[str], limit: int = 40) -> list[str]:
             break
     return result
 
+
+def translation_chunks(text: str, limit: int = 450) -> list[str]:
+    """Split long definitions without dropping content or breaking most words."""
+    remaining = " ".join(str(text).split()).strip()
+    if not remaining:
+        return []
+    chunk_count = max(1, (len(remaining) + limit - 1) // limit)
+    chunks: list[str] = []
+    while remaining and chunk_count > 0:
+        if chunk_count == 1 or len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        target = (len(remaining) + chunk_count - 1) // chunk_count
+        minimum = max(1, len(remaining) - (chunk_count - 1) * limit)
+        maximum = min(limit, len(remaining) - (chunk_count - 1))
+        cut = remaining.rfind(" ", minimum, maximum + 1)
+        if cut < minimum:
+            cut = max(minimum, min(target, maximum))
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+        chunk_count -= 1
+    return chunks
+
+
 def init_state(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path)
@@ -49,6 +74,7 @@ def init_state(path: Path) -> sqlite3.Connection:
       attempts INTEGER NOT NULL DEFAULT 0, http_status INTEGER, last_error TEXT,
       updated_at TEXT NOT NULL, PRIMARY KEY(term,source))""")
     db.execute("CREATE INDEX IF NOT EXISTS idx_provider_state_status ON provider_state(status,updated_at)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_provider_state_updated_at ON provider_state(updated_at)")
     db.commit()
     return db
 
@@ -65,6 +91,193 @@ class HostGate:
             if delta < self.interval:
                 await asyncio.sleep(self.interval - delta)
             self.last = time.monotonic()
+
+
+class EdgeDictionaryBatcher:
+    """Coalesce concurrent term lookups into one bounded edge invocation."""
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        gate: HostGate,
+        batch_size: int = 8,
+        flush_delay: float = 0.04,
+    ):
+        self.client = client
+        self.gate = gate
+        self.batch_size = max(1, min(8, batch_size))
+        self.flush_delay = max(0.0, flush_delay)
+        self.pending: list[
+            tuple[str, asyncio.Future[tuple[Any | None, int | None, str | None]]]
+        ] = []
+        self.lock = asyncio.Lock()
+        self.flush_task: asyncio.Task[None] | None = None
+
+    async def request(
+        self, term: str
+    ) -> tuple[Any | None, int | None, str | None]:
+        future: asyncio.Future[tuple[Any | None, int | None, str | None]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        async with self.lock:
+            self.pending.append((term, future))
+            if self.flush_task is None:
+                self.flush_task = asyncio.create_task(self._flush())
+        return await future
+
+    async def _flush(self) -> None:
+        if self.flush_delay:
+            await asyncio.sleep(self.flush_delay)
+        while True:
+            async with self.lock:
+                batch = self.pending[: self.batch_size]
+                del self.pending[: self.batch_size]
+                if not batch:
+                    self.flush_task = None
+                    return
+            terms = [term for term, _ in batch]
+            status: int | None = None
+            error: str | None = None
+            results: dict[str, Any] = {}
+            await self.gate.semaphore.acquire()
+            try:
+                await self.gate.wait()
+                response = await self.client.post(
+                    f"{EDGE_BASE}/api/dictionary/batch",
+                    json={"terms": terms},
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "LexoraOpenLexicon/1.0 (open-data enrichment)",
+                        **(
+                            {"X-Lexora-Origin-Token": EDGE_TOKEN}
+                            if EDGE_TOKEN
+                            else {}
+                        ),
+                    },
+                )
+                status = response.status_code
+                if response.status_code == 200:
+                    payload = response.json()
+                    raw_results = payload.get("results", {})
+                    if isinstance(raw_results, dict):
+                        results = raw_results
+                else:
+                    error = f"HTTP {response.status_code}"
+            except (httpx.HTTPError, ValueError, TypeError) as exc:
+                error = str(exc)
+            finally:
+                self.gate.semaphore.release()
+
+            for term, future in batch:
+                item = results.get(term)
+                item_status = (
+                    int(item.get("status"))
+                    if isinstance(item, dict) and item.get("status") is not None
+                    else status
+                )
+                data = item.get("data") if isinstance(item, dict) else None
+                item_error = error
+                if item_status != 200:
+                    if isinstance(data, dict) and data.get("error"):
+                        item_error = str(data["error"])
+                    data = None
+                if not future.done():
+                    future.set_result((data, item_status, item_error))
+
+
+class EdgeTranslationBatcher:
+    """Batch translations so dictionary enrichment stays within free quotas."""
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        gate: HostGate,
+        batch_size: int = 8,
+        flush_delay: float = 0.04,
+    ):
+        self.client = client
+        self.gate = gate
+        self.batch_size = max(1, min(32, batch_size))
+        self.flush_delay = max(0.0, flush_delay)
+        self.pending: list[
+            tuple[str, asyncio.Future[tuple[str, int | None, str | None]]]
+        ] = []
+        self.lock = asyncio.Lock()
+        self.flush_task: asyncio.Task[None] | None = None
+
+    async def request(self, text: str) -> tuple[str, int | None, str | None]:
+        future: asyncio.Future[tuple[str, int | None, str | None]] = (
+            asyncio.get_running_loop().create_future()
+        )
+        async with self.lock:
+            self.pending.append((text, future))
+            if self.flush_task is None:
+                self.flush_task = asyncio.create_task(self._flush())
+        return await future
+
+    async def _flush(self) -> None:
+        if self.flush_delay:
+            await asyncio.sleep(self.flush_delay)
+        while True:
+            async with self.lock:
+                batch = self.pending[: self.batch_size]
+                del self.pending[: self.batch_size]
+                if not batch:
+                    self.flush_task = None
+                    return
+            chunk_owners: list[int] = []
+            texts: list[str] = []
+            for owner, (text, _) in enumerate(batch):
+                for chunk in translation_chunks(text):
+                    chunk_owners.append(owner)
+                    texts.append(chunk)
+            translations: list[str] = []
+            status: int | None = None
+            error: str | None = None
+            await self.gate.semaphore.acquire()
+            try:
+                await self.gate.wait()
+                response = await self.client.post(
+                    f"{EDGE_BASE}/api/translate/batch",
+                    json={"texts": texts},
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "LexoraOpenLexicon/1.0 (open-data enrichment)",
+                        **(
+                            {"X-Lexora-Origin-Token": EDGE_TOKEN}
+                            if EDGE_TOKEN
+                            else {}
+                        ),
+                    },
+                )
+                status = response.status_code
+                if response.status_code == 200:
+                    payload = response.json()
+                    values = payload.get("translations", [])
+                    if isinstance(values, list):
+                        translations = [str(value or "").strip() for value in values]
+                else:
+                    error = f"HTTP {response.status_code}"
+            except (httpx.HTTPError, ValueError, TypeError) as exc:
+                error = str(exc)
+            finally:
+                self.gate.semaphore.release()
+
+            values_by_owner: list[list[str]] = [[] for _ in batch]
+            for index, owner in enumerate(chunk_owners):
+                if index < len(translations) and translations[index]:
+                    values_by_owner[owner].append(translations[index])
+            for index, (_, future) in enumerate(batch):
+                value = "\n".join(values_by_owner[index]).strip()
+                if not future.done():
+                    future.set_result(
+                        (
+                            value,
+                            status,
+                            None if value else error or "translation missing",
+                        )
+                    )
+
 
 async def request_json(client: httpx.AsyncClient, gate: HostGate, url: str, source: str, attempts: int = 3) -> tuple[Any | None, int | None, str | None]:
     for attempt in range(attempts):
@@ -114,6 +327,29 @@ def datamuse_fields(data: Any) -> dict[str, Any]:
     scores = [float(x.get("score")) for x in data if isinstance(x, dict) and x.get("score") is not None]
     return {"words": words, "definition": "\n".join(definitions[:24]), "frequency": max(scores) if scores else 0.0}
 
+
+def edge_fields(data: Any) -> dict[str, Any]:
+    """Normalize the aggregate response from Lexora's Cloudflare edge."""
+    if not isinstance(data, dict):
+        return {}
+    result = dictionary_fields(data.get("dictionary"))
+    exact = datamuse_fields(data.get("exact"))
+    related = datamuse_fields(data.get("related"))
+    synonyms = datamuse_fields(data.get("synonyms"))
+    antonyms = datamuse_fields(data.get("antonyms"))
+    related_words = related.get("words", [])
+    if not result.get("definition"):
+        result["definition"] = exact.get("definition", "")
+    result["frequency"] = max(
+        float(exact.get("frequency", 0) or 0),
+        float(related.get("frequency", 0) or 0),
+    )
+    result["related"] = related_words
+    result["phrases"] = [word for word in related_words if " " in word]
+    result["synonyms"] = synonyms.get("words", [])
+    result["antonyms"] = antonyms.get("words", [])
+    return result
+
 def difficulty(score: float) -> str:
     if score >= 6.0: return "A1–A2"
     if score >= 4.8: return "B1–B2"
@@ -138,7 +374,14 @@ def should_process_marker(raw: str | None, retry_after_hours: float) -> bool:
     except ValueError:
         return True
 
-async def enrich_term(client: httpx.AsyncClient, gates: dict[str, HostGate], term: str, state: sqlite3.Connection, existing: dict[str, Any]) -> dict[str, Any]:
+async def enrich_term(
+    client: httpx.AsyncClient,
+    gates: dict[str, HostGate],
+    term: str,
+    state: sqlite3.Connection,
+    existing: dict[str, Any],
+    edge_batcher: EdgeDictionaryBatcher | None = None,
+) -> dict[str, Any]:
     encoded = quote(term, safe="")
     urls = {
       "edge": f"{EDGE_BASE}/api/dictionary/full?term={encoded}" if EDGE_BASE else "",
@@ -153,19 +396,34 @@ async def enrich_term(client: httpx.AsyncClient, gates: dict[str, HostGate], ter
     needs_definition = not existing.get("definition")
     needs_phonetic = not existing.get("us") or not existing.get("uk")
     needs_examples = not existing.get("examples")
-    if EDGE_BASE and (needs_definition or needs_phonetic or needs_examples):
+    needs_network = any(
+        (
+            needs_definition,
+            needs_phonetic,
+            needs_examples,
+            not existing.get("related"),
+            not existing.get("phrases"),
+            not existing.get("synonyms"),
+            not existing.get("antonyms"),
+        )
+    )
+    if EDGE_BASE and needs_network:
         sources.append("edge")
-    if needs_definition or needs_phonetic or needs_examples:
+    elif needs_definition or needs_phonetic or needs_examples:
         sources.append("dictionary")
-    if not existing.get("related"):
-        sources.append("datamuse_related")
-    if needs_definition:
-        sources.append("datamuse_exact")
-    if not existing.get("synonyms"):
-        sources.append("datamuse_synonyms")
-    if not existing.get("antonyms"):
-        sources.append("datamuse_antonyms")
+    if not EDGE_BASE:
+        if not existing.get("related") or not existing.get("phrases"):
+            sources.append("datamuse_related")
+        if needs_definition:
+            sources.append("datamuse_exact")
+        if not existing.get("synonyms"):
+            sources.append("datamuse_synonyms")
+        if not existing.get("antonyms"):
+            sources.append("datamuse_antonyms")
     async def fetch(source: str) -> tuple[str, Any | None, int | None, str | None]:
+        if source == "edge" and edge_batcher is not None:
+            data, status, error = await edge_batcher.request(term)
+            return source, data, status, error
         gate = gates["datamuse"] if source.startswith("datamuse") else gates[source]
         data, status, error = await request_json(client, gate, urls[source], source)
         return source, data, status, error
@@ -186,16 +444,57 @@ async def enrich_term(client: httpx.AsyncClient, gates: dict[str, HostGate], ter
             result[source] = parsed
             if source == "datamuse_exact" and parsed.get("definition") and not result.get("definition"):
                 result["definition"] = parsed["definition"]
-            if source == "datamuse_related": result["related"] = parsed.get("words", [])
+            if source == "datamuse_related":
+                result["related"] = parsed.get("words", [])
+                result["phrases"] = [
+                    word for word in parsed.get("words", []) if " " in word
+                ]
             if source == "datamuse_synonyms": result["synonyms"] = parsed.get("words", [])
             if source == "datamuse_antonyms": result["antonyms"] = parsed.get("words", [])
             result["frequency"] = max(float(result.get("frequency", 0)), float(parsed.get("frequency", 0)))
-        elif source == "edge" and isinstance(data, dict) and data.get("word"):
-            result.update({k: data.get(k) for k in ("definition", "definition_zh", "us_phonetic", "uk_phonetic", "synonyms", "antonyms", "examples", "examplesZh", "frequency", "difficulty") if data.get(k) is not None})
+        elif source == "edge":
+            result.update(edge_fields(data))
     return result
 
-async def translate(client: httpx.AsyncClient, gate: HostGate, text: str) -> tuple[str, int | None, str | None]:
+async def translate(
+    client: httpx.AsyncClient,
+    gate: HostGate,
+    text: str,
+    translation_batcher: EdgeTranslationBatcher | None = None,
+) -> tuple[str, int | None, str | None]:
     if not text: return "", None, None
+    if EDGE_BASE and translation_batcher is not None:
+        return await translation_batcher.request(text)
+    if EDGE_BASE:
+        for attempt in range(3):
+            await gate.semaphore.acquire()
+            try:
+                await gate.wait()
+                response = await client.post(
+                    f"{EDGE_BASE}/api/translate/batch",
+                    json={"texts": [text[:1800]]},
+                    headers={
+                        "User-Agent": "LexoraOpenLexicon/1.0 (open-data enrichment)",
+                        **(
+                            {"X-Lexora-Origin-Token": EDGE_TOKEN}
+                            if EDGE_TOKEN
+                            else {}
+                        ),
+                    },
+                )
+                if response.status_code == 200:
+                    values = response.json().get("translations", [])
+                    translated = str(values[0]).strip() if values else ""
+                    return translated, 200, None if translated else "translation missing"
+                if response.status_code not in (429, 500, 502, 503, 504):
+                    return "", response.status_code, f"HTTP {response.status_code}"
+            except (httpx.HTTPError, ValueError, TypeError) as exc:
+                if attempt == 2:
+                    return "", None, str(exc)
+            finally:
+                gate.semaphore.release()
+            await asyncio.sleep(min(8.0, 2 ** attempt))
+        return "", None, "translation exhausted retries"
     url = "https://api.mymemory.translated.net/get?q=" + quote(text, safe="") + "&langpair=en|zh-CN"
     data, status, error = await request_json(client, gate, url, "translation")
     try:
@@ -214,6 +513,16 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
     }
     client_timeout = httpx.Timeout(20.0, connect=10.0)
     client = httpx.AsyncClient(timeout=client_timeout, follow_redirects=True)
+    edge_batcher = (
+        EdgeDictionaryBatcher(client, gates["edge"], batch_size=workers)
+        if EDGE_BASE
+        else None
+    )
+    translation_batcher = (
+        EdgeTranslationBatcher(client, gates["translation"], batch_size=workers)
+        if EDGE_BASE
+        else None
+    )
     try:
         db = sqlite3.connect(dataset)
         if shard_index is not None:
@@ -229,33 +538,50 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
             where.append("id >= ?"); params.append(start_id)
         if end_id is not None:
             where.append("id <= ?"); params.append(end_id)
-        query = "SELECT id,word,normalized_word,definition,definition_zh,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,related_words_json,frequency,difficulty,enrichment_json FROM entries"
+        query = "SELECT id,word,normalized_word,definition,definition_zh,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,phrases_json,related_words_json,frequency,difficulty,enrichment_json FROM entries"
         if where:
             query += " WHERE " + " AND ".join(where)
         query += " ORDER BY id"
-        rows = db.execute(query, params).fetchall()
+        # Stream the shard instead of materializing hundreds of thousands of
+        # rows.  This keeps the worker within an E2.1.Micro's 1 GB memory
+        # envelope and still allows the cursor to resume after each commit.
+        rows = db.execute(query, params)
         processed = 0
         async def process_row(row: tuple[Any, ...]) -> tuple[str, str]:
-            entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, related_json, freq, diff, enrich_json = row
+            entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, phrases_json, related_json, freq, diff, enrich_json = row
             marker = json.loads(enrich_json or "{}")
             existing = {
                 "definition": definition or "", "us": us or "", "uk": uk or "",
                 "examples": json.loads(examples_json or "[]"),
+                "phrases": json.loads(phrases_json or "[]"),
                 "synonyms": json.loads(synonyms_json or "[]"),
                 "antonyms": json.loads(antonyms_json or "[]"),
                 "related": json.loads(related_json or "[]"),
             }
-            data = await enrich_term(client, gates, term, state, existing)
+            data = await enrich_term(
+                client,
+                gates,
+                term,
+                state,
+                existing,
+                edge_batcher=edge_batcher,
+            )
             definition = definition or data.get("definition", "")
             us = us or data.get("us", "") or data.get("us_phonetic", "")
             uk = uk or data.get("uk", "") or data.get("uk_phonetic", "")
             synonyms = unique([*json.loads(synonyms_json or "[]"), *data.get("synonyms", [])])
             antonyms = unique([*json.loads(antonyms_json or "[]"), *data.get("antonyms", [])])
             examples = unique([*json.loads(examples_json or "[]"), *data.get("examples", [])])
+            phrases = unique([*json.loads(phrases_json or "[]"), *data.get("phrases", [])])
             related = unique([*json.loads(related_json or "[]"), *data.get("related", [])])
             zh = definition_zh
             if not zh and definition:
-                zh, status, error = await translate(client, gates["translation"], definition[:1800])
+                zh, status, error = await translate(
+                    client,
+                    gates["translation"],
+                    definition[:1800],
+                    translation_batcher=translation_batcher,
+                )
                 state.execute("""INSERT INTO provider_state(term,source,status,attempts,http_status,last_error,updated_at) VALUES(?,?,?,?,?,?,?)
                   ON CONFLICT(term,source) DO UPDATE SET status=excluded.status,attempts=provider_state.attempts+1,http_status=excluded.http_status,last_error=excluded.last_error,updated_at=excluded.updated_at""",
                   (term, "translation", "completed" if zh else "failed", 1, status, error, now()))
@@ -265,8 +591,8 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
             attempted = data.pop("_attempted", [])
             marker_status = "completed" if not attempted or all(item == "completed" for item in statuses) else ("partial" if any(item == "completed" for item in statuses) else "not_found")
             marker = {"status": marker_status, "lastAttempt": now(), "sources": sorted(set(["open-data", "network"]))}
-            db.execute("""UPDATE entries SET definition=?,definition_zh=?,us_phonetic=?,uk_phonetic=?,synonyms_json=?,antonyms_json=?,examples_json=?,related_words_json=?,frequency=?,difficulty=?,enrichment_json=? WHERE id=?""",
-              (definition, zh, us, uk, j(synonyms), j(antonyms), j(examples), j(related), score, diff or difficulty(score), j(marker), entry_id))
+            db.execute("""UPDATE entries SET definition=?,definition_zh=?,us_phonetic=?,uk_phonetic=?,synonyms_json=?,antonyms_json=?,examples_json=?,phrases_json=?,related_words_json=?,frequency=?,difficulty=?,enrichment_json=? WHERE id=?""",
+              (definition, zh, us, uk, j(synonyms), j(antonyms), j(examples), j(phrases), j(related), score, diff or difficulty(score), j(marker), entry_id))
             db.execute("""INSERT OR REPLACE INTO entries_fts(rowid,word,definition,definition_zh,examples,phrases)
               SELECT id,word,definition,definition_zh,examples_json,phrases_json FROM entries WHERE id=?""", (entry_id,))
             db.commit(); state.commit()

@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically watch Lexora enrichment shard %i
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

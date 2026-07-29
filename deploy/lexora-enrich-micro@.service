@@ -1,0 +1,27 @@
+[Unit]
+Description=Lexora open lexicon micro-instance shard %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/opt/lexora
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/lexora/.env
+Environment=LEXORA_EDGE_URL=https://dict.12323456.xyz/internal
+ExecStart=/usr/bin/python3 /opt/lexora/tools/enrich_oxford_scope.py \
+  --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+  --state /opt/lexora/state/shard-%i.sqlite \
+  --shard-index %i --shard-count 2 \
+  --workers 8 --delay 6 --translation-delay 6 --retry-after-hours 24
+Restart=on-failure
+RestartSec=30
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/lexora/build /opt/lexora/state
+
+[Install]
+WantedBy=multi-user.target

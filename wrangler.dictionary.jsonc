@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lexora-dictionary-edge",
+  "main": "worker/dictionary-edge.js",
+  "compatibility_date": "2026-07-29",
+  "workers_dev": true,
+  "routes": [
+    {
+      "pattern": "dict.12323456.xyz",
+      "custom_domain": true
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "DOWNLOADS",
+      "bucket_name": "autoword-downloads"
+    }
+  ],
+  "vars": {
+    "PRIMARY_ORIGIN": "http://140-245-114-238.sslip.io:8080",
+    "SECONDARY_ORIGIN": "http://134-185-82-7.sslip.io:8080",
+    "PRIMARY_TIMEOUT_MS": "6000",
+    "SECONDARY_TIMEOUT_MS": "8000"
+  }
+}

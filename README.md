@@ -43,6 +43,20 @@ curl http://127.0.0.1:8080/v1/suggest?prefix=wor
 See `LICENSES.md` before redistributing. This is an open-data English lexicon,
 not a copy of Oxford/OED proprietary definitions.
 
+## Live relay
+
+Lexora's public read-only relay is available at:
+
+```text
+https://dict.12323456.xyz/v1/lookup?term=word
+https://dict.12323456.xyz/v1/suggest?prefix=wor
+```
+
+Cloudflare caches successful lookups and automatically fails over between two
+Always Free OCI origins. Full open-data enrichment runs in two resumable
+shards. Each shard persists progress locally and has a watchdog that restarts a
+stalled collector without discarding completed entries.
+
 ## Downloads
 
 The current SQLite snapshots are published as release assets:
