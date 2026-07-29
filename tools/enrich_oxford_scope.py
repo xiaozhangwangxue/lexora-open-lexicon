@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import datetime as dt
 import json
+import math
 import os
 import sqlite3
 import time
@@ -104,6 +105,17 @@ def needs_definition_translation(definition: Any, translation: Any) -> bool:
     if len(source) <= 120:
         return False
     return len(target) < max(20, int(len(source) * 0.15))
+
+
+def needs_frequency_repair(value: Any) -> bool:
+    try:
+        score = float(value or 0)
+    except (TypeError, ValueError):
+        return True
+    # wordfreq and the exported manifest use the Zipf scale. Earlier
+    # enrichment briefly stored Datamuse relevance scores, which can be in the
+    # millions and must not survive into the public snapshots.
+    return score > 10
 
 
 def translation_chunks(text: str, limit: int = 450) -> list[str]:
@@ -417,7 +429,19 @@ def datamuse_fields(data: Any) -> dict[str, Any]:
     if not isinstance(data, list): return {}
     words = unique([x.get("word", "") for x in data if isinstance(x, dict)])
     definitions = unique([d for x in data if isinstance(x, dict) for d in x.get("defs", [])])
-    scores = [float(x.get("score")) for x in data if isinstance(x, dict) and x.get("score") is not None]
+    frequencies: list[float] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        for tag in item.get("tags", []) or []:
+            if not isinstance(tag, str) or not tag.startswith("f:"):
+                continue
+            try:
+                raw = float(tag[2:])
+            except ValueError:
+                continue
+            if raw > 0:
+                frequencies.append(3 + math.log10(raw))
     entries: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in data:
@@ -444,7 +468,7 @@ def datamuse_fields(data: Any) -> dict[str, Any]:
         "words": words,
         "entries": entries,
         "definition": "\n".join(definitions[:24]),
-        "frequency": max(scores) if scores else 0.0,
+        "frequency": max(frequencies) if frequencies else 0.0,
     }
 
 
@@ -749,7 +773,11 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                   ON CONFLICT(term,source) DO UPDATE SET status=excluded.status,attempts=provider_state.attempts+1,http_status=excluded.http_status,last_error=excluded.last_error,updated_at=excluded.updated_at""",
                   (term, "translation", "completed" if translated_zh else "failed", 1, status, error, now()))
                 data.setdefault("_statuses", []).append("completed" if translated_zh else "failed")
-            score = max(float(freq or 0), float(data.get("frequency", 0) or 0))
+            base_frequency = 0.0 if needs_frequency_repair(freq) else float(freq or 0)
+            score = max(
+                base_frequency,
+                float(data.get("frequency", 0) or 0),
+            )
             statuses = data.pop("_statuses", [])
             attempted = data.pop("_attempted", [])
             marker_status = "completed" if not attempted or all(item == "completed" for item in statuses) else ("partial" if any(item == "completed" for item in statuses) else "not_found")
@@ -768,6 +796,7 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                 needs_phonetic_repair(row[5])
                 or needs_phonetic_repair(row[6])
                 or needs_definition_translation(row[3], row[4])
+                or needs_frequency_repair(row[14])
             )
             if (
                 not should_process_marker(row[-1], retry_after_hours)
