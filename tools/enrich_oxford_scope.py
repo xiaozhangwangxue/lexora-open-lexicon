@@ -25,6 +25,13 @@ BUILD = ROOT / "build"
 STATE = BUILD / "oxford-enrichment-state.sqlite"
 EDGE_BASE = os.environ.get("LEXORA_EDGE_URL", "").rstrip("/")
 EDGE_TOKEN = os.environ.get("LEXORA_ORIGIN_TOKEN", "")
+ENTRY_SELECT_COLUMNS = (
+    "id,word,normalized_word,definition,definition_zh,"
+    "us_phonetic,uk_phonetic,synonyms_json,antonyms_json,"
+    "examples_json,phrases_json,phrase_entries_json,"
+    "related_words_json,related_entries_json,frequency,difficulty,"
+    "enrichment_json"
+)
 
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -166,6 +173,84 @@ def ensure_dataset_columns(database: sqlite3.Connection) -> None:
                 "TEXT NOT NULL DEFAULT '[]'"
             )
     database.commit()
+
+
+def fetch_candidate_batch(
+    database: sqlite3.Connection,
+    *,
+    start_id: int | None,
+    end_id: int | None,
+    frequency_first: bool,
+    after_frequency_rank: int | None,
+    after_id: int | None,
+    batch_size: int,
+) -> tuple[list[tuple[Any, ...]], int | None, int | None]:
+    """Read one stable keyset page and finalize its cursor before returning.
+
+    The enrichment loop commits writes between pages.  A cursor that streams
+    the complete shard would retain a read snapshot for the whole run and pin
+    the WAL.  Fetching a bounded page, closing the cursor, and then performing
+    writes lets SQLite checkpoints advance normally.
+
+    ``frequency_rank`` is the stable, unique priority key in generated
+    datasets.  ``id`` remains a tie-breaker so older/custom datasets with
+    duplicate ranks still resume without skipping rows.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+
+    where: list[str] = []
+    params: list[int] = []
+    if start_id is not None:
+        where.append("id >= ?")
+        params.append(start_id)
+    if end_id is not None:
+        where.append("id <= ?")
+        params.append(end_id)
+
+    query = f"SELECT {ENTRY_SELECT_COLUMNS}"
+    if frequency_first:
+        query += ",frequency_rank FROM entries INDEXED BY idx_entries_freq"
+        if after_frequency_rank is not None:
+            # A row-value comparison keeps duplicate ranks safe while still
+            # letting SQLite seek into idx_entries_freq.  The equivalent OR
+            # expression makes SQLite rescan the index from its beginning on
+            # every page, which becomes quadratic over a complete shard.
+            where.append("(frequency_rank,id) > (?,?)")
+            params.extend((after_frequency_rank, after_id or 0))
+    else:
+        query += " FROM entries"
+        if after_id is not None:
+            where.append("id > ?")
+            params.append(after_id)
+
+    if where:
+        query += " WHERE " + " AND ".join(where)
+    query += (
+        " ORDER BY frequency_rank,id"
+        if frequency_first
+        else " ORDER BY id"
+    )
+    query += " LIMIT ?"
+    params.append(batch_size)
+
+    cursor = database.execute(query, params)
+    try:
+        raw_rows = cursor.fetchall()
+    finally:
+        # Explicit finalization is important: fetchall() exhausts the current
+        # result, but close() makes the read-transaction boundary unambiguous
+        # for both CPython's sqlite3 wrapper and alternative runtimes.
+        cursor.close()
+
+    if not raw_rows:
+        return [], after_frequency_rank, after_id
+    if frequency_first:
+        next_rank = int(raw_rows[-1][-1])
+        next_id = int(raw_rows[-1][0])
+        return [tuple(row[:-1]) for row in raw_rows], next_rank, next_id
+    next_id = int(raw_rows[-1][0])
+    return [tuple(row) for row in raw_rows], None, next_id
 
 
 class HostGate:
@@ -687,28 +772,6 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
             total = max(0, max_id - min_id + 1)
             start_id = min_id + (total * shard_index) // shard_count
             end_id = min_id + (total * (shard_index + 1)) // shard_count - 1
-        where: list[str] = []
-        params: list[int] = []
-        if start_id is not None:
-            where.append("id >= ?"); params.append(start_id)
-        if end_id is not None:
-            where.append("id <= ?"); params.append(end_id)
-        query = "SELECT id,word,normalized_word,definition,definition_zh,us_phonetic,uk_phonetic,synonyms_json,antonyms_json,examples_json,phrases_json,phrase_entries_json,related_words_json,related_entries_json,frequency,difficulty,enrichment_json FROM entries"
-        if shard_index is not None:
-            # Each rank is unique, so scanning the existing frequency index
-            # lets both shards complete the future 20k snapshot first without
-            # allocating a large temporary sort on a 1 GB micro instance.
-            query = query.replace(
-                " FROM entries",
-                " FROM entries INDEXED BY idx_entries_freq",
-            )
-        if where:
-            query += " WHERE " + " AND ".join(where)
-        query += " ORDER BY frequency_rank" if shard_index is not None else " ORDER BY id"
-        # Stream the shard instead of materializing hundreds of thousands of
-        # rows.  This keeps the worker within an E2.1.Micro's 1 GB memory
-        # envelope and still allows the cursor to resume after each commit.
-        rows = db.execute(query, params)
         processed = 0
         async def process_row(row: tuple[Any, ...]) -> tuple[str, str]:
             entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, phrases_json, phrase_entries_json, related_json, related_entries_json, freq, diff, enrich_json = row
@@ -789,41 +852,72 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
             db.commit(); state.commit()
             return term, marker_status
         pending: list[tuple[Any, ...]] = []
-        for row in rows:
-            if limit and processed + len(pending) >= limit:
-                break
-            needs_quality_repair = (
-                needs_phonetic_repair(row[5])
-                or needs_phonetic_repair(row[6])
-                or needs_definition_translation(row[3], row[4])
-                or needs_frequency_repair(row[14])
+
+        async def flush_pending() -> None:
+            nonlocal processed
+            results = await asyncio.gather(
+                *(process_row(item) for item in pending),
+                return_exceptions=True,
             )
-            if (
-                not should_process_marker(row[-1], retry_after_hours)
-                and not needs_quality_repair
-            ):
-                continue
-            pending.append(row)
-            if len(pending) < workers:
-                continue
-            results = await asyncio.gather(*(process_row(item) for item in pending), return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception):
                     print(f"enrichment-error={result!r}", flush=True)
                 else:
                     processed += 1
                     if processed % 25 == 0:
-                        print(f"enriched={processed} term={result[0]} status={result[1]}", flush=True)
+                        print(
+                            f"enriched={processed} term={result[0]} "
+                            f"status={result[1]}",
+                            flush=True,
+                        )
             pending.clear()
+
+        # Keep pages large enough to skip completed terms efficiently but
+        # small enough for 1 GB collection instances.  Crucially, each page's
+        # read cursor is closed by fetch_candidate_batch() before process_row()
+        # can execute or commit any write.
+        candidate_batch_size = max(64, min(512, workers * 16))
+        after_frequency_rank: int | None = None
+        after_id: int | None = None
+        reached_limit = False
+        while not reached_limit:
+            rows, next_frequency_rank, next_id = fetch_candidate_batch(
+                db,
+                start_id=start_id,
+                end_id=end_id,
+                frequency_first=shard_index is not None,
+                after_frequency_rank=after_frequency_rank,
+                after_id=after_id,
+                batch_size=candidate_batch_size,
+            )
+            if not rows:
+                break
+            # Advance the keyset only after a complete, closed read page.  If
+            # the process stops during writes, the next invocation starts from
+            # the shard beginning and cheaply skips completed markers, exactly
+            # preserving the existing resumability semantics.
+            after_frequency_rank = next_frequency_rank
+            after_id = next_id
+            for row in rows:
+                if limit and processed + len(pending) >= limit:
+                    reached_limit = True
+                    break
+                needs_quality_repair = (
+                    needs_phonetic_repair(row[5])
+                    or needs_phonetic_repair(row[6])
+                    or needs_definition_translation(row[3], row[4])
+                    or needs_frequency_repair(row[14])
+                )
+                if (
+                    not should_process_marker(row[-1], retry_after_hours)
+                    and not needs_quality_repair
+                ):
+                    continue
+                pending.append(row)
+                if len(pending) >= workers:
+                    await flush_pending()
         if pending:
-            results = await asyncio.gather(*(process_row(item) for item in pending), return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    print(f"enrichment-error={result!r}", flush=True)
-                else:
-                    processed += 1
-                    if processed % 25 == 0:
-                        print(f"enriched={processed} term={result[0]} status={result[1]}", flush=True)
+            await flush_pending()
         db.close()
     finally:
         await client.aclose(); state.close()
