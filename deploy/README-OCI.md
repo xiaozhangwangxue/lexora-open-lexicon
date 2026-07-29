@@ -15,8 +15,10 @@ sudo systemctl daemon-reload
 ```
 
 把 `build/lexora-open-oxford-scope.sqlite` 和 `tools/` 同步到 `/opt/lexora/` 后，
-分别启用 `lexora-enrich@0` 至 `lexora-enrich@3`。由于 OCI A1 容量可能暂时不足，
-实例创建失败时不要切换到收费规格；等待容量恢复后按同样配置重试即可。
+在权限为 `0600` 的 `/opt/lexora/.env` 中设置
+`LEXORA_ORIGIN_TOKEN=...`（必须与 Cloudflare Worker secret 一致），再分别启用
+`lexora-enrich@0` 至 `lexora-enrich@3`。由于 OCI A1 容量可能暂时不足，实例创建
+失败时不要切换到收费规格；等待容量恢复后按同样配置重试即可。
 
 ## 进度和日志
 
@@ -38,8 +40,19 @@ Singapore 的 A1 容量不足时，可以使用控制台明确标注“符合始
 引导盘建立 2GB swap，再安装依赖；这不会创建额外云磁盘。
 
 每台实例安装 `deploy/lexora-enrich-micro@.service`，第一台启动分片 `0`，第二台
-启动分片 `1`。该模板固定 `--shard-count 2 --workers 8`，请求会由 Cloudflare
-中转层合并为每批最多 8 个词条，在不增加免费实例数量的前提下提高吞吐量。
+启动分片 `1`。该模板固定 `--shard-count 2 --workers 8 --delay 17`，请求会由
+Cloudflare 中转层合并为每批最多 8 个词条。核心采集每个缓存未命中词条只使用
+一次 Datamuse exact 请求；两台机器的静态安全速率约为每天 8.1 万次，低于
+项目设置的每天 9 万次硬上限。
+
+模板使用 `--profile auto`：先完成定义、词性、音标、例句和词频等核心字段，
+再自动进入近反义词、短语和关联词的深度补全。深度阶段仍受同一个全局每日硬上限
+保护；合法的空结果会写入 deep 完成标记，不会无限重复查询。
+
+若以后成功创建两台 A1，并与现有两台 E2 同时运行四个分片，应使用
+`lexora-enrich@.service` 的 `--delay 34`，不能把两台模式的 17 秒间隔原样复制。
+Cloudflare 中转层还会使用全局免费额度限流器作为第二道保护；静态间隔仍需保留，
+避免持续产生 429 重试并消耗 Workers 免费请求量。
 
 查询中转使用 `deploy/lexora-lexicon-micro.service`，由 Cloudflare Worker
 `worker/dictionary-edge.js` 通过 `dict.12323456.xyz` 访问。源站必须设置

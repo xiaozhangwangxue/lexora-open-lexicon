@@ -12,8 +12,10 @@ import datetime as dt
 import json
 import math
 import os
+import random
 import sqlite3
 import time
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -30,7 +32,7 @@ ENTRY_SELECT_COLUMNS = (
     "us_phonetic,uk_phonetic,synonyms_json,antonyms_json,"
     "examples_json,phrases_json,phrase_entries_json,"
     "related_words_json,related_entries_json,frequency,difficulty,"
-    "enrichment_json"
+    "enrichment_json,pos"
 )
 
 def now() -> str:
@@ -49,6 +51,10 @@ def unique(values: list[str], limit: int = 40) -> list[str]:
         if len(result) >= limit:
             break
     return result
+
+
+def normalized_term(value: Any) -> str:
+    return " ".join(str(value or "").strip().lower().replace("’", "'").split())
 
 
 def merge_named_entries(
@@ -125,26 +131,27 @@ def needs_frequency_repair(value: Any) -> bool:
     return score > 10
 
 
-def translation_chunks(text: str, limit: int = 450) -> list[str]:
-    """Split long definitions without dropping content or breaking most words."""
-    remaining = " ".join(str(text).split()).strip()
+def translation_chunks(text: str, limit: int = 480) -> list[str]:
+    """Split a complete definition into ordered provider-safe chunks."""
+    if limit < 1 or limit > 480:
+        raise ValueError("translation chunk limit must be within 1..480")
+    remaining = str(text or "").strip()
     if not remaining:
         return []
-    chunk_count = max(1, (len(remaining) + limit - 1) // limit)
     chunks: list[str] = []
-    while remaining and chunk_count > 0:
-        if chunk_count == 1 or len(remaining) <= limit:
+    while remaining:
+        if len(remaining) <= limit:
             chunks.append(remaining)
             break
-        target = (len(remaining) + chunk_count - 1) // chunk_count
-        minimum = max(1, len(remaining) - (chunk_count - 1) * limit)
-        maximum = min(limit, len(remaining) - (chunk_count - 1))
-        cut = remaining.rfind(" ", minimum, maximum + 1)
-        if cut < minimum:
-            cut = max(minimum, min(target, maximum))
+        cut = max(
+            remaining.rfind(" ", 0, limit + 1),
+            remaining.rfind("\n", 0, limit + 1),
+            remaining.rfind("\t", 0, limit + 1),
+        )
+        if cut <= 0:
+            cut = limit
         chunks.append(remaining[:cut].strip())
-        remaining = remaining[cut:].strip()
-        chunk_count -= 1
+        remaining = remaining[cut:].lstrip()
     return chunks
 
 
@@ -268,6 +275,52 @@ class HostGate:
             self.last = time.monotonic()
 
 
+def retry_after_seconds(value: Any, current_time: dt.datetime | None = None) -> float | None:
+    """Parse an HTTP Retry-After delta or date into seconds."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(text)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+        reference = current_time or dt.datetime.now(dt.timezone.utc)
+        seconds = (retry_at - reference).total_seconds()
+    if not math.isfinite(seconds):
+        return None
+    return max(0.0, seconds)
+
+
+class EdgeBatchRetryExhausted(RuntimeError):
+    """Stop a collection pass without marking a throttled batch as complete."""
+
+    def __init__(
+        self,
+        *,
+        status: int | None,
+        attempts: int,
+        retry_after: float | None,
+        detail: str,
+    ) -> None:
+        self.status = status
+        self.attempts = attempts
+        self.retry_after = retry_after
+        suffix = (
+            f"; retry after {retry_after:.1f}s"
+            if retry_after is not None
+            else ""
+        )
+        super().__init__(
+            f"edge batch unavailable after {attempts} attempt(s): "
+            f"{detail}{suffix}"
+        )
+
+
 class EdgeDictionaryBatcher:
     """Coalesce concurrent term lookups into one bounded edge invocation."""
 
@@ -277,11 +330,32 @@ class EdgeDictionaryBatcher:
         gate: HostGate,
         batch_size: int = 8,
         flush_delay: float = 0.04,
+        profile: str = "core",
+        max_attempts: int = 3,
+        retry_base_delay: float = 1.0,
+        retry_max_delay: float = 8.0,
+        inline_retry_after_limit: float = 60.0,
+        retry_jitter_ratio: float = 0.15,
     ):
         self.client = client
         self.gate = gate
         self.batch_size = max(1, min(8, batch_size))
         self.flush_delay = max(0.0, flush_delay)
+        self.profile = "deep" if profile == "deep" else "core"
+        self.max_attempts = max(1, min(6, max_attempts))
+        self.retry_base_delay = max(0.0, retry_base_delay)
+        self.retry_max_delay = max(
+            self.retry_base_delay,
+            retry_max_delay,
+        )
+        self.inline_retry_after_limit = max(
+            0.0,
+            inline_retry_after_limit,
+        )
+        self.retry_jitter_ratio = max(
+            0.0,
+            min(0.5, retry_jitter_ratio),
+        )
         self.pending: list[
             tuple[str, asyncio.Future[tuple[Any | None, int | None, str | None]]]
         ] = []
@@ -314,44 +388,145 @@ class EdgeDictionaryBatcher:
             status: int | None = None
             error: str | None = None
             results: dict[str, Any] = {}
-            await self.gate.semaphore.acquire()
-            try:
-                await self.gate.wait()
-                response = await self.client.post(
-                    f"{EDGE_BASE}/api/dictionary/batch",
-                    json={"terms": terms},
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": "LexoraOpenLexicon/1.0 (open-data enrichment)",
-                        **(
-                            {"X-Lexora-Origin-Token": EDGE_TOKEN}
-                            if EDGE_TOKEN
-                            else {}
-                        ),
-                    },
-                )
-                status = response.status_code
-                if response.status_code == 200:
-                    payload = response.json()
-                    raw_results = payload.get("results", {})
-                    if isinstance(raw_results, dict):
+            fatal_error: EdgeBatchRetryExhausted | None = None
+            for attempt in range(self.max_attempts):
+                status = None
+                error = None
+                retryable = False
+                retry_after: float | None = None
+                await self.gate.semaphore.acquire()
+                try:
+                    await self.gate.wait()
+                    response = await self.client.post(
+                        f"{EDGE_BASE}/api/dictionary/batch",
+                        json={"terms": terms, "profile": self.profile},
+                        headers={
+                            "Accept": "application/json",
+                            "User-Agent": "LexoraOpenLexicon/1.0 (open-data enrichment)",
+                            **(
+                                {"X-Lexora-Origin-Token": EDGE_TOKEN}
+                                if EDGE_TOKEN
+                                else {}
+                            ),
+                        },
+                    )
+                    status = response.status_code
+                    if status == 200:
+                        payload = response.json()
+                        if not isinstance(payload, dict):
+                            raise ValueError(
+                                "edge batch returned a non-object payload"
+                            )
+                        raw_results = payload.get("results", {})
+                        if not isinstance(raw_results, dict):
+                            raise ValueError(
+                                "edge batch returned invalid results"
+                            )
                         results = raw_results
-                else:
-                    error = f"HTTP {response.status_code}"
-            except (httpx.HTTPError, ValueError, TypeError) as exc:
-                error = str(exc)
-            finally:
-                self.gate.semaphore.release()
+                        retryable_item_status: int | None = None
+                        for requested_term in terms:
+                            item = raw_results.get(requested_term)
+                            if not isinstance(item, dict):
+                                retryable_item_status = 502
+                                break
+                            try:
+                                item_status = int(item.get("status", 502))
+                            except (TypeError, ValueError):
+                                item_status = 502
+                            if item_status in (429, 500, 502, 503, 504):
+                                retryable_item_status = item_status
+                                break
+                        if retryable_item_status is None:
+                            error = None
+                            break
+                        status = retryable_item_status
+                        error = (
+                            "edge batch returned a retryable item failure"
+                        )
+                        retryable = True
+                    error = f"HTTP {status}"
+                    retryable = (
+                        retryable
+                        or status in (429, 500, 502, 503, 504)
+                    )
+                    if retryable and response.status_code != 200:
+                        retry_after = retry_after_seconds(
+                            response.headers.get("retry-after")
+                        )
+                except (httpx.HTTPError, ValueError, TypeError) as exc:
+                    error = str(exc)
+                    retryable = True
+                finally:
+                    self.gate.semaphore.release()
+
+                if not retryable:
+                    break
+
+                attempts = attempt + 1
+                too_long_to_wait = (
+                    retry_after is not None
+                    and retry_after > self.inline_retry_after_limit
+                )
+                if attempts >= self.max_attempts or too_long_to_wait:
+                    fatal_error = EdgeBatchRetryExhausted(
+                        status=status,
+                        attempts=attempts,
+                        retry_after=retry_after,
+                        detail=error or "retryable edge failure",
+                    )
+                    break
+
+                delay = (
+                    retry_after
+                    if retry_after is not None
+                    else min(
+                        self.retry_max_delay,
+                        self.retry_base_delay * (2 ** attempt),
+                    )
+                )
+                jitter = random.uniform(
+                    0.0,
+                    delay * self.retry_jitter_ratio,
+                )
+                await asyncio.sleep(delay + jitter)
+
+            if fatal_error is not None:
+                # Fail every request currently owned by this flusher.  Leaving
+                # queued futures unresolved would hang the worker; turning
+                # them into the same fatal error lets run() stop cleanly.
+                async with self.lock:
+                    queued = self.pending
+                    self.pending = []
+                    self.flush_task = None
+                for _, future in [*batch, *queued]:
+                    if not future.done():
+                        future.set_exception(fatal_error)
+                return
 
             for term, future in batch:
                 item = results.get(term)
-                item_status = (
-                    int(item.get("status"))
-                    if isinstance(item, dict) and item.get("status") is not None
-                    else status
-                )
-                data = item.get("data") if isinstance(item, dict) else None
-                item_error = error
+                if not isinstance(item, dict):
+                    # A successful outer batch response does not mean every
+                    # requested term was accepted or processed.  Treat a
+                    # missing entry as retryable instead of recording a false
+                    # successful attempt with empty data.
+                    item_status = (
+                        502 if status in (None, 200) else status
+                    )
+                    data = None
+                    item_error = (
+                        "edge batch missing term result"
+                        if status in (None, 200)
+                        else error or "edge batch request failed"
+                    )
+                else:
+                    item_status = (
+                        int(item.get("status"))
+                        if item.get("status") is not None
+                        else status
+                    )
+                    data = item.get("data")
+                    item_error = error
                 if item_status != 200:
                     if isinstance(data, dict) and data.get("error"):
                         item_error = str(data["error"])
@@ -401,55 +576,99 @@ class EdgeTranslationBatcher:
                     self.flush_task = None
                     return
             chunk_owners: list[int] = []
+            owner_chunk_counts = [0 for _ in batch]
             texts: list[str] = []
             for owner, (text, _) in enumerate(batch):
                 for chunk in translation_chunks(text):
                     chunk_owners.append(owner)
+                    owner_chunk_counts[owner] += 1
                     texts.append(chunk)
-            translations: list[str] = []
-            status: int | None = None
-            error: str | None = None
-            await self.gate.semaphore.acquire()
-            try:
-                await self.gate.wait()
-                response = await self.client.post(
-                    f"{EDGE_BASE}/api/translate/batch",
-                    json={"texts": texts},
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": "LexoraOpenLexicon/1.0 (open-data enrichment)",
-                        **(
-                            {"X-Lexora-Origin-Token": EDGE_TOKEN}
-                            if EDGE_TOKEN
-                            else {}
-                        ),
-                    },
-                )
-                status = response.status_code
-                if response.status_code == 200:
-                    payload = response.json()
-                    values = payload.get("translations", [])
-                    if isinstance(values, list):
-                        translations = [str(value or "").strip() for value in values]
-                else:
-                    error = f"HTTP {response.status_code}"
-            except (httpx.HTTPError, ValueError, TypeError) as exc:
-                error = str(exc)
-            finally:
-                self.gate.semaphore.release()
+            translated_chunks = ["" for _ in texts]
+            chunk_statuses: list[int | None] = [None for _ in texts]
+            chunk_errors: list[str | None] = [None for _ in texts]
+            # The Worker accepts at most 32 texts per request.  Split the
+            # flattened chunk list again so a very long definition cannot be
+            # silently truncated after its 32nd chunk.
+            for start in range(0, len(texts), 32):
+                request_texts = texts[start : start + 32]
+                status: int | None = None
+                error: str | None = None
+                translations: list[str] = []
+                await self.gate.semaphore.acquire()
+                try:
+                    await self.gate.wait()
+                    response = await self.client.post(
+                        f"{EDGE_BASE}/api/translate/batch",
+                        json={"texts": request_texts},
+                        headers={
+                            "Accept": "application/json",
+                            "User-Agent": "LexoraOpenLexicon/1.0 (open-data enrichment)",
+                            **(
+                                {"X-Lexora-Origin-Token": EDGE_TOKEN}
+                                if EDGE_TOKEN
+                                else {}
+                            ),
+                        },
+                    )
+                    status = response.status_code
+                    if response.status_code == 200:
+                        payload = response.json()
+                        values = payload.get("translations", [])
+                        if isinstance(values, list):
+                            translations = [
+                                str(value or "").strip() for value in values
+                            ]
+                    else:
+                        error = f"HTTP {response.status_code}"
+                except (httpx.HTTPError, ValueError, TypeError) as exc:
+                    error = str(exc)
+                finally:
+                    self.gate.semaphore.release()
+                for offset in range(len(request_texts)):
+                    index = start + offset
+                    chunk_statuses[index] = status
+                    chunk_errors[index] = error
+                    if offset < len(translations):
+                        translated_chunks[index] = translations[offset]
 
             values_by_owner: list[list[str]] = [[] for _ in batch]
+            statuses_by_owner: list[list[int | None]] = [[] for _ in batch]
+            errors_by_owner: list[list[str]] = [[] for _ in batch]
             for index, owner in enumerate(chunk_owners):
-                if index < len(translations) and translations[index]:
-                    values_by_owner[owner].append(translations[index])
+                values_by_owner[owner].append(translated_chunks[index])
+                statuses_by_owner[owner].append(chunk_statuses[index])
+                if chunk_errors[index]:
+                    errors_by_owner[owner].append(str(chunk_errors[index]))
             for index, (_, future) in enumerate(batch):
-                value = "\n".join(values_by_owner[index]).strip()
+                translations = values_by_owner[index]
+                complete = (
+                    owner_chunk_counts[index] > 0
+                    and len(translations) == owner_chunk_counts[index]
+                    and all(translations)
+                )
+                value = "\n".join(translations).strip() if complete else ""
+                owner_statuses = statuses_by_owner[index]
+                failed_status = next(
+                    (
+                        item
+                        for item in owner_statuses
+                        if item is not None and item != 200
+                    ),
+                    None,
+                )
+                status = 200 if complete else failed_status
+                if status is None and any(item == 200 for item in owner_statuses):
+                    status = 200
+                error = (
+                    "; ".join(unique(errors_by_owner[index], 3))
+                    or "translation missing"
+                )
                 if not future.done():
                     future.set_result(
                         (
                             value,
                             status,
-                            None if value else error or "translation missing",
+                            None if complete else error,
                         )
                     )
 
@@ -480,6 +699,7 @@ async def request_json(client: httpx.AsyncClient, gate: HostGate, url: str, sour
 def dictionary_fields(data: Any) -> dict[str, Any]:
     if not isinstance(data, list): return {}
     definitions: list[str] = []; examples: list[str] = []; synonyms: list[str] = []; antonyms: list[str] = []
+    parts_of_speech: list[str] = []
     us = ""; uk = ""; fallback = ""
     for entry in data:
         entry_fallback = normalize_phonetic(entry.get("phonetic"))
@@ -496,6 +716,8 @@ def dictionary_fields(data: Any) -> dict[str, Any]:
             elif not fallback:
                 fallback = text
         for meaning in entry.get("meanings", []) or []:
+            if meaning.get("partOfSpeech"):
+                parts_of_speech.append(str(meaning["partOfSpeech"]))
             for item in meaning.get("definitions", []) or []:
                 if item.get("definition"): definitions.append(item["definition"])
                 if item.get("example"): examples.append(item["example"])
@@ -506,32 +728,62 @@ def dictionary_fields(data: Any) -> dict[str, Any]:
         "examples": unique(examples, 8),
         "synonyms": unique(synonyms),
         "antonyms": unique(antonyms),
-        "us": us or fallback or uk,
-        "uk": uk or fallback or us,
+        "pos": ", ".join(unique(parts_of_speech, 8)),
+        # A generic transcription is useful provenance, but assigning it to
+        # both dialect columns fabricates information.  Keep only explicitly
+        # identified US/UK values in their respective fields.
+        "generic_phonetic": fallback,
+        "us": us,
+        "uk": uk,
     }
 
-def datamuse_fields(data: Any) -> dict[str, Any]:
+def datamuse_fields(
+    data: Any,
+    *,
+    exact_term: str | None = None,
+) -> dict[str, Any]:
     if not isinstance(data, list): return {}
-    words = unique([x.get("word", "") for x in data if isinstance(x, dict)])
-    definitions = unique([d for x in data if isinstance(x, dict) for d in x.get("defs", [])])
+    items = [item for item in data if isinstance(item, dict)]
+    if exact_term is not None:
+        target = normalized_term(exact_term)
+        items = [
+            item
+            for item in items
+            if normalized_term(item.get("word")) == target
+        ]
+    words = unique([item.get("word", "") for item in items])
+    definitions = unique([d for item in items for d in item.get("defs", [])])
     frequencies: list[float] = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
+    phonetics: list[str] = []
+    parts_of_speech: list[str] = []
+    pos_names = {
+        "n": "noun",
+        "v": "verb",
+        "adj": "adjective",
+        "adv": "adverb",
+    }
+    for item in items:
         for tag in item.get("tags", []) or []:
-            if not isinstance(tag, str) or not tag.startswith("f:"):
+            if not isinstance(tag, str):
                 continue
-            try:
-                raw = float(tag[2:])
-            except ValueError:
+            if tag in pos_names:
+                parts_of_speech.append(pos_names[tag])
                 continue
-            if raw > 0:
-                frequencies.append(3 + math.log10(raw))
+            if tag.startswith("ipa_pron:"):
+                phonetic = normalize_phonetic(tag.split(":", 1)[1])
+                if phonetic:
+                    phonetics.append(phonetic)
+                continue
+            if tag.startswith("f:"):
+                try:
+                    raw = float(tag[2:])
+                except ValueError:
+                    continue
+                if raw > 0:
+                    frequencies.append(3 + math.log10(raw))
     entries: list[dict[str, str]] = []
     seen: set[str] = set()
-    for item in data:
-        if not isinstance(item, dict):
-            continue
+    for item in items:
         word = " ".join(str(item.get("word") or "").split()).strip()
         if not word or word in seen:
             continue
@@ -554,39 +806,69 @@ def datamuse_fields(data: Any) -> dict[str, Any]:
         "entries": entries,
         "definition": "\n".join(definitions[:24]),
         "frequency": max(frequencies) if frequencies else 0.0,
+        "phonetic": unique(phonetics, 1)[0] if phonetics else "",
+        "pos": ", ".join(unique(parts_of_speech, 8)),
     }
 
 
-def edge_fields(data: Any) -> dict[str, Any]:
+def edge_fields(data: Any, term: str) -> dict[str, Any]:
     """Normalize the aggregate response from Lexora's Cloudflare edge."""
     if not isinstance(data, dict):
         return {}
     result = dictionary_fields(data.get("dictionary"))
-    exact = datamuse_fields(data.get("exact"))
-    related = datamuse_fields(data.get("related"))
-    synonyms = datamuse_fields(data.get("synonyms"))
-    antonyms = datamuse_fields(data.get("antonyms"))
-    related_words = related.get("words", [])
+    exact = datamuse_fields(data.get("exact"), exact_term=term)
     if not result.get("definition"):
         result["definition"] = exact.get("definition", "")
-    result["frequency"] = max(
-        float(exact.get("frequency", 0) or 0),
-        float(related.get("frequency", 0) or 0),
-    )
-    result["related"] = related_words
-    result["phrases"] = [word for word in related_words if " " in word]
-    result["related_entries"] = [
-        item
-        for item in related.get("entries", [])
-        if " " not in str(item.get("word") or "")
-    ]
-    result["phrase_entries"] = [
-        item
-        for item in related.get("entries", [])
-        if " " in str(item.get("word") or "")
-    ]
-    result["synonyms"] = synonyms.get("words", [])
-    result["antonyms"] = antonyms.get("words", [])
+    if not result.get("pos"):
+        result["pos"] = exact.get("pos", "")
+    # Datamuse's ``md=p&ipa=1`` result includes an ``ipa_pron:`` tag.  It is
+    # Datamuse currently derives this value from its American pronunciation
+    # metadata.  Use it only as a US fallback; copying a rhotic /ɝ/ value into
+    # the UK field would incorrectly label it as British pronunciation.
+    exact_phonetic = str(exact.get("phonetic") or "")
+    if exact_phonetic:
+        result["us"] = result.get("us") or exact_phonetic
+    # Only the exact target's frequency describes this entry.  A semantically
+    # related word may be much more common and must not change the target's
+    # difficulty badge.
+    result["frequency"] = float(exact.get("frequency", 0) or 0)
+
+    # Core responses intentionally omit the three deep providers.  Absence is
+    # different from an empty provider result: do not manufacture empty lists
+    # that overwrite DictionaryAPI relationships or a caller's existing data.
+    if "related" in data:
+        related = datamuse_fields(data.get("related"))
+        related_words = related.get("words", [])
+        result["related"] = related_words
+        result["phrases"] = [
+            word for word in related_words if " " in word
+        ]
+        result["related_entries"] = [
+            item
+            for item in related.get("entries", [])
+            if " " not in str(item.get("word") or "")
+        ]
+        result["phrase_entries"] = [
+            item
+            for item in related.get("entries", [])
+            if " " in str(item.get("word") or "")
+        ]
+    if "synonyms" in data:
+        synonyms = datamuse_fields(data.get("synonyms"))
+        result["synonyms"] = unique(
+            [
+                *result.get("synonyms", []),
+                *synonyms.get("words", []),
+            ]
+        )
+    if "antonyms" in data:
+        antonyms = datamuse_fields(data.get("antonyms"))
+        result["antonyms"] = unique(
+            [
+                *result.get("antonyms", []),
+                *antonyms.get("words", []),
+            ]
+        )
     return result
 
 def difficulty(score: float) -> str:
@@ -594,6 +876,35 @@ def difficulty(score: float) -> str:
     if score >= 4.8: return "B1–B2"
     if score >= 3.4: return "C1–C2"
     return "C2+"
+
+
+def marker_retry_due(raw: str | None, retry_after_hours: float) -> bool:
+    marker = json.loads(raw or "{}")
+    if not marker.get("status"):
+        return True
+    last_attempt = marker.get("lastAttempt")
+    if not last_attempt:
+        return True
+    try:
+        attempted_at = dt.datetime.fromisoformat(last_attempt)
+        if attempted_at.tzinfo is None:
+            attempted_at = attempted_at.replace(tzinfo=dt.timezone.utc)
+        age = dt.datetime.now(dt.timezone.utc) - attempted_at
+        return age.total_seconds() >= max(0.0, retry_after_hours) * 3600
+    except (TypeError, ValueError):
+        return True
+
+
+def marker_profile(raw: str | None) -> str:
+    """Return the completed collection stage, treating legacy markers as core."""
+    try:
+        marker = json.loads(raw or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return "core"
+    if not isinstance(marker, dict):
+        return "core"
+    return "deep" if marker.get("profile") == "deep" else "core"
+
 
 def should_process_marker(raw: str | None, retry_after_hours: float) -> bool:
     """Resume efficiently without re-querying a recently attempted term."""
@@ -603,15 +914,74 @@ def should_process_marker(raw: str | None, retry_after_hours: float) -> bool:
         return True
     if status == "completed":
         return False
-    last_attempt = marker.get("lastAttempt")
-    if not last_attempt:
-        return True
+    return marker_retry_due(raw, retry_after_hours)
+
+
+def needs_deep_enrichment(
+    synonyms: Any,
+    antonyms: Any,
+    phrases: Any,
+    related: Any,
+) -> bool:
+    """Whether a row still lacks any field supplied by the deep providers."""
+    return any(
+        not value
+        for value in (synonyms, antonyms, phrases, related)
+    )
+
+
+def needs_deep_profile_pass(
+    raw: str | None,
+    profile: str,
+    has_deep_gaps: bool,
+) -> bool:
+    """Allow one immediate deep pass after a successful core-only pass."""
+    if profile != "deep" or not has_deep_gaps:
+        return False
     try:
-        attempted_at = dt.datetime.fromisoformat(last_attempt)
-        age = dt.datetime.now(dt.timezone.utc) - attempted_at
-        return age.total_seconds() >= max(0.0, retry_after_hours) * 3600
-    except ValueError:
-        return True
+        marker = json.loads(raw or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(marker, dict):
+        return False
+    return (
+        marker.get("status") == "completed"
+        and marker_profile(raw) != "deep"
+    )
+
+
+def needs_entry_quality_repair(
+    term: str,
+    definition: Any,
+    translation: Any,
+    us_phonetic: Any,
+    uk_phonetic: Any,
+    frequency: Any,
+) -> bool:
+    # Multi-word phrases do not reliably have standalone dictionary IPA, so a
+    # missing phrase pronunciation must not force an endless daily retry.
+    phrase = " " in normalized_term(term)
+    return (
+        (
+            not phrase
+            and (
+                needs_phonetic_repair(us_phonetic)
+                or needs_phonetic_repair(uk_phonetic)
+            )
+        )
+        or needs_definition_translation(definition, translation)
+        or needs_frequency_repair(frequency)
+    )
+
+
+def resolved_difficulty(
+    current: Any,
+    previous_frequency: Any,
+    score: float,
+) -> str:
+    if not str(current or "").strip() or needs_frequency_repair(previous_frequency):
+        return difficulty(score)
+    return str(current)
 
 async def enrich_term(
     client: httpx.AsyncClient,
@@ -620,7 +990,9 @@ async def enrich_term(
     state: sqlite3.Connection,
     existing: dict[str, Any],
     edge_batcher: EdgeDictionaryBatcher | None = None,
+    profile: str = "core",
 ) -> dict[str, Any]:
+    profile = "deep" if profile == "deep" else "core"
     encoded = quote(term, safe="")
     urls = {
       "edge": f"{EDGE_BASE}/api/dictionary/full?term={encoded}" if EDGE_BASE else "",
@@ -633,17 +1005,27 @@ async def enrich_term(
     result: dict[str, Any] = {"_statuses": [], "_attempted": []}
     sources: list[str] = []
     needs_definition = not existing.get("definition")
+    needs_pos = not str(existing.get("pos") or "").strip()
     needs_phonetic = needs_phonetic_repair(existing.get("us")) or needs_phonetic_repair(existing.get("uk"))
     needs_examples = not existing.get("examples")
+    needs_frequency = needs_frequency_repair(existing.get("frequency"))
+    needs_deep = (
+        profile == "deep"
+        and needs_deep_enrichment(
+            existing.get("synonyms"),
+            existing.get("antonyms"),
+            existing.get("phrases"),
+            existing.get("related"),
+        )
+    )
     needs_network = any(
         (
             needs_definition,
+            needs_pos,
             needs_phonetic,
             needs_examples,
-            not existing.get("related"),
-            not existing.get("phrases"),
-            not existing.get("synonyms"),
-            not existing.get("antonyms"),
+            needs_frequency,
+            needs_deep,
         )
     )
     if EDGE_BASE and needs_network:
@@ -653,7 +1035,7 @@ async def enrich_term(
     if not EDGE_BASE:
         if not existing.get("related") or not existing.get("phrases"):
             sources.append("datamuse_related")
-        if needs_definition:
+        if needs_definition or needs_pos or needs_frequency:
             sources.append("datamuse_exact")
         if not existing.get("synonyms"):
             sources.append("datamuse_synonyms")
@@ -672,14 +1054,38 @@ async def enrich_term(
     # provider's request rate and in-flight concurrency.
     fetched = await asyncio.gather(*(fetch(source) for source in sources))
     for source, data, status, error in fetched:
+        provider_status = "completed" if status == 200 else "failed"
+        if source == "edge" and status == 200 and isinstance(data, dict):
+            provider_details = data.get("_providers")
+            if isinstance(provider_details, dict) and provider_details:
+                provider_values = [
+                    item
+                    for item in provider_details.values()
+                    if isinstance(item, dict)
+                ]
+                provider_ok = [
+                    bool(item.get("ok"))
+                    for item in provider_values
+                ]
+                if not bool(data.get("_found")):
+                    provider_status = "not_found"
+                elif provider_ok and all(provider_ok):
+                    provider_status = "completed"
+                elif any(provider_ok):
+                    provider_status = "partial"
+                else:
+                    provider_status = "failed"
         state.execute("""INSERT INTO provider_state(term,source,status,attempts,http_status,last_error,updated_at)
           VALUES(?,?,?,?,?,?,?) ON CONFLICT(term,source) DO UPDATE SET status=excluded.status,attempts=provider_state.attempts+1,http_status=excluded.http_status,last_error=excluded.last_error,updated_at=excluded.updated_at""",
-          (term, source, "completed" if status == 200 else "failed", 1, status, error, now()))
-        result["_statuses"].append("completed" if status == 200 else "failed")
+          (term, source, provider_status, 1, status, error, now()))
+        result["_statuses"].append(provider_status)
         result["_attempted"].append(source)
         if source == "dictionary": result.update(dictionary_fields(data))
         elif source.startswith("datamuse"):
-            parsed = datamuse_fields(data)
+            parsed = datamuse_fields(
+                data,
+                exact_term=term if source == "datamuse_exact" else None,
+            )
             result[source] = parsed
             if source == "datamuse_exact" and parsed.get("definition") and not result.get("definition"):
                 result["definition"] = parsed["definition"]
@@ -690,9 +1096,13 @@ async def enrich_term(
                 ]
             if source == "datamuse_synonyms": result["synonyms"] = parsed.get("words", [])
             if source == "datamuse_antonyms": result["antonyms"] = parsed.get("words", [])
-            result["frequency"] = max(float(result.get("frequency", 0)), float(parsed.get("frequency", 0)))
+            if source == "datamuse_exact":
+                result["frequency"] = max(
+                    float(result.get("frequency", 0)),
+                    float(parsed.get("frequency", 0)),
+                )
         elif source == "edge":
-            result.update(edge_fields(data))
+            result.update(edge_fields(data, term))
     return result
 
 async def translate(
@@ -705,45 +1115,57 @@ async def translate(
     if EDGE_BASE and translation_batcher is not None:
         return await translation_batcher.request(text)
     if EDGE_BASE:
-        for attempt in range(3):
-            await gate.semaphore.acquire()
-            try:
-                await gate.wait()
-                response = await client.post(
-                    f"{EDGE_BASE}/api/translate/batch",
-                    json={"texts": [text[:1800]]},
-                    headers={
-                        "User-Agent": "LexoraOpenLexicon/1.0 (open-data enrichment)",
-                        **(
-                            {"X-Lexora-Origin-Token": EDGE_TOKEN}
-                            if EDGE_TOKEN
-                            else {}
-                        ),
-                    },
-                )
-                if response.status_code == 200:
-                    values = response.json().get("translations", [])
-                    translated = str(values[0]).strip() if values else ""
-                    return translated, 200, None if translated else "translation missing"
-                if response.status_code not in (429, 500, 502, 503, 504):
-                    return "", response.status_code, f"HTTP {response.status_code}"
-            except (httpx.HTTPError, ValueError, TypeError) as exc:
-                if attempt == 2:
-                    return "", None, str(exc)
-            finally:
-                gate.semaphore.release()
-            await asyncio.sleep(min(8.0, 2 ** attempt))
-        return "", None, "translation exhausted retries"
-    url = "https://api.mymemory.translated.net/get?q=" + quote(text, safe="") + "&langpair=en|zh-CN"
-    data, status, error = await request_json(client, gate, url, "translation")
-    try:
-        return str(data["responseData"]["translatedText"]), status, error
-    except Exception:
-        return "", status, error or "translation missing"
+        return await EdgeTranslationBatcher(
+            client,
+            gate,
+            batch_size=1,
+            flush_delay=0,
+        ).request(text)
+    translations: list[str] = []
+    statuses: list[int | None] = []
+    for chunk in translation_chunks(text):
+        url = (
+            "https://api.mymemory.translated.net/get?q="
+            + quote(chunk, safe="")
+            + "&langpair=en|zh-CN"
+        )
+        data, status, error = await request_json(
+            client,
+            gate,
+            url,
+            "translation",
+        )
+        statuses.append(status)
+        try:
+            translated = str(data["responseData"]["translatedText"]).strip()
+        except Exception:
+            translated = ""
+        if not translated:
+            return "", status, error or "translation missing"
+        translations.append(translated)
+    return (
+        "\n".join(translations),
+        200 if statuses and all(item == 200 for item in statuses) else None,
+        None,
+    )
 
-async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers: int, translation_delay: float, retry_after_hours: float, start_id: int | None, end_id: int | None, shard_index: int | None, shard_count: int) -> None:
+async def run(
+    dataset: Path,
+    state_path: Path,
+    limit: int,
+    delay: float,
+    workers: int,
+    translation_delay: float,
+    retry_after_hours: float,
+    start_id: int | None,
+    end_id: int | None,
+    shard_index: int | None,
+    shard_count: int,
+    profile: str = "core",
+) -> None:
     state = init_state(state_path)
     workers = max(1, workers)
+    profile = "deep" if profile == "deep" else "core"
     gates = {
         "edge": HostGate(delay, min(4, workers)),
         "dictionary": HostGate(delay, min(4, workers)),
@@ -753,7 +1175,12 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
     client_timeout = httpx.Timeout(20.0, connect=10.0)
     client = httpx.AsyncClient(timeout=client_timeout, follow_redirects=True)
     edge_batcher = (
-        EdgeDictionaryBatcher(client, gates["edge"], batch_size=workers)
+        EdgeDictionaryBatcher(
+            client,
+            gates["edge"],
+            batch_size=workers,
+            profile=profile,
+        )
         if EDGE_BASE
         else None
     )
@@ -774,10 +1201,11 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
             end_id = min_id + (total * (shard_index + 1)) // shard_count - 1
         processed = 0
         async def process_row(row: tuple[Any, ...]) -> tuple[str, str]:
-            entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, phrases_json, phrase_entries_json, related_json, related_entries_json, freq, diff, enrich_json = row
+            entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, phrases_json, phrase_entries_json, related_json, related_entries_json, freq, diff, enrich_json, pos = row
             marker = json.loads(enrich_json or "{}")
             existing = {
                 "definition": definition or "",
+                "pos": pos or "",
                 "us": "" if needs_phonetic_repair(us) else normalize_phonetic(us),
                 "uk": "" if needs_phonetic_repair(uk) else normalize_phonetic(uk),
                 "examples": json.loads(examples_json or "[]"),
@@ -787,6 +1215,7 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                 "antonyms": json.loads(antonyms_json or "[]"),
                 "related": json.loads(related_json or "[]"),
                 "related_entries": json.loads(related_entries_json or "[]"),
+                "frequency": freq,
             }
             data = await enrich_term(
                 client,
@@ -795,7 +1224,9 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                 state,
                 existing,
                 edge_batcher=edge_batcher,
+                profile=profile,
             )
+            pos = pos or data.get("pos", "")
             definition = definition or data.get("definition", "")
             if needs_phonetic_repair(us):
                 us = normalize_phonetic(
@@ -827,7 +1258,7 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                 translated_zh, status, error = await translate(
                     client,
                     gates["translation"],
-                    definition[:1800],
+                    definition,
                     translation_batcher=translation_batcher,
                 )
                 if translated_zh:
@@ -835,6 +1266,7 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                 state.execute("""INSERT INTO provider_state(term,source,status,attempts,http_status,last_error,updated_at) VALUES(?,?,?,?,?,?,?)
                   ON CONFLICT(term,source) DO UPDATE SET status=excluded.status,attempts=provider_state.attempts+1,http_status=excluded.http_status,last_error=excluded.last_error,updated_at=excluded.updated_at""",
                   (term, "translation", "completed" if translated_zh else "failed", 1, status, error, now()))
+                data.setdefault("_attempted", []).append("translation")
                 data.setdefault("_statuses", []).append("completed" if translated_zh else "failed")
             base_frequency = 0.0 if needs_frequency_repair(freq) else float(freq or 0)
             score = max(
@@ -843,10 +1275,30 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
             )
             statuses = data.pop("_statuses", [])
             attempted = data.pop("_attempted", [])
-            marker_status = "completed" if not attempted or all(item == "completed" for item in statuses) else ("partial" if any(item == "completed" for item in statuses) else "not_found")
-            marker = {"status": marker_status, "lastAttempt": now(), "sources": sorted(set(["open-data", "network"]))}
-            db.execute("""UPDATE entries SET definition=?,definition_zh=?,us_phonetic=?,uk_phonetic=?,synonyms_json=?,antonyms_json=?,examples_json=?,phrases_json=?,phrase_entries_json=?,related_words_json=?,related_entries_json=?,frequency=?,difficulty=?,enrichment_json=? WHERE id=?""",
-              (definition, zh, us, uk, j(synonyms), j(antonyms), j(examples), j(phrases), j(phrase_entries), j(related), j(related_entries), score, diff or difficulty(score), j(marker), entry_id))
+            marker_status = (
+                "completed"
+                if not attempted
+                or (
+                    len(statuses) >= len(attempted)
+                    and all(item == "completed" for item in statuses)
+                )
+                else (
+                    "partial"
+                    if any(
+                        item in ("completed", "partial")
+                        for item in statuses
+                    )
+                    else "not_found"
+                )
+            )
+            marker = {
+                "status": marker_status,
+                "profile": profile,
+                "lastAttempt": now(),
+                "sources": sorted(set(["open-data", "network"])),
+            }
+            db.execute("""UPDATE entries SET pos=?,definition=?,definition_zh=?,us_phonetic=?,uk_phonetic=?,synonyms_json=?,antonyms_json=?,examples_json=?,phrases_json=?,phrase_entries_json=?,related_words_json=?,related_entries_json=?,frequency=?,difficulty=?,enrichment_json=? WHERE id=?""",
+              (pos, definition, zh, us, uk, j(synonyms), j(antonyms), j(examples), j(phrases), j(phrase_entries), j(related), j(related_entries), score, resolved_difficulty(diff, freq, score), j(marker), entry_id))
             db.execute("""INSERT OR REPLACE INTO entries_fts(rowid,word,definition,definition_zh,examples,phrases)
               SELECT id,word,definition,definition_zh,examples_json,phrases_json FROM entries WHERE id=?""", (entry_id,))
             db.commit(); state.commit()
@@ -859,8 +1311,11 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                 *(process_row(item) for item in pending),
                 return_exceptions=True,
             )
+            fatal_error: EdgeBatchRetryExhausted | None = None
             for result in results:
-                if isinstance(result, Exception):
+                if isinstance(result, EdgeBatchRetryExhausted):
+                    fatal_error = fatal_error or result
+                elif isinstance(result, Exception):
                     print(f"enrichment-error={result!r}", flush=True)
                 else:
                     processed += 1
@@ -871,6 +1326,12 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                             flush=True,
                         )
             pending.clear()
+            if fatal_error is not None:
+                # Abort this pass before advancing to another page.  The
+                # affected rows received neither provider-state writes nor an
+                # enrichment marker, so the next systemd-timer run resumes
+                # them through the normal beginning-of-shard scan.
+                raise fatal_error
 
         # Keep pages large enough to skip completed terms efficiently but
         # small enough for 1 GB collection instances.  Crucially, each page's
@@ -902,15 +1363,35 @@ async def run(dataset: Path, state_path: Path, limit: int, delay: float, workers
                 if limit and processed + len(pending) >= limit:
                     reached_limit = True
                     break
-                needs_quality_repair = (
-                    needs_phonetic_repair(row[5])
-                    or needs_phonetic_repair(row[6])
-                    or needs_definition_translation(row[3], row[4])
-                    or needs_frequency_repair(row[14])
+                needs_quality_repair = needs_entry_quality_repair(
+                    row[2],
+                    row[3],
+                    row[4],
+                    row[5],
+                    row[6],
+                    row[14],
+                )
+                has_deep_gaps = (
+                    needs_deep_enrichment(
+                        json.loads(row[7] or "[]"),
+                        json.loads(row[8] or "[]"),
+                        json.loads(row[10] or "[]"),
+                        json.loads(row[12] or "[]"),
+                    )
+                    if profile == "deep"
+                    else False
                 )
                 if (
-                    not should_process_marker(row[-1], retry_after_hours)
-                    and not needs_quality_repair
+                    not should_process_marker(row[16], retry_after_hours)
+                    and not (
+                        needs_quality_repair
+                        and marker_retry_due(row[16], retry_after_hours)
+                    )
+                    and not needs_deep_profile_pass(
+                        row[16],
+                        profile,
+                        has_deep_gaps,
+                    )
                 ):
                     continue
                 pending.append(row)
@@ -931,6 +1412,15 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=16, help="number of terms processed concurrently")
     ap.add_argument("--translation-delay", type=float, default=1.0, help="minimum seconds between translation requests")
     ap.add_argument("--retry-after-hours", type=float, default=24.0, help="retry partial/not-found terms only after this many hours")
+    ap.add_argument(
+        "--profile",
+        choices=("core", "deep", "auto"),
+        default="core",
+        help=(
+            "core first pass, deep relationship-enrichment pass, or auto to "
+            "run core followed by deep"
+        ),
+    )
     ap.add_argument("--start-id", type=int, default=None, help="inclusive entry ID start")
     ap.add_argument("--end-id", type=int, default=None, help="inclusive entry ID end")
     ap.add_argument("--shard-index", type=int, default=None, help="zero-based shard index")
@@ -938,7 +1428,24 @@ def main() -> None:
     args = ap.parse_args()
     if args.shard_index is not None and (args.start_id is not None or args.end_id is not None):
         ap.error("use either --shard-index/--shard-count or --start-id/--end-id, not both")
-    asyncio.run(run(args.dataset, args.state, args.limit, args.delay, args.workers, args.translation_delay, args.retry_after_hours, args.start_id, args.end_id, args.shard_index, args.shard_count))
+    profiles = ("core", "deep") if args.profile == "auto" else (args.profile,)
+    for profile in profiles:
+        asyncio.run(
+            run(
+                args.dataset,
+                args.state,
+                args.limit,
+                args.delay,
+                args.workers,
+                args.translation_delay,
+                args.retry_after_hours,
+                args.start_id,
+                args.end_id,
+                args.shard_index,
+                args.shard_count,
+                profile=profile,
+            )
+        )
 
 if __name__ == "__main__":
     main()

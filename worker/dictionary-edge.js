@@ -11,6 +11,10 @@ const bootstrapObjects = new Set([
   "lexora-open-oxford-scope.sqlite.gz.part-01",
 ]);
 const offlineObjectPrefix = "lexora-offline/";
+const datamuseDailyLimit = 90000;
+const datamuseBurstCapacity = 32;
+const datamuseRefillPerSecond = 1;
+const datamuseLimiterObjectName = "global-v1";
 
 function offlineObjectName(pathname) {
   const prefix = "/v1/offline/download/";
@@ -169,18 +173,107 @@ function normalizeTerm(value) {
 }
 
 function isValidTerm(term) {
-  return /^[a-z][a-z' -]{0,79}$/.test(term);
+  // Match the canonical dataset's term envelope.  Dotted abbreviations and
+  // entries up to 120 characters are valid rows and must not silently vanish
+  // from a successful outer batch response.
+  return /^[a-z][a-z' .-]{0,119}$/.test(term);
 }
 
-async function enrichmentTerm(term, ctx) {
-  const cache = caches.default;
-  const cacheKey = new Request(
-    `https://lexora-enrichment-cache.invalid/v1/${encodeURIComponent(term)}`,
-  );
-  const cached = await cache.match(cacheKey);
-  if (cached) return cached;
+function enrichmentProviderNames(profile) {
+  return profile === "deep"
+    ? ["dictionary", "related", "exact", "synonyms", "antonyms"]
+    : ["dictionary", "exact"];
+}
 
-  const requests = {
+function datamuseRequestCount(profile) {
+  return enrichmentProviderNames(profile).filter(
+    (name) => name !== "dictionary",
+  ).length;
+}
+
+function enrichmentCacheKey(term, profile) {
+  return new Request(
+    `https://lexora-enrichment-cache.invalid/v4/${profile}/${encodeURIComponent(term)}`,
+  );
+}
+
+function normalizedRetryAfter(value, fallback = 60) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.min(parsed, 86400)
+    : fallback;
+}
+
+async function leaseDatamuseQuota(env, cost) {
+  if (cost === 0) return { granted: true, retryAfter: 0 };
+  if (!env.DATAMUSE_RATE_LIMITER) {
+    return { granted: false, retryAfter: 60 };
+  }
+
+  try {
+    const objectId =
+      env.DATAMUSE_RATE_LIMITER.idFromName(datamuseLimiterObjectName);
+    const stub = env.DATAMUSE_RATE_LIMITER.get(objectId);
+    const response = await stub.fetch(
+      "https://datamuse-rate-limiter.invalid/lease",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cost }),
+      },
+    );
+    const retryAfter = normalizedRetryAfter(
+      response.headers.get("Retry-After"),
+    );
+    if (!response.ok) return { granted: false, retryAfter };
+
+    let result;
+    try {
+      result = await response.json();
+    } catch {
+      return { granted: false, retryAfter: 60 };
+    }
+    return result?.granted === true
+      ? { granted: true, retryAfter: 0 }
+      : { granted: false, retryAfter };
+  } catch {
+    // The limiter is the source of truth for the free Datamuse allowance.
+    // Failing closed prevents an outage from accidentally becoming unbounded.
+    return { granted: false, retryAfter: 60 };
+  }
+}
+
+async function enrichmentTerm(
+  term,
+  profile,
+  ctx,
+  {
+    cachedResponse = null,
+    cacheChecked = false,
+    quotaGranted = false,
+  } = {},
+) {
+  const cache = caches.default;
+  const cacheKey = enrichmentCacheKey(term, profile);
+  if (cachedResponse) return cachedResponse;
+  if (!cacheChecked) {
+    const cached = await cache.match(cacheKey);
+    if (cached) return cached;
+  }
+  if (!quotaGranted) {
+    return Response.json(
+      { error: "Datamuse quota lease required" },
+      {
+        status: 429,
+        headers: {
+          "Cache-Control": "no-store",
+          "Retry-After": "60",
+        },
+      },
+    );
+  }
+
+  const availableRequests = {
     dictionary: `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(term)}`,
     related: `https://api.datamuse.com/words?${new URLSearchParams({
       ml: term,
@@ -204,39 +297,119 @@ async function enrichmentTerm(term, ctx) {
       max: "12",
     })}`,
   };
-  const jsonOrNull = async (input) => {
+  // The first pass only needs the exact result for definition/POS/IPA/frequency.
+  // Synonym, antonym and related-word gaps are handled from local open datasets
+  // and by an explicit deep pass.  This keeps the public Datamuse workload
+  // within its documented daily free allowance.
+  const requestNames = enrichmentProviderNames(profile);
+  const requests = Object.fromEntries(
+    requestNames.map((name) => [name, availableRequests[name]]),
+  );
+
+  const jsonProvider = async (input) => {
     try {
       const response = await fetch(input, {
         headers: { Accept: "application/json" },
         signal: AbortSignal.timeout(2200),
       });
-      if (!response.ok) return null;
-      return response.json();
+
+      if (response.status === 404 || response.status === 204) {
+        return {
+          data: null,
+          provider: {
+            ok: true,
+            status: response.status,
+            found: false,
+          },
+        };
+      }
+      if (!response.ok) {
+        return {
+          data: null,
+          provider: {
+            ok: false,
+            status: response.status,
+            found: false,
+          },
+        };
+      }
+
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        return {
+          data: null,
+          provider: {
+            ok: false,
+            status: response.status,
+            found: false,
+          },
+        };
+      }
+      const found = Array.isArray(data)
+        ? data.length > 0
+        : data !== null &&
+          typeof data === "object" &&
+          Object.keys(data).length > 0;
+      return {
+        data,
+        provider: {
+          ok: true,
+          status: response.status,
+          found,
+        },
+      };
     } catch {
-      return null;
+      return {
+        data: null,
+        provider: {
+          ok: false,
+          status: null,
+          found: false,
+        },
+      };
     }
   };
-  const values = await Promise.all(Object.values(requests).map(jsonOrNull));
-  if (values.every((value) => value === null)) {
+  const outcomes = await Promise.all(
+    Object.values(requests).map(jsonProvider),
+  );
+  if (outcomes.every((outcome) => !outcome.provider.ok)) {
     return Response.json(
       { error: "Dictionary providers are temporarily unavailable" },
       { status: 504, headers: { "Cache-Control": "no-store" } },
     );
   }
+
+  const providerNames = Object.keys(requests);
   const result = Object.fromEntries(
-    Object.keys(requests).map((key, index) => [key, values[index]]),
+    providerNames.map((key, index) => [key, outcomes[index].data]),
   );
+  result._providers = Object.fromEntries(
+    providerNames.map((key, index) => [key, outcomes[index].provider]),
+  );
+  result._found = outcomes.some((outcome) => outcome.provider.found);
+  result._profile = profile;
+
+  const allProvidersSucceeded = outcomes.every(
+    (outcome) => outcome.provider.ok,
+  );
+  const cacheTtl = allProvidersSucceeded ? 604800 : 3600;
   const response = Response.json(result, {
-    headers: { "Cache-Control": "public, max-age=604800" },
+    headers: { "Cache-Control": `public, max-age=${cacheTtl}` },
   });
   ctx.waitUntil(cache.put(cacheKey, response.clone()));
   return response;
 }
 
-async function enrichmentDictionaryBatch(request, ctx) {
+async function enrichmentDictionaryBatch(request, env, ctx) {
   let terms;
+  // Older collectors did not send a profile.  Default them to the bounded
+  // core pass so a rolling deployment can never multiply Datamuse usage.
+  let profile = "core";
   try {
     const payload = await request.json();
+    profile = payload.profile === "deep" ? "deep" : "core";
     const seen = new Set();
     terms = Array.isArray(payload.terms)
       ? payload.terms
@@ -253,9 +426,39 @@ async function enrichmentDictionaryBatch(request, ctx) {
   }
   if (terms.length === 0) return Response.json({ results: {} });
 
+  const cache = caches.default;
+  const cacheKeys = terms.map((term) => enrichmentCacheKey(term, profile));
+  const cachedResponses = await Promise.all(
+    cacheKeys.map((cacheKey) => cache.match(cacheKey)),
+  );
+  const missingCount = cachedResponses.filter(
+    (response) => !response,
+  ).length;
+  const quotaCost = missingCount * datamuseRequestCount(profile);
+  const lease = await leaseDatamuseQuota(env, quotaCost);
+  if (!lease.granted) {
+    return Response.json(
+      {
+        error: "Datamuse free quota is temporarily unavailable",
+        retryAfter: lease.retryAfter,
+      },
+      {
+        status: 429,
+        headers: {
+          "Cache-Control": "no-store",
+          "Retry-After": String(lease.retryAfter),
+        },
+      },
+    );
+  }
+
   const entries = await Promise.all(
-    terms.map(async (term) => {
-      const response = await enrichmentTerm(term, ctx);
+    terms.map(async (term, index) => {
+      const response = await enrichmentTerm(term, profile, ctx, {
+        cachedResponse: cachedResponses[index],
+        cacheChecked: true,
+        quotaGranted: true,
+      });
       let data;
       try {
         data = await response.json();
@@ -307,77 +510,77 @@ async function enrichmentTranslationBatch(request, ctx) {
     .map((value, index) => (value ? -1 : index))
     .filter((index) => index >= 0);
 
-  if (missingIndexes.length > 0) {
-    const marker = (index) => `[[[${index}]]]`;
-    const payload = missingIndexes
-      .map((index) => `${marker(index)} ${texts[index]}`)
-      .join("\n");
-    try {
-      const endpoint = new URL(
-        "https://translate.googleapis.com/translate_a/single",
-      );
-      endpoint.search = new URLSearchParams({
-        client: "gtx",
-        sl: "en",
-        tl: "zh-CN",
-        dt: "t",
-        q: payload,
-      }).toString();
-      const response = await fetch(endpoint, {
-        headers: { Accept: "application/json" },
-        signal: AbortSignal.timeout(3500),
-      });
-      if (response.ok) {
-        const body = await response.json();
-        const chunks = Array.isArray(body?.[0]) ? body[0] : [];
-        const joined = chunks.map((chunk) => String(chunk?.[0] ?? "")).join("");
-        for (let position = 0; position < missingIndexes.length; position++) {
-          const index = missingIndexes[position];
-          const startMarker = marker(index);
-          const start = joined.indexOf(startMarker);
-          if (start < 0) continue;
-          const contentStart = start + startMarker.length;
-          const nextIndex = missingIndexes[position + 1];
-          const end =
-            nextIndex === undefined
-              ? joined.length
-              : joined.indexOf(marker(nextIndex), contentStart);
-          const translated = joined
-            .slice(contentStart, end < 0 ? joined.length : end)
+  // Do not concatenate multiple definitions with artificial markers.  Google
+  // can translate or alter those markers, which makes otherwise successful
+  // translations impossible to split reliably.  Small bounded waves keep the
+  // input/output mapping exact and stay well below the Worker subrequest cap.
+  for (let start = 0; start < missingIndexes.length; start += 8) {
+    const wave = missingIndexes.slice(start, start + 8);
+    await Promise.all(
+      wave.map(async (index) => {
+        try {
+          const endpoint = new URL(
+            "https://translate.googleapis.com/translate_a/single",
+          );
+          endpoint.search = new URLSearchParams({
+            client: "gtx",
+            sl: "en",
+            tl: "zh-CN",
+            dt: "t",
+            q: texts[index],
+          }).toString();
+          const response = await fetch(endpoint, {
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(5000),
+          });
+          if (!response.ok) return;
+          const body = await response.json();
+          const chunks = Array.isArray(body?.[0]) ? body[0] : [];
+          const translated = chunks
+            .map((chunk) => String(chunk?.[0] ?? ""))
+            .join("")
             .trim();
           if (translated) translations[index] = translated;
+        } catch {
+          // The bounded MyMemory fallback below handles transient failures.
         }
-      }
-    } catch {
-      // Individual fallback below handles providers that reject a batch.
-    }
+      }),
+    );
   }
 
   const stillMissing = translations
     .map((value, index) => (value ? -1 : index))
     .filter((index) => index >= 0);
-  await Promise.all(
-    stillMissing.map(async (index) => {
-      try {
-        const endpoint = new URL("https://api.mymemory.translated.net/get");
-        endpoint.search = new URLSearchParams({
-          q: texts[index],
-          langpair: "en|zh-CN",
-        }).toString();
-        const response = await fetch(endpoint, {
-          headers: { Accept: "application/json" },
-          signal: AbortSignal.timeout(3000),
-        });
-        if (!response.ok) return;
-        const body = await response.json();
-        translations[index] = String(
-          body?.responseData?.translatedText ?? "",
-        ).trim();
-      } catch {
-        // Missing translations remain empty and can be retried later.
-      }
-    }),
-  );
+  // A request may already have used one Google subrequest per missing text.
+  // Keep the whole invocation below 50 provider subrequests; anything beyond
+  // this bounded fallback budget remains empty and is safely retried later.
+  const fallbackBudget = Math.max(0, 48 - missingIndexes.length);
+  const fallbackIndexes = stillMissing.slice(0, fallbackBudget);
+  for (let start = 0; start < fallbackIndexes.length; start += 4) {
+    const wave = fallbackIndexes.slice(start, start + 4);
+    await Promise.all(
+      wave.map(async (index) => {
+        try {
+          const endpoint = new URL("https://api.mymemory.translated.net/get");
+          endpoint.search = new URLSearchParams({
+            q: texts[index],
+            langpair: "en|zh-CN",
+          }).toString();
+          const response = await fetch(endpoint, {
+            headers: { Accept: "application/json" },
+            signal: AbortSignal.timeout(5000),
+          });
+          if (!response.ok) return;
+          const body = await response.json();
+          translations[index] = String(
+            body?.responseData?.translatedText ?? "",
+          ).trim();
+        } catch {
+          // Missing translations remain empty and can be retried later.
+        }
+      }),
+    );
+  }
 
   translations.forEach((translation, index) => {
     if (translation) {
@@ -395,6 +598,170 @@ async function enrichmentTranslationBatch(request, ctx) {
     { translations },
     { headers: { "Cache-Control": "no-store" } },
   );
+}
+
+function utcDay(now) {
+  return new Date(now).toISOString().slice(0, 10);
+}
+
+function secondsUntilNextUtcDay(now) {
+  const current = new Date(now);
+  const next = Date.UTC(
+    current.getUTCFullYear(),
+    current.getUTCMonth(),
+    current.getUTCDate() + 1,
+  );
+  return Math.max(1, Math.ceil((next - now) / 1000));
+}
+
+export class DatamuseRateLimiter {
+  constructor(state) {
+    this.state = state;
+    state.blockConcurrencyWhile(async () => {
+      const now = Date.now();
+      state.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS datamuse_quota (
+          singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+          utc_day TEXT NOT NULL,
+          used INTEGER NOT NULL,
+          tokens REAL NOT NULL,
+          last_refill_ms INTEGER NOT NULL
+        )
+      `);
+      state.storage.sql.exec(
+        `
+          INSERT OR IGNORE INTO datamuse_quota (
+            singleton,
+            utc_day,
+            used,
+            tokens,
+            last_refill_ms
+          ) VALUES (1, ?, 0, ?, ?)
+        `,
+        utcDay(now),
+        datamuseBurstCapacity,
+        now,
+      );
+    });
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (request.method !== "POST" || url.pathname !== "/lease") {
+      return Response.json({ error: "not found" }, { status: 404 });
+    }
+
+    let cost;
+    try {
+      const payload = await request.json();
+      cost = Number(payload?.cost);
+    } catch {
+      return Response.json({ error: "Invalid JSON" }, { status: 400 });
+    }
+    if (
+      !Number.isSafeInteger(cost) ||
+      cost < 1 ||
+      cost > datamuseBurstCapacity
+    ) {
+      return Response.json(
+        { error: `cost must be an integer from 1 to ${datamuseBurstCapacity}` },
+        { status: 400 },
+      );
+    }
+
+    const now = Date.now();
+    const today = utcDay(now);
+    const rows = Array.from(
+      this.state.storage.sql.exec(
+        `
+          SELECT utc_day, used, tokens, last_refill_ms
+          FROM datamuse_quota
+          WHERE singleton = 1
+        `,
+      ),
+    );
+    const row = rows[0];
+    if (!row) {
+      return Response.json(
+        { error: "quota state unavailable" },
+        {
+          status: 503,
+          headers: { "Cache-Control": "no-store" },
+        },
+      );
+    }
+
+    const elapsedSeconds = Math.max(
+      0,
+      (now - Number(row.last_refill_ms)) / 1000,
+    );
+    let tokens = Math.min(
+      datamuseBurstCapacity,
+      Number(row.tokens) + elapsedSeconds * datamuseRefillPerSecond,
+    );
+    let used = row.utc_day === today ? Number(row.used) : 0;
+
+    let retryAfter = 0;
+    if (used + cost > datamuseDailyLimit) {
+      retryAfter = secondsUntilNextUtcDay(now);
+    } else if (tokens < cost) {
+      retryAfter = Math.max(
+        1,
+        Math.ceil((cost - tokens) / datamuseRefillPerSecond),
+      );
+    }
+
+    if (retryAfter > 0) {
+      this.state.storage.sql.exec(
+        `
+          UPDATE datamuse_quota
+          SET utc_day = ?, used = ?, tokens = ?, last_refill_ms = ?
+          WHERE singleton = 1
+        `,
+        today,
+        used,
+        tokens,
+        now,
+      );
+      return Response.json(
+        {
+          granted: false,
+          retryAfter,
+          dailyRemaining: Math.max(0, datamuseDailyLimit - used),
+        },
+        {
+          status: 429,
+          headers: {
+            "Cache-Control": "no-store",
+            "Retry-After": String(retryAfter),
+          },
+        },
+      );
+    }
+
+    tokens -= cost;
+    used += cost;
+    this.state.storage.sql.exec(
+      `
+        UPDATE datamuse_quota
+        SET utc_day = ?, used = ?, tokens = ?, last_refill_ms = ?
+        WHERE singleton = 1
+      `,
+      today,
+      used,
+      tokens,
+      now,
+    );
+    return Response.json(
+      {
+        granted: true,
+        leased: cost,
+        dailyRemaining: datamuseDailyLimit - used,
+        burstRemaining: Math.floor(tokens),
+      },
+      { headers: { "Cache-Control": "no-store" } },
+    );
+  }
 }
 
 export default {
@@ -443,7 +810,7 @@ export default {
         url.pathname === "/internal/api/dictionary/batch" &&
         request.method === "POST"
       ) {
-        return enrichmentDictionaryBatch(request, ctx);
+        return enrichmentDictionaryBatch(request, env, ctx);
       }
       if (
         url.pathname === "/internal/api/translate/batch" &&

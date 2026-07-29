@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 from build_oxford_scope import SCHEMA  # noqa: E402
 from auto_export_ready_shard import export_if_ready  # noqa: E402
 from export_enrichment_shard import export_delta  # noqa: E402
+from merge_enrichment_shards import merge  # noqa: E402
 from package_offline_lexicons import compress, copy_fast, copy_full  # noqa: E402
 
 
@@ -131,6 +132,12 @@ class OfflinePackagingTest(unittest.TestCase):
                 database.execute("SELECT id FROM entries ORDER BY id").fetchall(),
                 [(3,), (4,)],
             )
+            self.assertEqual(
+                database.execute(
+                    "SELECT DISTINCT pos FROM entries"
+                ).fetchall(),
+                [("noun",)],
+            )
             database.close()
 
     def test_builds_queryable_full_and_fast_gzip_packages(self) -> None:
@@ -156,6 +163,118 @@ class OfflinePackagingTest(unittest.TestCase):
                 [("alpha",), ("bravo",)],
             )
             database.close()
+
+    def test_merge_streams_shards_in_small_batches_and_refreshes_fts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "canonical.sqlite"
+            first = root / "first.sqlite"
+            second = root / "second.sqlite"
+            build_source(canonical)
+            export_delta(canonical, first, 0, 2, None)
+            export_delta(canonical, second, 1, 2, None)
+            for shard, suffix in ((first, " first"), (second, " second")):
+                database = sqlite3.connect(shard)
+                database.execute(
+                    "UPDATE entries SET definition=definition || ?",
+                    (suffix,),
+                )
+                database.commit()
+                database.close()
+
+            self.assertEqual(
+                merge(canonical, [first, second], batch_size=1),
+                4,
+            )
+
+            database = sqlite3.connect(canonical)
+            try:
+                self.assertEqual(
+                    database.execute(
+                        "SELECT definition FROM entries ORDER BY id"
+                    ).fetchall(),
+                    [
+                        ("alpha definition first",),
+                        ("bravo definition first",),
+                        ("charlie definition second",),
+                        ("delta definition second",),
+                    ],
+                )
+                self.assertEqual(
+                    database.execute(
+                        "SELECT definition FROM entries_fts "
+                        "WHERE rowid=3"
+                    ).fetchone(),
+                    ("charlie definition second",),
+                )
+            finally:
+                database.close()
+
+    def test_merge_rejects_ids_missing_from_canonical_and_rolls_back(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "canonical.sqlite"
+            shard = root / "missing.sqlite"
+            build_source(canonical)
+            export_delta(canonical, shard, 0, 2, None)
+            database = sqlite3.connect(shard)
+            database.execute(
+                "UPDATE entries SET definition='must roll back'"
+            )
+            database.execute("UPDATE entries SET id=999 WHERE id=1")
+            database.commit()
+            database.close()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "did not match canonical rows: 999",
+            ):
+                merge(canonical, [shard], batch_size=2)
+
+            database = sqlite3.connect(canonical)
+            try:
+                self.assertEqual(
+                    database.execute(
+                        "SELECT definition FROM entries WHERE id=2"
+                    ).fetchone(),
+                    ("bravo definition",),
+                )
+            finally:
+                database.close()
+
+    def test_merge_rejects_overlapping_shards_transactionally(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "canonical.sqlite"
+            first = root / "first.sqlite"
+            duplicate = root / "duplicate.sqlite"
+            build_source(canonical)
+            export_delta(canonical, first, 0, 2, None)
+            export_delta(canonical, duplicate, 0, 2, None)
+            database = sqlite3.connect(first)
+            database.execute(
+                "UPDATE entries SET definition='must roll back'"
+            )
+            database.commit()
+            database.close()
+
+            with self.assertRaisesRegex(ValueError, "overlapping entry id"):
+                merge(canonical, [first, duplicate], batch_size=1)
+
+            database = sqlite3.connect(canonical)
+            try:
+                self.assertEqual(
+                    database.execute(
+                        "SELECT definition FROM entries WHERE id=1"
+                    ).fetchone(),
+                    ("alpha definition",),
+                )
+            finally:
+                database.close()
 
 
 if __name__ == "__main__":

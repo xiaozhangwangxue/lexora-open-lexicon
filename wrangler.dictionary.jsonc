@@ -16,6 +16,22 @@
       "bucket_name": "autoword-downloads"
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DATAMUSE_RATE_LIMITER",
+        "class_name": "DatamuseRateLimiter"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1-datamuse-rate-limiter",
+      "new_sqlite_classes": [
+        "DatamuseRateLimiter"
+      ]
+    }
+  ],
   "vars": {
     "PRIMARY_ORIGIN": "http://140-245-114-238.sslip.io:8080",
     "SECONDARY_ORIGIN": "http://134-185-82-7.sslip.io:8080",

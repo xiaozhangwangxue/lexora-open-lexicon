@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 MUTABLE_COLUMNS = (
+    "pos",
     "definition",
     "definition_zh",
     "us_phonetic",

@@ -14,9 +14,12 @@ ExecStart=/usr/bin/python3 /opt/lexora/tools/enrich_oxford_scope.py \
   --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
   --state /opt/lexora/state/shard-%i.sqlite \
   --shard-index %i --shard-count 2 \
-  --workers 8 --delay 5 --translation-delay 6 --retry-after-hours 24
+  --profile auto \
+  --workers 8 --delay 17 --translation-delay 17 --retry-after-hours 24
 Restart=on-failure
-RestartSec=30
+# A quota exhaustion returns a long Retry-After and exits the current pass.
+# Back off here instead of hammering the free Worker every 30 seconds.
+RestartSec=15min
 Nice=10
 NoNewPrivileges=true
 PrivateTmp=true

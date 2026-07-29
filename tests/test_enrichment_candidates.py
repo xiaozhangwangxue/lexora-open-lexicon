@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import sys
 import tempfile
@@ -8,6 +9,8 @@ import unittest
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+
+import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -76,6 +79,7 @@ def create_database(path: str | Path = ":memory:") -> sqlite3.Connection:
           id INTEGER PRIMARY KEY,
           word TEXT NOT NULL,
           normalized_word TEXT NOT NULL,
+          pos TEXT NOT NULL DEFAULT '',
           definition TEXT NOT NULL DEFAULT '',
           definition_zh TEXT NOT NULL DEFAULT '',
           us_phonetic TEXT NOT NULL DEFAULT '',
@@ -127,6 +131,1020 @@ def build_database() -> _CommitGuardConnection:
 
 
 class CandidateBatchTest(unittest.TestCase):
+    def test_core_enrichment_skips_network_for_optional_empty_lists(
+        self,
+    ) -> None:
+        class UnexpectedBatcher:
+            async def request(self, term: str) -> tuple[Any, int, None]:
+                raise AssertionError(f"unexpected network request for {term}")
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = enrichment.init_state(
+                    Path(temp_dir) / "state.sqlite"
+                )
+                try:
+                    async with httpx.AsyncClient() as client:
+                        with patch.object(
+                            enrichment,
+                            "EDGE_BASE",
+                            "https://edge.example",
+                        ):
+                            result = await enrichment.enrich_term(
+                                client,
+                                {
+                                    "edge": enrichment.HostGate(0),
+                                    "dictionary": enrichment.HostGate(0),
+                                    "datamuse": enrichment.HostGate(0),
+                                },
+                                "word",
+                                state,
+                                {
+                                    "definition": "A unit of language.",
+                                    "pos": "noun",
+                                    "us": "wɝːd",
+                                    "uk": "wɜːd",
+                                    "examples": ["This is a word."],
+                                    "frequency": 5.0,
+                                    "phrases": [],
+                                    "synonyms": [],
+                                    "antonyms": [],
+                                    "related": [],
+                                },
+                                edge_batcher=UnexpectedBatcher(),
+                                profile="core",
+                            )
+                    self.assertEqual(result["_attempted"], [])
+                finally:
+                    state.close()
+
+        asyncio.run(scenario())
+
+    def test_deep_enrichment_requests_missing_relationships(self) -> None:
+        class RecordingBatcher:
+            def __init__(self) -> None:
+                self.terms: list[str] = []
+
+            async def request(
+                self,
+                term: str,
+            ) -> tuple[Any, int, None]:
+                self.terms.append(term)
+                return (
+                    {
+                        "dictionary": None,
+                        "exact": [],
+                        "related": [
+                            {
+                                "word": "written word",
+                                "defs": ["n\tA written or printed term."],
+                            }
+                        ],
+                        "synonyms": [{"word": "term"}],
+                        "antonyms": [{"word": "silence"}],
+                        "_providers": {
+                            name: {
+                                "ok": True,
+                                "status": 200,
+                                "found": name != "dictionary",
+                            }
+                            for name in (
+                                "dictionary",
+                                "exact",
+                                "related",
+                                "synonyms",
+                                "antonyms",
+                            )
+                        },
+                        "_found": True,
+                        "_profile": "deep",
+                    },
+                    200,
+                    None,
+                )
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = enrichment.init_state(
+                    Path(temp_dir) / "state.sqlite"
+                )
+                batcher = RecordingBatcher()
+                try:
+                    async with httpx.AsyncClient() as client:
+                        with patch.object(
+                            enrichment,
+                            "EDGE_BASE",
+                            "https://edge.example",
+                        ):
+                            result = await enrichment.enrich_term(
+                                client,
+                                {
+                                    "edge": enrichment.HostGate(0),
+                                    "dictionary": enrichment.HostGate(0),
+                                    "datamuse": enrichment.HostGate(0),
+                                },
+                                "word",
+                                state,
+                                {
+                                    "definition": "A unit of language.",
+                                    "pos": "noun",
+                                    "us": "wɝːd",
+                                    "uk": "wɜːd",
+                                    "examples": ["This is a word."],
+                                    "frequency": 5.0,
+                                    "phrases": [],
+                                    "synonyms": [],
+                                    "antonyms": [],
+                                    "related": [],
+                                },
+                                edge_batcher=batcher,
+                                profile="deep",
+                            )
+                    self.assertEqual(batcher.terms, ["word"])
+                    self.assertEqual(result["_attempted"], ["edge"])
+                    self.assertEqual(result["synonyms"], ["term"])
+                    self.assertEqual(result["antonyms"], ["silence"])
+                    self.assertEqual(result["phrases"], ["written word"])
+                finally:
+                    state.close()
+
+        asyncio.run(scenario())
+
+    def test_cli_forwards_core_and_deep_profiles(self) -> None:
+        captured: list[str] = []
+
+        async def fake_run(*args: Any, **kwargs: Any) -> None:
+            del args
+            captured.append(str(kwargs["profile"]))
+
+        with patch.object(enrichment, "run", new=fake_run):
+            with patch.object(
+                sys,
+                "argv",
+                ["enrich_oxford_scope.py"],
+            ):
+                enrichment.main()
+            with patch.object(
+                sys,
+                "argv",
+                ["enrich_oxford_scope.py", "--profile", "deep"],
+            ):
+                enrichment.main()
+            with patch.object(
+                sys,
+                "argv",
+                ["enrich_oxford_scope.py", "--profile", "auto"],
+            ):
+                enrichment.main()
+
+        self.assertEqual(captured, ["core", "deep", "core", "deep"])
+
+    def test_edge_provider_metadata_marks_partial_success(self) -> None:
+        class PartialBatcher:
+            async def request(self, term: str) -> tuple[Any, int, None]:
+                return (
+                    {
+                        "dictionary": [
+                            {
+                                "word": term,
+                                "phonetics": [],
+                                "meanings": [
+                                    {
+                                        "partOfSpeech": "noun",
+                                        "definitions": [
+                                            {
+                                                "definition":
+                                                    "A unit of language."
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                        "exact": None,
+                        "_providers": {
+                            "dictionary": {
+                                "ok": True,
+                                "status": 200,
+                                "found": True,
+                            },
+                            "exact": {
+                                "ok": False,
+                                "status": 503,
+                                "found": False,
+                            },
+                        },
+                        "_found": True,
+                    },
+                    200,
+                    None,
+                )
+
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                state = enrichment.init_state(
+                    Path(temp_dir) / "state.sqlite"
+                )
+                try:
+                    async with httpx.AsyncClient() as client:
+                        with patch.object(
+                            enrichment,
+                            "EDGE_BASE",
+                            "https://edge.example",
+                        ):
+                            result = await enrichment.enrich_term(
+                                client,
+                                {
+                                    "edge": enrichment.HostGate(0),
+                                    "dictionary": enrichment.HostGate(0),
+                                    "datamuse": enrichment.HostGate(0),
+                                },
+                                "word",
+                                state,
+                                {
+                                    "definition": "",
+                                    "us": "",
+                                    "uk": "",
+                                    "examples": [],
+                                    "frequency": 0,
+                                    "phrases": [],
+                                    "synonyms": [],
+                                    "antonyms": [],
+                                    "related": [],
+                                },
+                                edge_batcher=PartialBatcher(),
+                            )
+                    self.assertEqual(result["_statuses"], ["partial"])
+                    self.assertEqual(
+                        state.execute(
+                            """
+                            SELECT status FROM provider_state
+                            WHERE term='word' AND source='edge'
+                            """
+                        ).fetchone(),
+                        ("partial",),
+                    )
+                finally:
+                    state.close()
+
+        asyncio.run(scenario())
+
+    def test_translation_batcher_keeps_all_ordered_chunks(self) -> None:
+        async def scenario() -> None:
+            source = " ".join(
+                f"segment-{index:04d}" for index in range(1_500)
+            )
+            expected_chunks = enrichment.translation_chunks(source)
+            self.assertGreater(len(expected_chunks), 32)
+            posted_texts: list[str] = []
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                payload = json.loads(request.content)
+                texts = payload["texts"]
+                self.assertLessEqual(len(texts), 32)
+                self.assertTrue(all(0 < len(text) <= 480 for text in texts))
+                posted_texts.extend(texts)
+                return httpx.Response(
+                    200,
+                    json={
+                        "translations": [
+                            f"译文-{len(posted_texts) - len(texts) + index}"
+                            for index in range(len(texts))
+                        ]
+                    },
+                )
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                batcher = enrichment.EdgeTranslationBatcher(
+                    client,
+                    enrichment.HostGate(0),
+                    batch_size=1,
+                    flush_delay=0,
+                )
+                with patch.object(
+                    enrichment,
+                    "EDGE_BASE",
+                    "https://edge.example",
+                ):
+                    translated, status, error = await batcher.request(source)
+
+            self.assertEqual(posted_texts, expected_chunks)
+            self.assertEqual(
+                " ".join(posted_texts),
+                " ".join(source.split()),
+            )
+            self.assertEqual(len(translated.splitlines()), len(expected_chunks))
+            self.assertEqual(status, 200)
+            self.assertIsNone(error)
+
+        asyncio.run(scenario())
+
+    def test_edge_batch_missing_term_is_retryable_failure(self) -> None:
+        async def scenario() -> None:
+            request_count = 0
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal request_count
+                request_count += 1
+                self.assertEqual(
+                    request.url,
+                    httpx.URL(
+                        "https://edge.example/api/dictionary/batch"
+                    ),
+                )
+                self.assertEqual(
+                    json.loads(request.content),
+                    {"terms": ["word", "e.g."], "profile": "core"},
+                )
+                results = {
+                    "word": {
+                        "status": 200,
+                        "data": {"dictionary": []},
+                    }
+                }
+                if request_count > 1:
+                    results["e.g."] = {
+                        "status": 200,
+                        "data": {"dictionary": []},
+                    }
+                return httpx.Response(
+                    200,
+                    json={"results": results},
+                )
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                batcher = enrichment.EdgeDictionaryBatcher(
+                    client,
+                    enrichment.HostGate(0),
+                    batch_size=8,
+                    flush_delay=0,
+                )
+                with patch.object(
+                    enrichment,
+                    "EDGE_BASE",
+                    "https://edge.example",
+                ):
+                    found, missing = await asyncio.gather(
+                        batcher.request("word"),
+                        batcher.request("e.g."),
+                    )
+
+            self.assertEqual(found, ({"dictionary": []}, 200, None))
+            self.assertEqual(
+                missing,
+                ({"dictionary": []}, 200, None),
+            )
+            self.assertEqual(request_count, 2)
+
+        asyncio.run(scenario())
+
+    def test_edge_batch_sends_deep_profile(self) -> None:
+        async def scenario() -> None:
+            def handler(request: httpx.Request) -> httpx.Response:
+                self.assertEqual(
+                    json.loads(request.content),
+                    {"terms": ["word"], "profile": "deep"},
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": {
+                            "word": {
+                                "status": 200,
+                                "data": {"_profile": "deep"},
+                            }
+                        }
+                    },
+                )
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                batcher = enrichment.EdgeDictionaryBatcher(
+                    client,
+                    enrichment.HostGate(0),
+                    batch_size=1,
+                    flush_delay=0,
+                    profile="deep",
+                )
+                with patch.object(
+                    enrichment,
+                    "EDGE_BASE",
+                    "https://edge.example",
+                ):
+                    result = await batcher.request("word")
+
+            self.assertEqual(result, ({"_profile": "deep"}, 200, None))
+
+        asyncio.run(scenario())
+
+    def test_edge_batch_retries_same_terms_and_honors_retry_after(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            requests: list[dict[str, Any]] = []
+            sleeps: list[float] = []
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                requests.append(json.loads(request.content))
+                if len(requests) == 1:
+                    return httpx.Response(
+                        429,
+                        headers={"Retry-After": "2"},
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": {
+                            "word": {
+                                "status": 200,
+                                "data": {"dictionary": []},
+                            }
+                        }
+                    },
+                )
+
+            async def fake_sleep(delay: float) -> None:
+                sleeps.append(delay)
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                batcher = enrichment.EdgeDictionaryBatcher(
+                    client,
+                    enrichment.HostGate(0),
+                    batch_size=1,
+                    flush_delay=0,
+                )
+                with (
+                    patch.object(
+                        enrichment,
+                        "EDGE_BASE",
+                        "https://edge.example",
+                    ),
+                    patch.object(
+                        enrichment.asyncio,
+                        "sleep",
+                        new=fake_sleep,
+                    ),
+                    patch.object(
+                        enrichment.random,
+                        "uniform",
+                        return_value=0.25,
+                    ),
+                ):
+                    result = await batcher.request("word")
+
+            self.assertEqual(
+                requests,
+                [
+                    {"terms": ["word"], "profile": "core"},
+                    {"terms": ["word"], "profile": "core"},
+                ],
+            )
+            self.assertEqual(sleeps, [2.25])
+            self.assertEqual(result, ({"dictionary": []}, 200, None))
+
+        asyncio.run(scenario())
+
+    def test_edge_batch_exhausts_finite_5xx_retries(self) -> None:
+        async def scenario() -> None:
+            requests: list[dict[str, Any]] = []
+            sleeps: list[float] = []
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                requests.append(json.loads(request.content))
+                return httpx.Response(503)
+
+            async def fake_sleep(delay: float) -> None:
+                sleeps.append(delay)
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                batcher = enrichment.EdgeDictionaryBatcher(
+                    client,
+                    enrichment.HostGate(0),
+                    batch_size=1,
+                    flush_delay=0,
+                    max_attempts=3,
+                )
+                with (
+                    patch.object(
+                        enrichment,
+                        "EDGE_BASE",
+                        "https://edge.example",
+                    ),
+                    patch.object(
+                        enrichment.asyncio,
+                        "sleep",
+                        new=fake_sleep,
+                    ),
+                    patch.object(
+                        enrichment.random,
+                        "uniform",
+                        return_value=0.0,
+                    ),
+                ):
+                    outcomes = await asyncio.gather(
+                        batcher.request("word"),
+                        return_exceptions=True,
+                    )
+
+            self.assertEqual(
+                requests,
+                [{"terms": ["word"], "profile": "core"}] * 3,
+            )
+            self.assertEqual(sleeps, [1.0, 2.0])
+            failure = outcomes[0]
+            self.assertIsInstance(
+                failure,
+                enrichment.EdgeBatchRetryExhausted,
+            )
+            assert isinstance(
+                failure,
+                enrichment.EdgeBatchRetryExhausted,
+            )
+            self.assertEqual(failure.status, 503)
+            self.assertEqual(failure.attempts, 3)
+
+        asyncio.run(scenario())
+
+    def test_edge_long_retry_after_aborts_all_queued_terms(self) -> None:
+        async def scenario() -> None:
+            requests: list[dict[str, Any]] = []
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                requests.append(json.loads(request.content))
+                return httpx.Response(
+                    429,
+                    headers={"Retry-After": "3600"},
+                )
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                batcher = enrichment.EdgeDictionaryBatcher(
+                    client,
+                    enrichment.HostGate(0),
+                    batch_size=1,
+                    flush_delay=0,
+                )
+                with patch.object(
+                    enrichment,
+                    "EDGE_BASE",
+                    "https://edge.example",
+                ):
+                    outcomes = await asyncio.gather(
+                        batcher.request("word"),
+                        batcher.request("phrase"),
+                        return_exceptions=True,
+                    )
+
+            self.assertEqual(
+                requests,
+                [{"terms": ["word"], "profile": "core"}],
+            )
+            self.assertTrue(
+                all(
+                    isinstance(
+                        outcome,
+                        enrichment.EdgeBatchRetryExhausted,
+                    )
+                    for outcome in outcomes
+                )
+            )
+            self.assertEqual(
+                [
+                    outcome.retry_after
+                    for outcome in outcomes
+                    if isinstance(
+                        outcome,
+                        enrichment.EdgeBatchRetryExhausted,
+                    )
+                ],
+                [3600.0, 3600.0],
+            )
+
+        asyncio.run(scenario())
+
+    def test_retry_after_http_date_is_supported(self) -> None:
+        reference = enrichment.dt.datetime(
+            2026,
+            7,
+            29,
+            12,
+            0,
+            tzinfo=enrichment.dt.timezone.utc,
+        )
+        self.assertEqual(
+            enrichment.retry_after_seconds(
+                "Wed, 29 Jul 2026 12:00:30 GMT",
+                current_time=reference,
+            ),
+            30.0,
+        )
+
+    def test_rate_limited_batch_does_not_mark_or_advance_entry(self) -> None:
+        async def fail_request(
+            batcher: enrichment.EdgeDictionaryBatcher,
+            term: str,
+        ) -> tuple[Any | None, int | None, str | None]:
+            del batcher, term
+            raise enrichment.EdgeBatchRetryExhausted(
+                status=429,
+                attempts=1,
+                retry_after=3600.0,
+                detail="HTTP 429",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "dataset.sqlite"
+            state_path = root / "state.sqlite"
+            database = create_database(dataset)
+            database.close()
+
+            with (
+                patch.object(
+                    enrichment,
+                    "EDGE_BASE",
+                    "https://edge.example",
+                ),
+                patch.object(
+                    enrichment.EdgeDictionaryBatcher,
+                    "request",
+                    new=fail_request,
+                ),
+            ):
+                with self.assertRaises(
+                    enrichment.EdgeBatchRetryExhausted
+                ):
+                    asyncio.run(
+                        enrichment.run(
+                            dataset,
+                            state_path,
+                            1,
+                            0,
+                            1,
+                            0,
+                            24,
+                            1,
+                            1,
+                            None,
+                            1,
+                        )
+                    )
+
+            database = sqlite3.connect(dataset)
+            marker = database.execute(
+                """
+                SELECT enrichment_json FROM entries WHERE id=1
+                """
+            ).fetchone()
+            database.close()
+            self.assertEqual(marker, ("{}",))
+
+            state = sqlite3.connect(state_path)
+            provider_rows = state.execute(
+                "SELECT COUNT(*) FROM provider_state"
+            ).fetchone()
+            state.close()
+            self.assertEqual(provider_rows, (0,))
+
+    def test_datamuse_ipa_is_used_when_dictionary_has_no_phonetic(
+        self,
+    ) -> None:
+        fields = enrichment.edge_fields(
+            {
+                "dictionary": None,
+                "exact": [
+                    {
+                        "word": "word",
+                        "tags": ["n", "ipa_pron:wˈɝd", "f:147.674682"],
+                        "defs": ["n\tA unit of language."],
+                    }
+                ],
+                "related": [],
+                "synonyms": [],
+                "antonyms": [],
+            },
+            "word",
+        )
+        self.assertEqual(fields["us"], "wˈɝd")
+        self.assertEqual(fields.get("uk", ""), "")
+        self.assertEqual(fields["definition"], "n A unit of language.")
+        self.assertEqual(fields["pos"], "noun")
+
+    def test_core_edge_preserves_dictionary_relationships(self) -> None:
+        fields = enrichment.edge_fields(
+            {
+                "dictionary": [
+                    {
+                        "word": "word",
+                        "meanings": [
+                            {
+                                "partOfSpeech": "noun",
+                                "synonyms": ["term", "expression"],
+                                "antonyms": ["silence"],
+                                "definitions": [
+                                    {
+                                        "definition":
+                                            "A unit of language."
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+                "exact": [],
+                "_profile": "core",
+            },
+            "word",
+        )
+
+        self.assertEqual(fields["synonyms"], ["term", "expression"])
+        self.assertEqual(fields["antonyms"], ["silence"])
+        self.assertNotIn("related", fields)
+        self.assertNotIn("phrases", fields)
+        self.assertNotIn("related_entries", fields)
+        self.assertNotIn("phrase_entries", fields)
+
+    def test_deep_edge_merges_dictionary_and_datamuse_relationships(
+        self,
+    ) -> None:
+        fields = enrichment.edge_fields(
+            {
+                "dictionary": [
+                    {
+                        "word": "word",
+                        "meanings": [
+                            {
+                                "partOfSpeech": "noun",
+                                "synonyms": ["term"],
+                                "antonyms": ["silence"],
+                                "definitions": [],
+                            }
+                        ],
+                    }
+                ],
+                "exact": [],
+                "related": [],
+                "synonyms": [
+                    {"word": "term"},
+                    {"word": "expression"},
+                ],
+                "antonyms": [
+                    {"word": "silence"},
+                    {"word": "gesture"},
+                ],
+                "_profile": "deep",
+            },
+            "word",
+        )
+
+        self.assertEqual(fields["synonyms"], ["term", "expression"])
+        self.assertEqual(fields["antonyms"], ["silence", "gesture"])
+
+    def test_dictionary_dialect_phonetics_override_datamuse_fallback(
+        self,
+    ) -> None:
+        fields = enrichment.edge_fields(
+            {
+                "dictionary": [
+                    {
+                        "word": "word",
+                        "phonetics": [
+                            {
+                                "text": "/wɝːd/",
+                                "audio": "https://example.test/word-us.mp3",
+                            },
+                            {
+                                "text": "/wɜːd/",
+                                "audio": "https://example.test/word-uk.mp3",
+                            },
+                        ],
+                        "meanings": [],
+                    }
+                ],
+                "exact": [
+                    {
+                        "word": "word",
+                        "tags": ["ipa_pron:wˈɝd"],
+                    }
+                ],
+                "related": [],
+                "synonyms": [],
+                "antonyms": [],
+            },
+            "word",
+        )
+        self.assertEqual(fields["us"], "wɝːd")
+        self.assertEqual(fields["uk"], "wɜːd")
+
+    def test_dictionary_generic_phonetic_is_not_faked_as_two_dialects(
+        self,
+    ) -> None:
+        generic = enrichment.dictionary_fields(
+            [
+                {
+                    "word": "either",
+                    "phonetic": "/ˈaɪðə/",
+                    "phonetics": [
+                        {
+                            "text": "/ˈaɪðə/",
+                            "audio": "",
+                        }
+                    ],
+                    "meanings": [],
+                }
+            ]
+        )
+        self.assertEqual(generic["generic_phonetic"], "ˈaɪðə")
+        self.assertEqual(generic["us"], "")
+        self.assertEqual(generic["uk"], "")
+
+        us_only = enrichment.dictionary_fields(
+            [
+                {
+                    "word": "word",
+                    "phonetics": [
+                        {
+                            "text": "/wɝːd/",
+                            "audio": "https://example.test/word-us.mp3",
+                        }
+                    ],
+                    "meanings": [],
+                }
+            ]
+        )
+        self.assertEqual(us_only["us"], "wɝːd")
+        self.assertEqual(us_only["uk"], "")
+
+    def test_datamuse_exact_rejects_fuzzy_word_data(self) -> None:
+        fields = enrichment.edge_fields(
+            {
+                "dictionary": None,
+                "exact": [
+                    {
+                        "word": "regrowing",
+                        "tags": [
+                            "v",
+                            "ipa_pron:rigrˈoʊɪŋ",
+                            "f:0.25",
+                        ],
+                        "defs": ["v\tTo grow again."],
+                    }
+                ],
+                "related": [
+                    {
+                        "word": "growing",
+                        "tags": ["f:5000"],
+                    }
+                ],
+                "synonyms": [],
+                "antonyms": [],
+            },
+            "peagrowing",
+        )
+        self.assertEqual(fields.get("us", ""), "")
+        self.assertEqual(fields.get("definition", ""), "")
+        self.assertEqual(fields.get("pos", ""), "")
+        self.assertEqual(fields["frequency"], 0.0)
+
+    def test_quality_retry_skips_phrase_ipa_and_respects_age(self) -> None:
+        recent = enrichment.j(
+            {
+                "status": "completed",
+                "lastAttempt": enrichment.now(),
+            }
+        )
+        self.assertFalse(
+            enrichment.needs_entry_quality_repair(
+                "look after",
+                "To take care of.",
+                "照顾。",
+                "",
+                "",
+                5.0,
+            )
+        )
+        self.assertTrue(
+            enrichment.needs_entry_quality_repair(
+                "word",
+                "A unit of language.",
+                "单词。",
+                "",
+                "",
+                5.0,
+            )
+        )
+        self.assertFalse(enrichment.marker_retry_due(recent, 24))
+        self.assertTrue(enrichment.marker_retry_due(recent, 0))
+
+    def test_deep_pass_runs_once_after_completed_core_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "dataset.sqlite"
+            state = root / "state.sqlite"
+            database = create_database(dataset)
+            database.execute(
+                """
+                UPDATE entries SET
+                  pos='noun',
+                  definition='A unit of language.',
+                  definition_zh='语言单位。',
+                  us_phonetic='wɝːd',
+                  uk_phonetic='wɜːd',
+                  frequency=5.0,
+                  enrichment_json=?
+                WHERE id=1
+                """,
+                (
+                    enrichment.j(
+                        {
+                            "status": "completed",
+                            "lastAttempt": enrichment.now(),
+                        }
+                    ),
+                ),
+            )
+            database.commit()
+            database.close()
+            attempted: list[tuple[str, str]] = []
+
+            async def fake_enrich_term(
+                *args: Any,
+                **kwargs: Any,
+            ) -> dict[str, Any]:
+                attempted.append((str(args[2]), str(kwargs["profile"])))
+                return {"_statuses": [], "_attempted": []}
+
+            with patch.object(
+                enrichment,
+                "enrich_term",
+                new=fake_enrich_term,
+            ):
+                asyncio.run(
+                    enrichment.run(
+                        dataset,
+                        state,
+                        1,
+                        0,
+                        1,
+                        0,
+                        24,
+                        1,
+                        1,
+                        None,
+                        1,
+                        profile="deep",
+                    )
+                )
+                # The deep marker is terminal for legitimately empty
+                # relationship results, so a second invocation does not loop.
+                asyncio.run(
+                    enrichment.run(
+                        dataset,
+                        state,
+                        0,
+                        0,
+                        1,
+                        0,
+                        24,
+                        1,
+                        1,
+                        None,
+                        1,
+                        profile="deep",
+                    )
+                )
+
+            self.assertEqual(attempted, [("word-1", "deep")])
+            database = sqlite3.connect(dataset)
+            marker = database.execute(
+                "SELECT enrichment_json FROM entries WHERE id=1"
+            ).fetchone()
+            database.close()
+            self.assertIsNotNone(marker)
+            parsed = json.loads(marker[0])
+            self.assertEqual(parsed["status"], "completed")
+            self.assertEqual(parsed["profile"], "deep")
+
+    def test_invalid_legacy_frequency_recalculates_difficulty(self) -> None:
+        self.assertEqual(
+            enrichment.resolved_difficulty("A1–A2", 500_000, 3.7),
+            "C1–C2",
+        )
+        self.assertEqual(
+            enrichment.resolved_difficulty("B1–B2", 5.1, 5.2),
+            "B1–B2",
+        )
+
     def test_frequency_keyset_closes_reader_before_each_write_commit(
         self,
     ) -> None:
@@ -370,6 +1388,177 @@ class CandidateBatchTest(unittest.TestCase):
             ).fetchall()
             database.close()
             self.assertEqual(statuses, [("completed",)] * 6)
+
+    def test_run_translates_the_complete_long_definition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "dataset.sqlite"
+            state = root / "state.sqlite"
+            definition = (
+                " ".join(f"definition-{index:04d}" for index in range(240))
+                + " final-sentinel"
+            )
+            self.assertGreater(len(definition), 1_800)
+            database = create_database(dataset)
+            database.execute(
+                """
+                UPDATE entries SET
+                  definition=?,
+                  definition_zh='',
+                  us_phonetic='wɜːd',
+                  uk_phonetic='wɜːd',
+                  frequency=5.0
+                """,
+                (definition,),
+            )
+            database.commit()
+            database.close()
+            translated_sources: list[str] = []
+
+            async def fake_enrich_term(
+                *args: Any,
+                **kwargs: Any,
+            ) -> dict[str, Any]:
+                return {"_statuses": [], "_attempted": []}
+
+            async def fake_translate(
+                client: httpx.AsyncClient,
+                gate: enrichment.HostGate,
+                text: str,
+                translation_batcher: (
+                    enrichment.EdgeTranslationBatcher | None
+                ) = None,
+            ) -> tuple[str, int | None, str | None]:
+                del client, gate, translation_batcher
+                translated_sources.append(text)
+                return "完整翻译", 200, None
+
+            with (
+                patch.object(
+                    enrichment,
+                    "enrich_term",
+                    new=fake_enrich_term,
+                ),
+                patch.object(
+                    enrichment,
+                    "translate",
+                    new=fake_translate,
+                ),
+            ):
+                asyncio.run(
+                    enrichment.run(
+                        dataset,
+                        state,
+                        1,
+                        0,
+                        1,
+                        0,
+                        24,
+                        None,
+                        None,
+                        0,
+                        1,
+                    )
+                )
+
+            self.assertEqual(translated_sources, [definition])
+            database = sqlite3.connect(dataset)
+            translated, status = database.execute(
+                """
+                SELECT definition_zh,
+                       json_extract(enrichment_json, '$.status')
+                FROM entries WHERE id=3
+                """
+            ).fetchone()
+            database.close()
+            self.assertEqual(translated, "完整翻译")
+            self.assertEqual(status, "completed")
+
+    def test_translation_only_failure_never_completes_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset = root / "dataset.sqlite"
+            state_path = root / "state.sqlite"
+            database = create_database(dataset)
+            database.execute(
+                """
+                UPDATE entries SET
+                  definition='A definition requiring translation.',
+                  definition_zh='',
+                  us_phonetic='wɜːd',
+                  uk_phonetic='wɜːd',
+                  frequency=5.0
+                """
+            )
+            database.commit()
+            database.close()
+
+            async def fake_enrich_term(
+                *args: Any,
+                **kwargs: Any,
+            ) -> dict[str, Any]:
+                return {"_statuses": [], "_attempted": []}
+
+            async def failed_translate(
+                client: httpx.AsyncClient,
+                gate: enrichment.HostGate,
+                text: str,
+                translation_batcher: (
+                    enrichment.EdgeTranslationBatcher | None
+                ) = None,
+            ) -> tuple[str, int | None, str | None]:
+                del client, gate, text, translation_batcher
+                return "", 200, "translation missing"
+
+            with (
+                patch.object(
+                    enrichment,
+                    "enrich_term",
+                    new=fake_enrich_term,
+                ),
+                patch.object(
+                    enrichment,
+                    "translate",
+                    new=failed_translate,
+                ),
+            ):
+                asyncio.run(
+                    enrichment.run(
+                        dataset,
+                        state_path,
+                        1,
+                        0,
+                        1,
+                        0,
+                        24,
+                        None,
+                        None,
+                        0,
+                        1,
+                    )
+                )
+
+            database = sqlite3.connect(dataset)
+            definition_zh, marker_status = database.execute(
+                """
+                SELECT definition_zh,
+                       json_extract(enrichment_json, '$.status')
+                FROM entries WHERE id=3
+                """
+            ).fetchone()
+            database.close()
+            self.assertEqual(definition_zh, "")
+            self.assertEqual(marker_status, "not_found")
+
+            state = sqlite3.connect(state_path)
+            provider_status = state.execute(
+                """
+                SELECT status FROM provider_state
+                WHERE term='word-3' AND source='translation'
+                """
+            ).fetchone()
+            state.close()
+            self.assertEqual(provider_status, ("failed",))
 
     def test_run_keeps_calculated_shard_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
