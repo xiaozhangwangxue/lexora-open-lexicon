@@ -10,12 +10,28 @@ const bootstrapObjects = new Set([
   "lexora-open-oxford-scope.sqlite.gz.part-00-1",
   "lexora-open-oxford-scope.sqlite.gz.part-01",
 ]);
+const offlineObjectPrefix = "lexora-offline/";
+
+function offlineObjectName(pathname) {
+  const prefix = "/v1/offline/download/";
+  if (!pathname.startsWith(prefix)) return null;
+  const filename = decodeURIComponent(pathname.slice(prefix.length));
+  if (!/^[a-z0-9][a-z0-9._-]{0,159}$/i.test(filename)) return null;
+  return `${offlineObjectPrefix}${filename}`;
+}
 
 function withCors(response, originName, cacheStatus) {
   const headers = new Headers(response.headers);
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-  headers.set("Access-Control-Allow-Headers", "Content-Type");
+  headers.set(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Range, If-Range, If-None-Match",
+  );
+  headers.set(
+    "Access-Control-Expose-Headers",
+    "Accept-Ranges, Content-Length, Content-Range, ETag",
+  );
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("X-Lexora-Origin", originName);
   headers.set("X-Lexora-Cache", cacheStatus);
@@ -25,6 +41,65 @@ function withCors(response, originName, cacheStatus) {
     statusText: response.statusText,
     headers,
   });
+}
+
+async function offlineObjectResponse(request, env, key, isManifest = false) {
+  if (!env.DOWNLOADS) {
+    return Response.json(
+      { detail: "offline lexicon storage unavailable" },
+      { status: 503 },
+    );
+  }
+  const object =
+    request.method === "HEAD"
+      ? await env.DOWNLOADS.head(key)
+      : await env.DOWNLOADS.get(key, {
+          onlyIf: request.headers,
+          range: request.headers,
+        });
+  if (!object) {
+    return Response.json({ detail: "offline lexicon not found" }, { status: 404 });
+  }
+
+  const headers = new Headers();
+  object.writeHttpMetadata(headers);
+  headers.set("ETag", object.httpEtag);
+  headers.set("Accept-Ranges", "bytes");
+  headers.set(
+    "Cache-Control",
+    isManifest ? "public, max-age=300" : "public, max-age=86400, immutable",
+  );
+  headers.set(
+    "Content-Type",
+    isManifest ? "application/json; charset=utf-8" : "application/gzip",
+  );
+
+  let status = 200;
+  if ("range" in object && object.range) {
+    const offset = object.range.offset ?? 0;
+    const length = object.range.length ?? object.size;
+    headers.set(
+      "Content-Range",
+      `bytes ${offset}-${offset + length - 1}/${object.size}`,
+    );
+    headers.set("Content-Length", String(length));
+    status = 206;
+  } else {
+    headers.set("Content-Length", String(object.size));
+  }
+  if (!isManifest) {
+    headers.set(
+      "Content-Disposition",
+      `attachment; filename="${key.slice(offlineObjectPrefix.length)}"`,
+    );
+  }
+  const body =
+    request.method === "HEAD" || !("body" in object) ? null : object.body;
+  return withCors(
+    new Response(body, { status, headers }),
+    "r2",
+    isManifest ? "MANIFEST" : "DOWNLOAD",
+  );
 }
 
 async function fetchOrigin(origin, originName, request, env) {
@@ -325,6 +400,21 @@ async function enrichmentTranslationBatch(request, ctx) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (
+      ["GET", "HEAD"].includes(request.method) &&
+      url.pathname === "/v1/offline/manifest.json"
+    ) {
+      return offlineObjectResponse(
+        request,
+        env,
+        `${offlineObjectPrefix}manifest.json`,
+        true,
+      );
+    }
+    const offlineKey = offlineObjectName(url.pathname);
+    if (["GET", "HEAD"].includes(request.method) && offlineKey) {
+      return offlineObjectResponse(request, env, offlineKey);
+    }
     if (url.pathname.startsWith("/bootstrap/")) {
       const key = decodeURIComponent(url.pathname.slice("/bootstrap/".length));
       if (
@@ -369,7 +459,8 @@ export default {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type",
+          "Access-Control-Allow-Headers":
+            "Content-Type, Range, If-Range, If-None-Match",
         },
       });
     }
