@@ -28,6 +28,10 @@ class DeploymentConfigTest(unittest.TestCase):
             ROOT / "deploy" / "lexora-enrich-micro@.service"
         ).read_text(encoding="utf-8")
         self.assertIn("--profile auto", service)
+        self.assertIn(
+            "--workers 8 --delay 16 --translation-delay 16",
+            service,
+        )
 
     def test_micro_watchdog_only_restarts_micro_service(self) -> None:
         watch = (
