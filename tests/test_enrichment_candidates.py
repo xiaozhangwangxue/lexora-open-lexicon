@@ -697,6 +697,58 @@ class CandidateBatchTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_edge_batch_keeps_successes_when_one_item_is_transient(self) -> None:
+        async def scenario() -> None:
+            def handler(request: httpx.Request) -> httpx.Response:
+                self.assertEqual(
+                    json.loads(request.content),
+                    edge_payload(["word", "phrase"]),
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": {
+                            "word": {
+                                "status": 200,
+                                "data": {"dictionary": []},
+                            },
+                            "phrase": {
+                                "status": 504,
+                                "data": {
+                                    "error": "providers temporarily unavailable"
+                                },
+                            },
+                        }
+                    },
+                )
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                batcher = enrichment.EdgeDictionaryBatcher(
+                    client,
+                    enrichment.HostGate(0),
+                    batch_size=8,
+                    flush_delay=0,
+                )
+                with patch.object(
+                    enrichment,
+                    "EDGE_BASE",
+                    "https://edge.example",
+                ):
+                    found, transient = await asyncio.gather(
+                        batcher.request("word"),
+                        batcher.request("phrase"),
+                    )
+
+            self.assertEqual(found, ({"dictionary": []}, 200, None))
+            self.assertEqual(
+                transient,
+                (None, 504, "providers temporarily unavailable"),
+            )
+
+        asyncio.run(scenario())
+
     def test_edge_batch_sends_each_terms_missing_field_needs(self) -> None:
         async def scenario() -> None:
             posted: list[dict[str, Any]] = []
@@ -915,6 +967,63 @@ class CandidateBatchTest(unittest.TestCase):
             )
             self.assertEqual(failure.status, 503)
             self.assertEqual(failure.attempts, 3)
+
+        asyncio.run(scenario())
+
+    def test_edge_batch_continues_queued_work_after_transient_5xx(self) -> None:
+        async def scenario() -> None:
+            requests: list[dict[str, Any]] = []
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                payload = json.loads(request.content)
+                requests.append(payload)
+                if payload["terms"] == ["word"]:
+                    return httpx.Response(504)
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": {
+                            "phrase": {
+                                "status": 200,
+                                "data": {"dictionary": []},
+                            }
+                        }
+                    },
+                )
+
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                batcher = enrichment.EdgeDictionaryBatcher(
+                    client,
+                    enrichment.HostGate(0),
+                    batch_size=1,
+                    flush_delay=0,
+                    max_attempts=1,
+                )
+                with patch.object(
+                    enrichment,
+                    "EDGE_BASE",
+                    "https://edge.example",
+                ):
+                    outcomes = await asyncio.gather(
+                        batcher.request("word"),
+                        batcher.request("phrase"),
+                        return_exceptions=True,
+                    )
+
+            self.assertEqual(
+                requests,
+                [edge_payload(["word"]), edge_payload(["phrase"])],
+            )
+            self.assertIsInstance(
+                outcomes[0],
+                enrichment.EdgeBatchRetryExhausted,
+            )
+            self.assertEqual(
+                outcomes[1],
+                ({"dictionary": []}, 200, None),
+            )
 
         asyncio.run(scenario())
 

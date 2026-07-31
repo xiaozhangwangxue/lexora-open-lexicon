@@ -481,25 +481,18 @@ class EdgeDictionaryBatcher:
                                 "edge batch returned invalid results"
                             )
                         results = raw_results
-                        retryable_item_status: int | None = None
+                        missing_item_status: int | None = None
                         for requested_term in terms:
                             item = raw_results.get(requested_term)
                             if not isinstance(item, dict):
-                                retryable_item_status = 502
+                                missing_item_status = 502
                                 break
-                            try:
-                                item_status = int(item.get("status", 502))
-                            except (TypeError, ValueError):
-                                item_status = 502
-                            if item_status in (429, 500, 502, 503, 504):
-                                retryable_item_status = item_status
-                                break
-                        if retryable_item_status is None:
+                        if missing_item_status is None:
                             error = None
                             break
-                        status = retryable_item_status
+                        status = missing_item_status
                         error = (
-                            "edge batch returned a retryable item failure"
+                            "edge batch omitted one or more requested terms"
                         )
                         retryable = True
                     error = f"HTTP {status}"
@@ -549,17 +542,24 @@ class EdgeDictionaryBatcher:
                 await asyncio.sleep(delay + jitter)
 
             if fatal_error is not None:
-                # Fail every request currently owned by this flusher.  Leaving
-                # queued futures unresolved would hang the worker; turning
-                # them into the same fatal error lets run() stop cleanly.
-                async with self.lock:
-                    queued = self.pending
-                    self.pending = []
-                    self.flush_task = None
-                for _, _, future in [*batch, *queued]:
+                # A real quota response must stop the pass and preserve every
+                # queued row for a later run. Transient 5xx failures only fail
+                # the current bounded batch; the flusher then continues with
+                # queued work instead of idling the whole server for 15 min.
+                if fatal_error.status == 429:
+                    async with self.lock:
+                        queued = self.pending
+                        self.pending = []
+                        self.flush_task = None
+                    owned = [*batch, *queued]
+                else:
+                    owned = batch
+                for _, _, future in owned:
                     if not future.done():
                         future.set_exception(fatal_error)
-                return
+                if fatal_error.status == 429:
+                    return
+                continue
 
             for term, _, future in batch:
                 item = results.get(term)
@@ -1164,6 +1164,15 @@ async def enrich_term(
                     ),
                 },
             )
+            if status in (500, 502, 503, 504):
+                # Keep a transient failure isolated to this term. Other terms
+                # in the same successful outer batch can still be committed.
+                raise EdgeBatchRetryExhausted(
+                    status=status,
+                    attempts=1,
+                    retry_after=None,
+                    detail=error or f"HTTP {status}",
+                )
             return source, data, status, error
         gate = gates["datamuse"] if source.startswith("datamuse") else gates[source]
         data, status, error = await request_json(client, gate, urls[source], source)
@@ -1437,7 +1446,13 @@ async def run(
             fatal_error: EdgeBatchRetryExhausted | None = None
             for result in results:
                 if isinstance(result, EdgeBatchRetryExhausted):
-                    fatal_error = fatal_error or result
+                    if result.status == 429:
+                        fatal_error = fatal_error or result
+                    else:
+                        print(
+                            f"enrichment-transient-error={result!r}",
+                            flush=True,
+                        )
                 elif isinstance(result, Exception):
                     print(f"enrichment-error={result!r}", flush=True)
                 else:

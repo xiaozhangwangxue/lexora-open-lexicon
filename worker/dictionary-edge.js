@@ -410,6 +410,10 @@ async function enrichmentTerm(
       });
 
       if (response.status === 404 || response.status === 204) {
+        // Cloudflare counts unread response bodies as live subrequests. A
+        // batch containing several misses could otherwise exhaust the
+        // connection pool and have a healthy request canceled as a 504.
+        response.body?.cancel();
         return {
           data: null,
           provider: {
@@ -420,6 +424,7 @@ async function enrichmentTerm(
         };
       }
       if (!response.ok) {
+        response.body?.cancel();
         return {
           data: null,
           provider: {
