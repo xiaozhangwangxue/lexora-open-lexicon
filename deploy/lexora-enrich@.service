@@ -15,7 +15,9 @@ ExecStart=/usr/bin/python3 /opt/lexora/tools/enrich_oxford_scope.py \
   --state /opt/lexora/state/shard-%i.sqlite \
   --shard-index %i --shard-count 4 \
   --profile auto \
-  --workers 8 --delay 34 --translation-delay 34 --retry-after-hours 24
+  --workers 8 --delay 34 --translation-delay 34 --retry-after-hours 8760
+# Finish the first pass over pending entries before spending the free daily
+# provider budget retrying partial or not-found records.
 Restart=on-failure
 RestartSec=15min
 NoNewPrivileges=true
