@@ -94,7 +94,8 @@ class DeploymentConfigTest(unittest.TestCase):
         self.assertIn("Nice=19", service)
         self.assertIn("IOSchedulingClass=idle", service)
         self.assertIn("progress-shard-%i.json", service)
-        self.assertIn("OnUnitActiveSec=30min", timer)
+        self.assertIn("OnUnitActiveSec=5min", timer)
+        self.assertIn("AccuracySec=30s", timer)
 
 
 if __name__ == "__main__":
