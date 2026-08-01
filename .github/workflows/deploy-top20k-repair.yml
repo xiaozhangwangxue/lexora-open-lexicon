@@ -1,0 +1,83 @@
+name: Deploy top-20k repair
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: 140.245.114.238
+            shard: 0
+          - host: 134.185.82.7
+            shard: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare SSH credentials
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.LEXORA_OCI_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LEXORA_OCI_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lexora_oci
+          chmod 0600 ~/.ssh/lexora_oci
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Upload repair files
+        shell: bash
+        run: |
+          scp -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 \
+            tools/enrich_oxford_scope.py tools/top20k_quality.py \
+            deploy/lexora-top20k-repair@.service \
+            deploy/lexora-top20k-repair@.timer \
+            "opc@${{ matrix.host }}:/tmp/"
+
+      - name: Install and start bounded repair
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 "opc@${{ matrix.host }}" \
+            'bash -se' <<'REMOTE'
+          set -euo pipefail
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          cp /opt/lexora/tools/enrich_oxford_scope.py \
+            "/opt/lexora/tools/enrich_oxford_scope.py.pre-top20k-$stamp"
+          sudo install -o opc -g opc -m 0755 \
+            /tmp/enrich_oxford_scope.py \
+            /opt/lexora/tools/enrich_oxford_scope.py
+          sudo install -o opc -g opc -m 0755 \
+            /tmp/top20k_quality.py \
+            /opt/lexora/tools/top20k_quality.py
+          sudo install -m 0644 /tmp/lexora-top20k-repair@.service \
+            /etc/systemd/system/lexora-top20k-repair@.service
+          sudo install -m 0644 /tmp/lexora-top20k-repair@.timer \
+            /etc/systemd/system/lexora-top20k-repair@.timer
+          python3 -m py_compile \
+            /opt/lexora/tools/enrich_oxford_scope.py \
+            /opt/lexora/tools/top20k_quality.py
+          sqlite3 /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+            'PRAGMA quick_check;'
+          python3 /opt/lexora/tools/top20k_quality.py \
+            --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+            --shard-index '${{ matrix.shard }}' --shard-count 2 \
+            --unresolved-limit 0
+          sudo systemctl daemon-reload
+          sudo systemctl enable lexora-top20k-repair@'${{ matrix.shard }}'.timer
+          sudo systemctl start --no-block \
+            lexora-top20k-repair@'${{ matrix.shard }}'.service
+          sleep 3
+          systemctl is-active lexora-top20k-repair@'${{ matrix.shard }}'.service
+          systemctl show lexora-top20k-repair@'${{ matrix.shard }}'.service \
+            -p MainPID -p ActiveState -p SubState
+          REMOTE
