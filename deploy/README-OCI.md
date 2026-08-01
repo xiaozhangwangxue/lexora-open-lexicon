@@ -113,3 +113,20 @@ curl -H "X-Lexora-Origin-Token: $LEXORA_ORIGIN_TOKEN" \
 采集进程自然结束后，再运行 `tools/auto_export_ready_shard.py` 导出常用
 20,000 词和完整分片。不要在采集仍写入 SQLite 时定时扫描整库，以免读事务与
 采集写事务争用数据库锁。
+
+## 高频 20,000 质量修复
+
+安装 `lexora-top20k-repair@.service` 和对应 timer 后，每天只对排名前 20,000
+且未通过质量门槛的词条执行一次修复。普通单词必须有英文、完整中文、词性和至少
+一个可靠音标；短语只强制英文和中文。修复服务与常规 micro 采集服务互斥，结束后
+自动恢复常规采集，因此不会并发消耗 Datamuse 的每日免费额度。
+
+```sh
+python3 /opt/lexora/tools/top20k_quality.py \
+  --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+  --shard-index N --shard-count 2
+sudo systemctl start lexora-top20k-repair@N.service
+```
+
+Wiktionary 回退只接受原词或空格与连字符等价的页面标题，不采用拼写相似但不同的
+词条。仍无法可靠补全的词条保留在每日重试队列中，不能将极速包标记为完成。

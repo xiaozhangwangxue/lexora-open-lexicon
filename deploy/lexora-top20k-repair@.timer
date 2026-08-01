@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry incomplete Lexora top-20k fields daily on shard %i
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+Unit=lexora-top20k-repair@%i.service
+
+[Install]
+WantedBy=timers.target

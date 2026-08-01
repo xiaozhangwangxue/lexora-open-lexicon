@@ -1,0 +1,27 @@
+[Unit]
+Description=Repair required Lexora top-20k fields on shard %i
+After=network-online.target
+Wants=network-online.target
+Conflicts=lexora-enrich-micro@%i.service
+Before=lexora-enrich-micro@%i.service
+
+[Service]
+Type=oneshot
+User=opc
+WorkingDirectory=/opt/lexora
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/opt/lexora/.env
+Environment=LEXORA_EDGE_URL=https://dict.12323456.xyz/internal
+ExecStart=/usr/bin/python3 /opt/lexora/tools/enrich_oxford_scope.py \
+  --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+  --state /opt/lexora/state/top20k-repair-shard-%i.sqlite \
+  --shard-index %i --shard-count 2 \
+  --profile core --max-frequency-rank 20000 --quality-repair-only \
+  --workers 8 --delay 16 --translation-delay 16 --retry-after-hours 0
+ExecStopPost=+/usr/bin/systemctl start lexora-enrich-micro@%i.service
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/lexora/build /opt/lexora/state
+

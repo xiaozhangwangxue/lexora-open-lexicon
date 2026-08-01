@@ -9,12 +9,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import html
 import json
 import math
 import os
 import random
+import re
 import sqlite3
 import time
+from html.parser import HTMLParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -55,6 +58,168 @@ def unique(values: list[str], limit: int = 40) -> list[str]:
 
 def normalized_term(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().replace("’", "'").split())
+
+
+PHRASE_POS_NAMES = {
+    "phrase",
+    "prep_phrase",
+    "prepositional phrase",
+    "proverb",
+    "idiom",
+}
+
+
+def is_phrase(term: Any, pos: Any = "") -> bool:
+    """Recognize phrases without mistaking affixes such as ``pre-`` for one."""
+    value = normalized_term(term)
+    pos_names = {
+        item.strip().lower()
+        for item in re.split(r"[,;/]", str(pos or ""))
+        if item.strip()
+    }
+    if pos_names & PHRASE_POS_NAMES or any(
+        item.endswith("_phrase") for item in pos_names
+    ):
+        return True
+    if " " in value:
+        return True
+    return (
+        "-" in value
+        and not value.startswith("-")
+        and not value.endswith("-")
+        and len([part for part in value.split("-") if part]) >= 2
+    )
+
+
+def entry_quality_gaps(
+    term: Any,
+    definition: Any,
+    translation: Any,
+    us_phonetic: Any,
+    uk_phonetic: Any,
+    pos: Any,
+) -> list[str]:
+    """Return required top-20k fields that are still incomplete."""
+    gaps: list[str] = []
+    if not str(definition or "").strip():
+        gaps.append("definition")
+    if needs_definition_translation(definition, translation):
+        gaps.append("definition_zh")
+    if not is_phrase(term, pos):
+        if not str(pos or "").strip():
+            gaps.append("pos")
+        if needs_phonetic_repair(us_phonetic) and needs_phonetic_repair(
+            uk_phonetic
+        ):
+            gaps.append("phonetic")
+    return gaps
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.ignored_depth = 0
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        del attrs
+        if tag.lower() in {"style", "script"}:
+            self.ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() in {"style", "script"} and self.ignored_depth:
+            self.ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.ignored_depth:
+            self.parts.append(data)
+
+
+def html_text(value: Any) -> str:
+    parser = _TextExtractor()
+    parser.feed(str(value or ""))
+    return " ".join(html.unescape("".join(parser.parts)).split()).strip()
+
+
+def wiktionary_definition_fields(data: Any) -> dict[str, str]:
+    """Extract English definitions from Wiktionary's structured endpoint."""
+    if not isinstance(data, dict):
+        return {}
+    entries = data.get("en")
+    if not isinstance(entries, list):
+        return {}
+    parts_of_speech: list[str] = []
+    definitions: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        pos = str(entry.get("partOfSpeech") or "").strip().lower()
+        if pos:
+            parts_of_speech.append(pos)
+        for raw in entry.get("definitions", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            definition = html_text(raw.get("definition"))
+            # The endpoint sometimes includes a parent definition containing
+            # an entire nested ordered list followed by the same individual
+            # senses.  Keep the bounded individual senses instead of storing
+            # and translating that duplicated aggregate.
+            if (
+                definition
+                and len(definition) <= 800
+                and definition not in definitions
+            ):
+                definitions.append(definition)
+            if len(definitions) >= 8:
+                break
+        if len(definitions) >= 8:
+            break
+    result: dict[str, str] = {}
+    if definitions:
+        result["definition"] = "\n".join(definitions)
+    if parts_of_speech:
+        result["pos"] = ", ".join(unique(parts_of_speech, 8))
+    return result
+
+
+def wiktionary_english_ipa(page_html: Any) -> str:
+    """Return one reliable IPA value from the English section only."""
+    source = str(page_html or "")
+    start = re.search(r'<h2[^>]+id=["\']English["\'][^>]*>', source, re.I)
+    if not start:
+        return ""
+    remainder = source[start.end():]
+    end = re.search(r"<h2\b", remainder, re.I)
+    section = remainder[:end.start()] if end else remainder
+    for match in re.finditer(
+        r'<span[^>]*class=["\'][^"\']*\bIPA\b[^"\']*["\'][^>]*>'
+        r"(.*?)</span>",
+        section,
+        re.I | re.S,
+    ):
+        value = normalize_phonetic(html_text(match.group(1)))
+        if value:
+            return value
+    return ""
+
+
+def wiktionary_variants(term: Any) -> list[str]:
+    """Try separator-equivalent spellings, never a fuzzy different term."""
+    value = normalized_term(term)
+    variants = [value] if value else []
+    if value and not value.startswith("-") and not value.endswith("-"):
+        alternate = (
+            re.sub(r"-+", " ", value)
+            if "-" in value
+            else re.sub(r" +", "-", value)
+        )
+        if alternate != value and alternate not in variants:
+            variants.append(alternate)
+    return variants
 
 
 def merge_named_entries(
@@ -191,6 +356,7 @@ def fetch_candidate_batch(
     after_frequency_rank: int | None,
     after_id: int | None,
     batch_size: int,
+    max_frequency_rank: int | None = None,
 ) -> tuple[list[tuple[Any, ...]], int | None, int | None]:
     """Read one stable keyset page and finalize its cursor before returning.
 
@@ -214,6 +380,9 @@ def fetch_candidate_batch(
     if end_id is not None:
         where.append("id <= ?")
         params.append(end_id)
+    if max_frequency_rank is not None:
+        where.append("frequency_rank <= ?")
+        params.append(max_frequency_rank)
 
     query = f"SELECT {ENTRY_SELECT_COLUMNS}"
     if frequency_first:
@@ -754,6 +923,97 @@ async def request_json(client: httpx.AsyncClient, gate: HostGate, url: str, sour
             gate.semaphore.release()
     return None, None, f"{source} exhausted retries"
 
+
+async def request_text(
+    client: httpx.AsyncClient,
+    gate: HostGate,
+    url: str,
+    source: str,
+    attempts: int = 3,
+) -> tuple[str, int | None, str | None]:
+    for attempt in range(attempts):
+        await gate.semaphore.acquire()
+        try:
+            await gate.wait()
+            response = await client.get(
+                url,
+                headers={
+                    "User-Agent": (
+                        "LexoraOpenLexicon/1.0 "
+                        "(https://lexora.12323456.xyz)"
+                    )
+                },
+            )
+            if response.status_code == 200:
+                return response.text, 200, None
+            if response.status_code in (429, 500, 502, 503, 504):
+                retry = retry_after_seconds(response.headers.get("retry-after"))
+                await asyncio.sleep(
+                    retry if retry is not None else min(60.0, 2 ** attempt)
+                )
+                continue
+            return "", response.status_code, f"HTTP {response.status_code}"
+        except httpx.HTTPError as exc:
+            if attempt + 1 < attempts:
+                await asyncio.sleep(min(60.0, 2 ** attempt))
+            else:
+                return "", None, str(exc)
+        finally:
+            gate.semaphore.release()
+    return "", None, f"{source} exhausted retries"
+
+
+async def fetch_wiktionary_fields(
+    client: httpx.AsyncClient,
+    gate: HostGate,
+    term: str,
+    *,
+    need_definition: bool,
+    need_pos: bool,
+    need_phonetic: bool,
+) -> tuple[dict[str, str], int | None, str | None]:
+    """Use only exact or separator-equivalent Wiktionary page titles."""
+    last_status: int | None = None
+    errors: list[str] = []
+    for variant in wiktionary_variants(term):
+        encoded = quote(variant, safe="")
+        fields: dict[str, str] = {}
+        if need_definition or need_pos:
+            data, status, error = await request_json(
+                client,
+                gate,
+                "https://en.wiktionary.org/api/rest_v1/page/definition/"
+                + encoded,
+                "wiktionary-definition",
+                attempts=2,
+            )
+            last_status = status
+            if error:
+                errors.append(f"{variant}: {error}")
+            parsed = wiktionary_definition_fields(data)
+            if need_definition and parsed.get("definition"):
+                fields["definition"] = parsed["definition"]
+            if need_pos and parsed.get("pos"):
+                fields["pos"] = parsed["pos"]
+        if need_phonetic:
+            page, status, error = await request_text(
+                client,
+                gate,
+                "https://en.wiktionary.org/api/rest_v1/page/html/" + encoded,
+                "wiktionary-pronunciation",
+                attempts=2,
+            )
+            last_status = status
+            if error:
+                errors.append(f"{variant}: {error}")
+            ipa = wiktionary_english_ipa(page)
+            if ipa:
+                fields["us"] = ipa
+        if fields:
+            fields["matched_variant"] = variant
+            return fields, 200, None
+    return {}, last_status, "; ".join(unique(errors, 4)) or "not found"
+
 def dictionary_fields(data: Any) -> dict[str, Any]:
     if not isinstance(data, list): return {}
     definitions: list[str] = []; examples: list[str] = []; synonyms: list[str] = []; antonyms: list[str] = []
@@ -1047,15 +1307,16 @@ def needs_entry_quality_repair(
     uk_phonetic: Any,
     frequency: Any,
 ) -> bool:
-    # Multi-word phrases do not reliably have standalone dictionary IPA, so a
-    # missing phrase pronunciation must not force an endless daily retry.
-    phrase = " " in normalized_term(term)
+    # Phrases do not reliably have standalone dictionary IPA, so a missing
+    # phrase pronunciation must not force an endless retry.  A normal word is
+    # complete once either a US or UK transcription is reliable.
+    phrase = is_phrase(term)
     return (
         (
             not phrase
             and (
                 needs_phonetic_repair(us_phonetic)
-                or needs_phonetic_repair(uk_phonetic)
+                and needs_phonetic_repair(uk_phonetic)
             )
         )
         or needs_definition_translation(definition, translation)
@@ -1080,6 +1341,7 @@ async def enrich_term(
     existing: dict[str, Any],
     edge_batcher: EdgeDictionaryBatcher | None = None,
     profile: str = "core",
+    quality_repair_only: bool = False,
 ) -> dict[str, Any]:
     profile = "deep" if profile == "deep" else "core"
     encoded = quote(term, safe="")
@@ -1091,13 +1353,26 @@ async def enrich_term(
       "datamuse_synonyms": f"https://api.datamuse.com/words?rel_syn={encoded}&md=f&max=12",
       "datamuse_antonyms": f"https://api.datamuse.com/words?rel_ant={encoded}&max=12",
     }
-    result: dict[str, Any] = {"_statuses": [], "_attempted": []}
+    result: dict[str, Any] = {
+        "_statuses": [],
+        "_attempted": [],
+        "_field_sources": {},
+        "_provider_results": {},
+    }
     sources: list[str] = []
+    phrase = is_phrase(term, existing.get("pos"))
     needs_definition = not existing.get("definition")
-    needs_pos = not str(existing.get("pos") or "").strip()
-    needs_phonetic = needs_phonetic_repair(existing.get("us")) or needs_phonetic_repair(existing.get("uk"))
-    needs_examples = not existing.get("examples")
-    needs_frequency = needs_frequency_repair(existing.get("frequency"))
+    needs_pos = not phrase and not str(existing.get("pos") or "").strip()
+    needs_phonetic = (
+        not phrase
+        and needs_phonetic_repair(existing.get("us"))
+        and needs_phonetic_repair(existing.get("uk"))
+    )
+    needs_examples = not quality_repair_only and not existing.get("examples")
+    needs_frequency = (
+        not quality_repair_only
+        and needs_frequency_repair(existing.get("frequency"))
+    )
     deep_needs = (
         deep_enrichment_needs(
             existing.get("synonyms"),
@@ -1105,7 +1380,7 @@ async def enrich_term(
             existing.get("phrases"),
             existing.get("related"),
         )
-        if profile == "deep"
+        if profile == "deep" and not quality_repair_only
         else {
             "synonyms": False,
             "antonyms": False,
@@ -1137,6 +1412,19 @@ async def enrich_term(
             sources.append("datamuse_synonyms")
         if deep_needs["antonyms"]:
             sources.append("datamuse_antonyms")
+    if quality_repair_only and any(
+        (needs_definition, needs_pos, needs_phonetic)
+    ):
+        sources.append("wiktionary")
+
+    def apply_fields(fields: dict[str, Any], source: str) -> None:
+        for name, value in fields.items():
+            if name == "matched_variant" or value in (None, "", [], {}):
+                continue
+            if not result.get(name):
+                result[name] = value
+                result["_field_sources"][name] = source
+
     async def fetch(source: str) -> tuple[str, Any | None, int | None, str | None]:
         if source == "edge" and edge_batcher is not None:
             data, status, error = await edge_batcher.request(
@@ -1152,16 +1440,12 @@ async def enrich_term(
                     "antonyms": deep_needs["antonyms"],
                     "phrases": deep_needs["phrases"],
                     "related": deep_needs["related"],
-                    # The public need remains ``phonetic``.  The two optional
-                    # dialect hints let the edge avoid spending an exact
-                    # lookup when only a UK transcription is absent:
-                    # Datamuse exact can currently fill US IPA only.
-                    "usPhonetic": needs_phonetic_repair(
-                        existing.get("us")
-                    ),
-                    "ukPhonetic": needs_phonetic_repair(
-                        existing.get("uk")
-                    ),
+                    # The quality gate needs one reliable pronunciation, not
+                    # two dialect variants.  Prefer the US-capable exact
+                    # fallback and still accept a UK value returned by the
+                    # dictionary provider.
+                    "usPhonetic": needs_phonetic,
+                    "ukPhonetic": False,
                 },
             )
             if status in (500, 502, 503, 504):
@@ -1174,6 +1458,16 @@ async def enrich_term(
                     detail=error or f"HTTP {status}",
                 )
             return source, data, status, error
+        if source == "wiktionary":
+            data, status, error = await fetch_wiktionary_fields(
+                client,
+                gates["wiktionary"],
+                term,
+                need_definition=needs_definition,
+                need_pos=needs_pos,
+                need_phonetic=needs_phonetic,
+            )
+            return source, data, status, error
         gate = gates["datamuse"] if source.startswith("datamuse") else gates[source]
         data, status, error = await request_json(client, gate, urls[source], source)
         return source, data, status, error
@@ -1184,6 +1478,8 @@ async def enrich_term(
     fetched = await asyncio.gather(*(fetch(source) for source in sources))
     for source, data, status, error in fetched:
         provider_status = "completed" if status == 200 else "failed"
+        if source == "wiktionary" and not data and status in (200, 404):
+            provider_status = "not_found"
         if source == "edge" and status == 200 and isinstance(data, dict):
             provider_details = data.get("_providers")
             if isinstance(provider_details, dict) and provider_details:
@@ -1211,7 +1507,13 @@ async def enrich_term(
           (term, source, provider_status, 1, status, error, now()))
         result["_statuses"].append(provider_status)
         result["_attempted"].append(source)
-        if source == "dictionary": result.update(dictionary_fields(data))
+        result["_provider_results"][source] = {
+            "status": provider_status,
+            "httpStatus": status,
+            "error": error or "",
+        }
+        if source == "dictionary":
+            apply_fields(dictionary_fields(data), source)
         elif source.startswith("datamuse"):
             parsed = datamuse_fields(
                 data,
@@ -1220,6 +1522,7 @@ async def enrich_term(
             result[source] = parsed
             if source == "datamuse_exact" and parsed.get("definition") and not result.get("definition"):
                 result["definition"] = parsed["definition"]
+                result["_field_sources"]["definition"] = source
             if source == "datamuse_related":
                 result["related"] = parsed.get("words", [])
                 result["phrases"] = [
@@ -1233,7 +1536,9 @@ async def enrich_term(
                     float(parsed.get("frequency", 0)),
                 )
         elif source == "edge":
-            result.update(edge_fields(data, term))
+            apply_fields(edge_fields(data, term), source)
+        elif source == "wiktionary" and isinstance(data, dict):
+            apply_fields(data, source)
     return result
 
 async def translate(
@@ -1293,6 +1598,8 @@ async def run(
     shard_index: int | None,
     shard_count: int,
     profile: str = "core",
+    max_frequency_rank: int | None = None,
+    quality_repair_only: bool = False,
 ) -> None:
     state = init_state(state_path)
     workers = max(1, workers)
@@ -1302,6 +1609,7 @@ async def run(
         "dictionary": HostGate(delay, min(4, workers)),
         "datamuse": HostGate(delay, min(8, workers)),
         "translation": HostGate(max(delay, translation_delay), min(2, workers)),
+        "wiktionary": HostGate(max(2.0, min(delay, 4.0)), 1),
     }
     client_timeout = httpx.Timeout(20.0, connect=10.0)
     client = httpx.AsyncClient(timeout=client_timeout, follow_redirects=True)
@@ -1357,6 +1665,7 @@ async def run(
                 existing,
                 edge_batcher=edge_batcher,
                 profile=profile,
+                quality_repair_only=quality_repair_only,
             )
             pos = pos or data.get("pos", "")
             definition = definition or data.get("definition", "")
@@ -1386,6 +1695,7 @@ async def run(
                 data.get("related_entries", []),
             )
             zh = definition_zh
+            translated_zh = ""
             if needs_definition_translation(definition, zh):
                 translated_zh, status, error = await translate(
                     client,
@@ -1400,6 +1710,11 @@ async def run(
                   (term, "translation", "completed" if translated_zh else "failed", 1, status, error, now()))
                 data.setdefault("_attempted", []).append("translation")
                 data.setdefault("_statuses", []).append("completed" if translated_zh else "failed")
+                data.setdefault("_provider_results", {})["translation"] = {
+                    "status": "completed" if translated_zh else "failed",
+                    "httpStatus": status,
+                    "error": error or "",
+                }
             base_frequency = 0.0 if needs_frequency_repair(freq) else float(freq or 0)
             score = max(
                 base_frequency,
@@ -1407,6 +1722,8 @@ async def run(
             )
             statuses = data.pop("_statuses", [])
             attempted = data.pop("_attempted", [])
+            field_sources = data.pop("_field_sources", {})
+            provider_results = data.pop("_provider_results", {})
             marker_status = (
                 "completed"
                 if not attempted
@@ -1423,11 +1740,43 @@ async def run(
                     else "not_found"
                 )
             )
+            quality_gaps = entry_quality_gaps(
+                term,
+                definition,
+                zh,
+                us,
+                uk,
+                pos,
+            )
+            if quality_repair_only:
+                marker_status = "completed"
+                if quality_gaps:
+                    marker_status = (
+                        "not_found"
+                        if "definition" in quality_gaps
+                        and statuses
+                        and all(
+                            item in ("not_found", "failed")
+                            for item in statuses
+                        )
+                        else "partial"
+                    )
+            previous_field_sources = marker.get("fieldSources", {})
+            if not isinstance(previous_field_sources, dict):
+                previous_field_sources = {}
             marker = {
                 "status": marker_status,
                 "profile": profile,
                 "lastAttempt": now(),
                 "sources": sorted(set(["open-data", "network"])),
+                "attemptedSources": attempted,
+                "providerResults": provider_results,
+                "fieldSources": {
+                    **previous_field_sources,
+                    **field_sources,
+                    **({"definition_zh": "translation"} if translated_zh else {}),
+                },
+                "qualityGaps": quality_gaps,
             }
             db.execute("""UPDATE entries SET pos=?,definition=?,definition_zh=?,us_phonetic=?,uk_phonetic=?,synonyms_json=?,antonyms_json=?,examples_json=?,phrases_json=?,phrase_entries_json=?,related_words_json=?,related_entries_json=?,frequency=?,difficulty=?,enrichment_json=? WHERE id=?""",
               (pos, definition, zh, us, uk, j(synonyms), j(antonyms), j(examples), j(phrases), j(phrase_entries), j(related), j(related_entries), score, resolved_difficulty(diff, freq, score), j(marker), entry_id))
@@ -1488,6 +1837,7 @@ async def run(
                 after_frequency_rank=after_frequency_rank,
                 after_id=after_id,
                 batch_size=candidate_batch_size,
+                max_frequency_rank=max_frequency_rank,
             )
             if not rows:
                 break
@@ -1509,6 +1859,14 @@ async def run(
                     row[6],
                     row[14],
                 )
+                required_quality_gaps = entry_quality_gaps(
+                    row[2],
+                    row[3],
+                    row[4],
+                    row[5],
+                    row[6],
+                    row[17],
+                )
                 has_deep_gaps = (
                     needs_deep_enrichment(
                         json.loads(row[7] or "[]"),
@@ -1519,7 +1877,9 @@ async def run(
                     if profile == "deep"
                     else False
                 )
-                if (
+                if quality_repair_only and not required_quality_gaps:
+                    continue
+                if not quality_repair_only and (
                     not should_process_marker(row[16], retry_after_hours)
                     and not (
                         needs_quality_repair
@@ -1565,6 +1925,20 @@ def main() -> None:
     ap.add_argument("--end-id", type=int, default=None, help="inclusive entry ID end")
     ap.add_argument("--shard-index", type=int, default=None, help="zero-based shard index")
     ap.add_argument("--shard-count", type=int, default=1, help="number of contiguous shards")
+    ap.add_argument(
+        "--max-frequency-rank",
+        type=int,
+        default=None,
+        help="only inspect entries up to this frequency rank",
+    )
+    ap.add_argument(
+        "--quality-repair-only",
+        action="store_true",
+        help=(
+            "only repair required definition, Chinese translation, POS and "
+            "single-word phonetic gaps"
+        ),
+    )
     args = ap.parse_args()
     if args.shard_index is not None and (args.start_id is not None or args.end_id is not None):
         ap.error("use either --shard-index/--shard-count or --start-id/--end-id, not both")
@@ -1584,6 +1958,8 @@ def main() -> None:
                 args.shard_index,
                 args.shard_count,
                 profile=profile,
+                max_frequency_rank=args.max_frequency_rank,
+                quality_repair_only=args.quality_repair_only,
             )
         )
 

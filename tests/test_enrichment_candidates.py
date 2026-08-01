@@ -1400,6 +1400,86 @@ class CandidateBatchTest(unittest.TestCase):
         self.assertEqual(fields.get("pos", ""), "")
         self.assertEqual(fields["frequency"], 0.0)
 
+    def test_top20k_phrase_classification_and_quality_gate(self) -> None:
+        self.assertTrue(enrichment.is_phrase("look after"))
+        self.assertTrue(enrichment.is_phrase("people-to-people"))
+        self.assertTrue(enrichment.is_phrase("entry", "prep_phrase"))
+        self.assertFalse(enrichment.is_phrase("pre-", "prefix"))
+        self.assertFalse(enrichment.is_phrase("word", "noun"))
+
+        self.assertEqual(
+            enrichment.entry_quality_gaps(
+                "look after",
+                "To take care of.",
+                "照顾。",
+                "",
+                "",
+                "",
+            ),
+            [],
+        )
+        self.assertEqual(
+            enrichment.entry_quality_gaps(
+                "word",
+                "A unit of language.",
+                "语言单位。",
+                "wɝːd",
+                "",
+                "noun",
+            ),
+            [],
+        )
+        self.assertEqual(
+            enrichment.entry_quality_gaps(
+                "word",
+                "A unit of language.",
+                "语言单位。",
+                "",
+                "",
+                "",
+            ),
+            ["pos", "phonetic"],
+        )
+
+    def test_wiktionary_fallback_parses_only_exact_english_data(self) -> None:
+        fields = enrichment.wiktionary_definition_fields(
+            {
+                "en": [
+                    {
+                        "partOfSpeech": "Noun",
+                        "definitions": [
+                            {
+                                "definition": (
+                                    "A <a href='/wiki/unit'>unit</a> of "
+                                    "language."
+                                )
+                            }
+                        ],
+                    }
+                ],
+                "fr": [
+                    {
+                        "partOfSpeech": "Nom",
+                        "definitions": [{"definition": "mot"}],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(fields["definition"], "A unit of language.")
+        self.assertEqual(fields["pos"], "noun")
+        page = (
+            '<h2 id="English">English</h2>'
+            '<span class="IPA">/wɜːd/</span>'
+            '<h2 id="French">French</h2>'
+            '<span class="IPA">/mɔ/</span>'
+        )
+        self.assertEqual(enrichment.wiktionary_english_ipa(page), "wɜːd")
+        self.assertEqual(
+            enrichment.wiktionary_variants("people-to-people"),
+            ["people-to-people", "people to people"],
+        )
+        self.assertEqual(enrichment.wiktionary_variants("pre-"), ["pre-"])
+
     def test_quality_retry_skips_phrase_ipa_and_respects_age(self) -> None:
         recent = enrichment.j(
             {
@@ -1429,6 +1509,89 @@ class CandidateBatchTest(unittest.TestCase):
         )
         self.assertFalse(enrichment.marker_retry_due(recent, 24))
         self.assertTrue(enrichment.marker_retry_due(recent, 0))
+
+    def test_quality_repair_mode_only_processes_incomplete_top_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = Path(directory) / "dataset.sqlite"
+            state = Path(directory) / "state.sqlite"
+            database = create_database(dataset)
+            database.execute(
+                """
+                UPDATE entries SET pos='noun',definition='Complete.',
+                  definition_zh='完整。',us_phonetic='wɜːd'
+                """
+            )
+            database.execute(
+                """
+                UPDATE entries SET pos='',definition='',definition_zh='',
+                  us_phonetic='',uk_phonetic=''
+                WHERE frequency_rank=1
+                """
+            )
+            database.commit()
+            database.close()
+            attempted: list[str] = []
+
+            async def fake_enrich_term(
+                *args: Any,
+                **kwargs: Any,
+            ) -> dict[str, Any]:
+                attempted.append(str(args[2]))
+                return {
+                    "definition": "A repaired definition.",
+                    "pos": "noun",
+                    "us": "wɜːd",
+                    "_statuses": ["completed"],
+                    "_attempted": ["test"],
+                    "_field_sources": {
+                        "definition": "test",
+                        "pos": "test",
+                        "us": "test",
+                    },
+                    "_provider_results": {
+                        "test": {"status": "completed"}
+                    },
+                }
+
+            async def fake_translate(
+                *args: Any,
+                **kwargs: Any,
+            ) -> tuple[str, int, None]:
+                return "修复后的释义。", 200, None
+
+            with (
+                patch.object(enrichment, "enrich_term", new=fake_enrich_term),
+                patch.object(enrichment, "translate", new=fake_translate),
+            ):
+                asyncio.run(
+                    enrichment.run(
+                        dataset,
+                        state,
+                        0,
+                        0,
+                        1,
+                        0,
+                        24,
+                        None,
+                        None,
+                        0,
+                        1,
+                        max_frequency_rank=1,
+                        quality_repair_only=True,
+                    )
+                )
+
+            self.assertEqual(attempted, ["word-3"])
+            database = sqlite3.connect(dataset)
+            row = database.execute(
+                "SELECT definition_zh,enrichment_json FROM entries WHERE id=3"
+            ).fetchone()
+            database.close()
+            self.assertEqual(row[0], "修复后的释义。")
+            marker = json.loads(row[1])
+            self.assertEqual(marker["status"], "completed")
+            self.assertEqual(marker["qualityGaps"], [])
+            self.assertEqual(marker["fieldSources"]["definition"], "test")
 
     def test_deep_pass_runs_once_after_completed_core_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
