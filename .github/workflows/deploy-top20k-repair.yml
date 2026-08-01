@@ -19,7 +19,7 @@ jobs:
           - host: 134.185.82.7
             shard: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Prepare SSH credentials
         shell: bash
@@ -66,8 +66,7 @@ jobs:
           python3 -m py_compile \
             /opt/lexora/tools/enrich_oxford_scope.py \
             /opt/lexora/tools/top20k_quality.py
-          sqlite3 /opt/lexora/build/lexora-open-oxford-scope.sqlite \
-            'PRAGMA quick_check;'
+          python3 -c "import sqlite3; db=sqlite3.connect('/opt/lexora/build/lexora-open-oxford-scope.sqlite'); print(db.execute('PRAGMA quick_check').fetchone()[0]); db.close()"
           python3 /opt/lexora/tools/top20k_quality.py \
             --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
             --shard-index '${{ matrix.shard }}' --shard-count 2 \
