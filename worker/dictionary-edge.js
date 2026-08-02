@@ -3,6 +3,7 @@ const allowedPaths = new Set([
   "/manifest",
   "/oxford-manifest",
   "/v1/lookup",
+  "/v1/progress",
   "/v1/suggest",
   "/v1/web/quota",
   "/v1/web/lookup",
@@ -183,6 +184,79 @@ async function fetchWithFailover(request, env) {
       originName: "unavailable",
     }
   );
+}
+
+async function combinedProgressResponse(request, env) {
+  const origins = [
+    [env.PRIMARY_ORIGIN, "primary"],
+    [env.SECONDARY_ORIGIN, "secondary"],
+  ].filter(([origin]) => Boolean(origin));
+  const results = await Promise.allSettled(
+    origins.map(async ([origin, name]) => {
+      const target = new URL("/v1/progress", origin);
+      const response = await fetch(target, {
+        headers: {
+          Accept: "application/json",
+          "X-Lexora-Origin-Token": env.ORIGIN_TOKEN,
+        },
+        signal: AbortSignal.timeout(8000),
+        cf: { cacheTtl: 0 },
+      });
+      if (!response.ok) throw new Error(`${name} progress unavailable`);
+      const value = await response.json();
+      return {
+        shard: Number(value.shard),
+        finished: Number(value.finished),
+        total: Number(value.total),
+        updatedAt: value.updatedAt || null,
+      };
+    }),
+  );
+  const shards = results
+    .filter((result) => result.status === "fulfilled")
+    .map((result) => result.value)
+    .filter(
+      (value) =>
+        Number.isFinite(value.finished) &&
+        Number.isFinite(value.total) &&
+        value.finished >= 0 &&
+        value.total > 0,
+    )
+    .sort((left, right) => left.shard - right.shard);
+  if (shards.length !== origins.length) {
+    return withCors(
+      Response.json(
+        { detail: "collection progress temporarily unavailable" },
+        { status: 503, headers: { "Cache-Control": "no-store" } },
+      ),
+      "progress",
+      "MISS",
+    );
+  }
+  const finished = shards.reduce((sum, shard) => sum + shard.finished, 0);
+  const total = shards.reduce((sum, shard) => sum + shard.total, 0);
+  const response = Response.json(
+    {
+      finished,
+      total,
+      percent: total > 0 ? Number(((finished / total) * 100).toFixed(3)) : 100,
+      updatedAt: shards
+        .map((shard) => shard.updatedAt)
+        .filter(Boolean)
+        .sort()
+        .at(-1) || null,
+      shards,
+    },
+    { headers: { "Cache-Control": "public, max-age=60" } },
+  );
+  if (request.method === "HEAD") {
+    return withCors(
+      new Response(null, { status: response.status, headers: response.headers }),
+      "progress",
+      "MISS",
+    );
+  }
+  return withCors(response, "progress", "MISS");
 }
 
 function normalizeTerm(value) {
@@ -1291,6 +1365,12 @@ export default {
             "Content-Type, Range, If-Range, If-None-Match, X-Lexora-Client-Hash",
         },
       });
+    }
+    if (
+      ["GET", "HEAD"].includes(request.method) &&
+      url.pathname === "/v1/progress"
+    ) {
+      return combinedProgressResponse(request, env);
     }
     const allowedMethod =
       ["GET", "HEAD"].includes(request.method) ||

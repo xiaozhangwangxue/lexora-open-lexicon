@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
+STATE = ROOT / "state"
 ORIGIN_TOKEN = os.environ.get("LEXORA_ORIGIN_TOKEN", "")
 USAGE_DB = Path(os.environ.get("LEXORA_WEB_USAGE_DB", ROOT / "state" / "web-usage.sqlite"))
 WEB_LOOKUP_DAILY_LIMIT = int(os.environ.get("LEXORA_WEB_LOOKUP_DAILY_LIMIT", "10000"))
@@ -118,6 +119,30 @@ def lookup_entry(term: str, dataset: str = "oxford") -> dict[str, Any]:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+@app.get("/v1/progress")
+def collection_progress() -> dict[str, Any]:
+    """Return this origin's cached shard progress without touching the live DB."""
+    snapshots = sorted(
+        STATE.glob("progress-shard-*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not snapshots:
+        raise HTTPException(503, "progress snapshot is not ready")
+    try:
+        payload = json.loads(snapshots[0].read_text(encoding="utf-8"))
+        finished = max(0, int(payload["finished"]))
+        total = max(0, int(payload["total"]))
+        shard = int(snapshots[0].stem.rsplit("-", 1)[-1])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        raise HTTPException(503, "progress snapshot is invalid") from error
+    return {
+        "shard": shard,
+        "finished": min(finished, total) if total else finished,
+        "total": total,
+        "updatedAt": payload.get("updatedAt"),
+    }
 
 @app.get("/manifest")
 def manifest():
