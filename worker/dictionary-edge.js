@@ -1292,7 +1292,10 @@ export default {
         },
       });
     }
-    const allowedMethod = ["GET", "HEAD"].includes(request.method) || (request.method === "POST" && url.pathname === "/v1/web/generate");
+    const allowedMethod =
+      ["GET", "HEAD"].includes(request.method) ||
+      (request.method === "POST" &&
+        ["/v1/web/generate", "/v1/web/import"].includes(url.pathname));
     if (!allowedMethod || !allowedPaths.has(url.pathname)) {
       return Response.json({ detail: "not found" }, { status: 404 });
     }
