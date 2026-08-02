@@ -203,6 +203,10 @@ def _build_epub(entries: list[dict[str, Any]], title: str, preset: str) -> tuple
 
 
 def _wrapped(draw: Any, text: str, font: Any, width: int) -> list[str]:
+    # Pillow cannot measure text containing line breaks. Dictionary entries can
+    # contain both real newlines and escaped ``\\n`` separators, so collapse
+    # both forms before applying the width-aware wrapping algorithm.
+    text = re.sub(r"\s+", " ", str(text).replace("\\n", " ")).strip()
     words = re.findall(r"\S+\s*", text) if re.search(r"[A-Za-z]", text) else list(text)
     lines: list[str] = []
     current = ""
