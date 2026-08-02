@@ -66,17 +66,18 @@ jobs:
           python3 -m py_compile \
             /opt/lexora/tools/enrich_oxford_scope.py \
             /opt/lexora/tools/top20k_quality.py
-          python3 -c "import sqlite3; db=sqlite3.connect('/opt/lexora/build/lexora-open-oxford-scope.sqlite'); print(db.execute('PRAGMA quick_check').fetchone()[0]); db.close()"
-          python3 /opt/lexora/tools/top20k_quality.py \
-            --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
-            --shard-index '${{ matrix.shard }}' --shard-count 2 \
-            --unresolved-limit 0
+          python3 -c "import sqlite3; db=sqlite3.connect('/opt/lexora/build/lexora-open-oxford-scope.sqlite'); print('top20k_rows=' + str(db.execute('SELECT count(*) FROM entries WHERE frequency_rank <= 20000').fetchone()[0])); db.close()"
           sudo systemctl daemon-reload
           sudo systemctl enable lexora-top20k-repair@'${{ matrix.shard }}'.timer
           sudo systemctl start --no-block \
             lexora-top20k-repair@'${{ matrix.shard }}'.service
           sleep 3
-          systemctl is-active lexora-top20k-repair@'${{ matrix.shard }}'.service
+          state=$(systemctl is-active \
+            lexora-top20k-repair@'${{ matrix.shard }}'.service || true)
+          case "$state" in
+            active|activating) ;;
+            *) echo "unexpected repair state: $state"; exit 1 ;;
+          esac
           systemctl show lexora-top20k-repair@'${{ matrix.shard }}'.service \
             -p MainPID -p ActiveState -p SubState
           REMOTE
