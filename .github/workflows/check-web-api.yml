@@ -1,0 +1,40 @@
+name: Check web API
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [140.245.114.238, 134.185.82.7]
+    steps:
+      - name: Prepare SSH credentials
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.LEXORA_OCI_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LEXORA_OCI_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lexora_oci
+          chmod 0600 ~/.ssh/lexora_oci
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Read API state and recent errors
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 "opc@${{ matrix.host }}" 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          systemctl is-active lexora-lexicon-micro.service
+          curl --fail --silent --max-time 5 http://127.0.0.1:8080/health
+          echo
+          journalctl -u lexora-lexicon-micro.service -n 120 --no-pager
+          REMOTE
