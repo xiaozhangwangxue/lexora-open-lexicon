@@ -72,7 +72,9 @@ jobs:
             sudo dnf install -y antiword || {
               sudo dnf install -y "oracle-epel-release-el${major}"
               sudo dnf --enablerepo="ol${major}_developer_EPEL" \
-                install -y antiword
+                install -y antiword || \
+              sudo dnf --enablerepo="ol${major}_developer_EPEL" \
+                install -y catdoc
             }
           fi
 
