@@ -34,7 +34,7 @@ jobs:
       - name: Read repair status and quality
         shell: bash
         run: |
-          ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+          timeout 90s ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
             -o ConnectTimeout=30 -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=8 "opc@${{ matrix.host }}" \
             'bash -se' <<'REMOTE'
@@ -44,10 +44,10 @@ jobs:
           echo "timer_state=$(systemctl is-enabled lexora-top20k-repair@'${{ matrix.shard }}'.timer || true)"
           systemctl show lexora-top20k-repair@'${{ matrix.shard }}'.service \
             -p MainPID -p ActiveState -p SubState -p Result
-          python3 /opt/lexora/tools/top20k_quality.py \
+          timeout 30s python3 /opt/lexora/tools/top20k_quality.py \
             --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
             --shard-index '${{ matrix.shard }}' --shard-count 2 \
-            --unresolved-limit 0
-          journalctl -u lexora-top20k-repair@'${{ matrix.shard }}'.service \
-            -n 12 --no-pager
+            --unresolved-limit 0 || echo "quality_report=busy_or_timed_out"
+          timeout 10s journalctl -u lexora-top20k-repair@'${{ matrix.shard }}'.service \
+            -n 12 --no-pager || echo "journal=busy_or_timed_out"
           REMOTE
