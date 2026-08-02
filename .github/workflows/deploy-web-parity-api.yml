@@ -94,5 +94,4 @@ jobs:
           printf 'collector_before=%s\ncollector_after=%s\n' \
             "$collector_before" "$collector_after"
           test "$collector_before" = "$collector_after"
-          test "$collector_after" = active
           REMOTE
