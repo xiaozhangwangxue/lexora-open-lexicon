@@ -1,0 +1,10 @@
+fastapi>=0.116,<1
+uvicorn>=0.35,<1
+pydantic>=2.11,<3
+reportlab>=4.4,<5
+python-docx>=1.2,<2
+pypdf>=6.0,<7
+striprtf>=0.0.29,<1
+odfpy>=1.4,<2
+Pillow>=11,<13
+python-multipart>=0.0.20,<1

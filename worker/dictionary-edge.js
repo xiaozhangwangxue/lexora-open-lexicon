@@ -4,6 +4,11 @@ const allowedPaths = new Set([
   "/oxford-manifest",
   "/v1/lookup",
   "/v1/suggest",
+  "/v1/web/quota",
+  "/v1/web/lookup",
+  "/v1/web/suggest",
+  "/v1/web/import",
+  "/v1/web/generate",
 ]);
 const bootstrapObjects = new Set([
   "lexora-open-oxford-scope.sqlite.gz.part-00-0",
@@ -27,7 +32,7 @@ function offlineObjectName(pathname) {
 function withCors(response, originName, cacheStatus) {
   const headers = new Headers(response.headers);
   headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+  headers.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
   headers.set(
     "Access-Control-Allow-Headers",
     "Content-Type, Range, If-Range, If-None-Match",
@@ -106,7 +111,7 @@ async function offlineObjectResponse(request, env, key, isManifest = false) {
   );
 }
 
-async function fetchOrigin(origin, originName, request, env) {
+async function fetchOrigin(origin, originName, request, env, body) {
   const incoming = new URL(request.url);
   const target = new URL(incoming.pathname + incoming.search, origin);
   if (
@@ -119,18 +124,32 @@ async function fetchOrigin(origin, originName, request, env) {
   const headers = new Headers();
   headers.set("Accept", "application/json");
   headers.set("X-Lexora-Origin-Token", env.ORIGIN_TOKEN);
+  const clientHash = request.headers.get("X-Lexora-Client-Hash");
+  if (clientHash) headers.set("X-Lexora-Client-Hash", clientHash);
+  if (request.method === "POST") {
+    headers.set(
+      "Content-Type",
+      request.headers.get("Content-Type") || "application/json",
+    );
+  }
   const timeoutSetting =
     originName === "primary"
       ? env.PRIMARY_TIMEOUT_MS
       : env.SECONDARY_TIMEOUT_MS;
   const configuredTimeout = Number.parseInt(timeoutSetting || "8000", 10);
-  const timeoutMs =
+  const normalTimeout =
     Number.isFinite(configuredTimeout) && configuredTimeout >= 500
       ? configuredTimeout
       : 8000;
+  const timeoutMs = incoming.pathname === "/v1/web/generate"
+    ? 120000
+    : incoming.pathname === "/v1/web/import"
+      ? 30000
+      : normalTimeout;
   const response = await fetch(target, {
     method: request.method,
     headers,
+    body,
     redirect: "follow",
     signal: AbortSignal.timeout(timeoutMs),
     cf: { cacheTtl: 0 },
@@ -144,10 +163,11 @@ async function fetchWithFailover(request, env) {
     [env.SECONDARY_ORIGIN, "secondary"],
   ];
   let lastResponse;
+  const body = request.method === "POST" ? await request.arrayBuffer() : undefined;
   for (const [origin, originName] of origins) {
     if (!origin) continue;
     try {
-      const result = await fetchOrigin(origin, originName, request, env);
+      const result = await fetchOrigin(origin, originName, request, env, body);
       lastResponse = result;
       if (result.response.status < 500) return result;
     } catch {
@@ -1266,19 +1286,20 @@ export default {
         status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+          "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
           "Access-Control-Allow-Headers":
-            "Content-Type, Range, If-Range, If-None-Match",
+            "Content-Type, Range, If-Range, If-None-Match, X-Lexora-Client-Hash",
         },
       });
     }
-    if (!["GET", "HEAD"].includes(request.method) || !allowedPaths.has(url.pathname)) {
+    const allowedMethod = ["GET", "HEAD"].includes(request.method) || (request.method === "POST" && url.pathname === "/v1/web/generate");
+    if (!allowedMethod || !allowedPaths.has(url.pathname)) {
       return Response.json({ detail: "not found" }, { status: 404 });
     }
 
     const cache = caches.default;
     const cacheKey = new Request(url.toString(), { method: "GET" });
-    if (request.method === "GET" && url.pathname !== "/health") {
+    if (request.method === "GET" && url.pathname !== "/health" && !url.pathname.startsWith("/v1/web/")) {
       const cached = await cache.match(cacheKey);
       if (cached) return withCors(cached, "cache", "HIT");
     }
@@ -1293,13 +1314,13 @@ export default {
             ? 60
             : 20;
     const headers = new Headers(response.headers);
-    headers.set("Cache-Control", `public, max-age=${ttl}`);
+    headers.set("Cache-Control", url.pathname.startsWith("/v1/web/") ? "no-store" : `public, max-age=${ttl}`);
     const relayResponse = new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
       headers,
     });
-    if (request.method === "GET" && response.status < 500 && url.pathname !== "/health") {
+    if (request.method === "GET" && response.status < 500 && url.pathname !== "/health" && !url.pathname.startsWith("/v1/web/")) {
       ctx.waitUntil(cache.put(cacheKey, relayResponse.clone()));
     }
     return withCors(relayResponse, originName, "MISS");

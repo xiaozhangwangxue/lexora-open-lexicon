@@ -1,0 +1,98 @@
+name: Deploy web parity API
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: 140.245.114.238
+            shard: 0
+          - host: 134.185.82.7
+            shard: 1
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare SSH credentials
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.LEXORA_OCI_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LEXORA_OCI_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lexora_oci
+          chmod 0600 ~/.ssh/lexora_oci
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Upload API files
+        shell: bash
+        run: |
+          scp -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 \
+            service/server.py service/web_documents.py service/web_pdf.py \
+            requirements-web.txt \
+            "opc@${{ matrix.host }}:/tmp/"
+
+      - name: Install, restart, and verify without disturbing collection
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 "opc@${{ matrix.host }}" \
+            'bash -se' <<'REMOTE'
+          set -euo pipefail
+          shard='${{ matrix.shard }}'
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          collector="lexora-enrich-micro@${shard}.service"
+          collector_before=$(systemctl is-active "$collector" || true)
+
+          sudo install -d -o opc -g opc -m 0755 /opt/lexora/service
+          for file in server.py web_documents.py web_pdf.py; do
+            if [ -f "/opt/lexora/service/$file" ]; then
+              sudo cp -a "/opt/lexora/service/$file" \
+                "/opt/lexora/service/$file.pre-web-parity-$stamp"
+            fi
+            sudo install -o opc -g opc -m 0644 "/tmp/$file" \
+              "/opt/lexora/service/$file"
+          done
+          sudo install -o opc -g opc -m 0644 /tmp/requirements-web.txt \
+            /opt/lexora/requirements-web.txt
+
+          python3 -m pip install --user --disable-pip-version-check \
+            --no-warn-script-location -r /opt/lexora/requirements-web.txt
+          python3 -m py_compile \
+            /opt/lexora/service/server.py \
+            /opt/lexora/service/web_documents.py \
+            /opt/lexora/service/web_pdf.py
+
+          if systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
+            | grep -q lexora-lexicon-micro; then
+            api_unit=lexora-lexicon-micro.service
+          else
+            api_unit=lexora-lexicon.service
+          fi
+          sudo systemctl restart "$api_unit"
+
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --max-time 3 \
+              http://127.0.0.1:8080/health >/tmp/lexora-health.json; then
+              break
+            fi
+            sleep 1
+          done
+          cat /tmp/lexora-health.json
+          systemctl is-active "$api_unit"
+          collector_after=$(systemctl is-active "$collector" || true)
+          printf 'collector_before=%s\ncollector_after=%s\n' \
+            "$collector_before" "$collector_after"
+          test "$collector_before" = "$collector_after"
+          test "$collector_after" = active
+          REMOTE
