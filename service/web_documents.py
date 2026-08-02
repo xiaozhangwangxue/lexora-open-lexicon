@@ -14,6 +14,15 @@ from typing import Any, Iterable
 
 TERM_RE = re.compile(r"^[a-z][a-z' .-]{0,119}$", re.I)
 
+_LEGACY_DOC_NOISE = {
+    "document",
+    "microsoft office word",
+    "microsoft word",
+    "normal",
+    "summaryinformation",
+    "worddocument",
+}
+
 
 def _unique_terms(text: str) -> list[str]:
     values: list[str] = []
@@ -24,6 +33,40 @@ def _unique_terms(text: str) -> list[str]:
             values.append(term)
             seen.add(term)
     return values
+
+
+def _legacy_doc_text(raw: bytes) -> str:
+    """Recover simple word lists from legacy binary Word documents.
+
+    Word 97-2003 files commonly keep short text runs as either single-byte
+    characters or UTF-16LE.  This conservative fallback is intentionally
+    limited to the English words and phrases accepted by Lexora; it avoids an
+    OS package dependency while leaving formatted document conversion to
+    antiword/catdoc when either is available.
+    """
+    candidates: list[str] = []
+    # Mask UTF-16LE ranges before looking for ASCII so their alternating zero
+    # bytes do not turn one word into a series of one-letter candidates.
+    ascii_source = bytearray(raw)
+    utf16_pattern = re.compile(
+        rb"(?<![A-Za-z' .-])[A-Za-z]\x00(?:[A-Za-z' .-]\x00){0,119}"
+    )
+    for match in utf16_pattern.finditer(raw):
+        candidates.append(match.group().decode("utf-16le", errors="ignore"))
+        ascii_source[match.start():match.end()] = b"\x00" * len(match.group())
+    for value in re.findall(rb"[A-Za-z][A-Za-z' .-]{0,119}", ascii_source):
+        candidates.append(value.decode("ascii", errors="ignore"))
+
+    cleaned: list[str] = []
+    for candidate in candidates:
+        candidate = re.sub(r"\s+", " ", candidate).strip(" .-")
+        if (
+            candidate
+            and TERM_RE.fullmatch(candidate)
+            and candidate.lower() not in _LEGACY_DOC_NOISE
+        ):
+            cleaned.append(candidate)
+    return "\n".join(cleaned)
 
 
 def extract_terms(raw: bytes, filename: str) -> list[str]:
@@ -53,23 +96,24 @@ def extract_terms(raw: bytes, filename: str) -> list[str]:
         text = teletype.extractText(document.text)
     elif suffix == ".doc":
         converter = shutil.which("antiword") or shutil.which("catdoc")
-        if not converter:
-            raise ValueError("服务器的 DOC 解析器暂不可用，请先另存为 DOCX")
-        source = Path(tempfile.mkstemp(prefix="lexora-import-", suffix=".doc")[1])
-        try:
-            source.write_bytes(raw)
-            result = subprocess.run(
-                [converter, str(source)],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=20,
-            )
-            text = result.stdout.decode("utf-8", errors="replace")
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-            raise ValueError("无法读取此 DOC 文件") from error
-        finally:
-            source.unlink(missing_ok=True)
+        if converter:
+            source = Path(tempfile.mkstemp(prefix="lexora-import-", suffix=".doc")[1])
+            try:
+                source.write_bytes(raw)
+                result = subprocess.run(
+                    [converter, str(source)],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=20,
+                )
+                text = result.stdout.decode("utf-8", errors="replace")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                raise ValueError("无法读取此 DOC 文件") from error
+            finally:
+                source.unlink(missing_ok=True)
+        else:
+            text = _legacy_doc_text(raw)
     else:
         raise ValueError("不支持此文件格式")
     terms = _unique_terms(text)

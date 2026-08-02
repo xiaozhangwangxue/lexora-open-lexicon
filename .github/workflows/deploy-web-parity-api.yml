@@ -66,18 +66,6 @@ jobs:
           sudo install -o opc -g opc -m 0644 /tmp/requirements-web.txt \
             /opt/lexora/requirements-web.txt
 
-          if ! command -v antiword >/dev/null 2>&1 && \
-             ! command -v catdoc >/dev/null 2>&1; then
-            major=$(source /etc/os-release && printf '%s' "${VERSION_ID%%.*}")
-            sudo dnf install -y antiword || {
-              sudo dnf install -y "oracle-epel-release-el${major}"
-              sudo dnf --enablerepo="ol${major}_developer_EPEL" \
-                install -y antiword || \
-              sudo dnf --enablerepo="ol${major}_developer_EPEL" \
-                install -y catdoc
-            }
-          fi
-
           python3 -m pip install --user --disable-pip-version-check \
             --no-warn-script-location -r /opt/lexora/requirements-web.txt
           python3 -m py_compile \
