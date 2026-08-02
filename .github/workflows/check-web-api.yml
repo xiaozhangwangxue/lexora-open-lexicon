@@ -36,5 +36,6 @@ jobs:
           systemctl is-active lexora-lexicon-micro.service
           curl --fail --silent --max-time 5 http://127.0.0.1:8080/health
           echo
+          echo "doc_parser=$(command -v antiword || command -v catdoc || echo unavailable)"
           journalctl -u lexora-lexicon-micro.service -n 120 --no-pager
           REMOTE
