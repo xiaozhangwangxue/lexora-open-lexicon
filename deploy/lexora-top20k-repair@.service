@@ -18,10 +18,9 @@ ExecStart=/usr/bin/python3 /opt/lexora/tools/enrich_oxford_scope.py \
   --shard-index %i --shard-count 2 \
   --profile core --max-frequency-rank 20000 --quality-repair-only \
   --workers 8 --delay 16 --translation-delay 16 --retry-after-hours 0
-ExecStopPost=+/usr/bin/systemctl start lexora-enrich-micro@%i.service
+ExecStopPost=+/usr/bin/systemctl start --no-block lexora-enrich-micro@%i.service
 Nice=10
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ReadWritePaths=/opt/lexora/build /opt/lexora/state
-
