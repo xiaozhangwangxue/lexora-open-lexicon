@@ -36,11 +36,11 @@ function withCors(response, originName, cacheStatus) {
   headers.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
   headers.set(
     "Access-Control-Allow-Headers",
-    "Content-Type, Range, If-Range, If-None-Match",
+    "Content-Type, Range, If-Range, If-None-Match, X-Lexora-Client-Hash",
   );
   headers.set(
     "Access-Control-Expose-Headers",
-    "Accept-Ranges, Content-Length, Content-Range, ETag",
+    "Accept-Ranges, Content-Disposition, Content-Length, Content-Range, ETag, X-Lexora-Daily-Remaining, X-Lexora-Filename, X-Lexora-Skipped",
   );
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("X-Lexora-Origin", originName);
