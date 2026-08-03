@@ -1,5 +1,10 @@
 # Lexora Open Lexicon
 
+This is the open dictionary and offline-data project behind
+[Lexora, a free bilingual dictionary and personal vocabulary book generator](https://lexora.12323456.xyz/en/vocabulary-book-generator).
+The main application source is available in the
+[Lexora GitHub repository](https://github.com/xiaozhangwangxue/lexora).
+
 Reproducible, open-data SQLite snapshots for Lexora:
 
 * `build/lexora-english-600k.sqlite` — 600,000 English headwords.
