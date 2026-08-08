@@ -162,9 +162,47 @@ async function fetchWithFailover(request, env) {
   const origins = [
     [env.PRIMARY_ORIGIN, "primary"],
     [env.SECONDARY_ORIGIN, "secondary"],
-  ];
+  ].filter(([origin]) => Boolean(origin));
   let lastResponse;
   const body = request.method === "POST" ? await request.arrayBuffer() : undefined;
+
+  // Dictionary lookups are read-only and both Always Free origins contain the
+  // same published database. Race them so a stalled instance cannot add its
+  // full timeout before the healthy instance is tried. Quota-bearing web and
+  // document requests intentionally remain sequential below.
+  const pathname = new URL(request.url).pathname;
+  if (request.method === "GET" && pathname === "/v1/lookup") {
+    try {
+      return await Promise.any(
+        origins.map(async ([origin, originName]) => {
+          const result = await fetchOrigin(
+            origin,
+            originName,
+            request,
+            env,
+            undefined,
+          );
+          if (result.response.status >= 500) throw result;
+          return result;
+        }),
+      );
+    } catch (error) {
+      const failures =
+        error instanceof AggregateError ? error.errors : [error];
+      lastResponse = failures
+        .map((failure) => failure?.response ? failure : null)
+        .find(Boolean);
+      return (
+        lastResponse || {
+          response: Response.json(
+            { detail: "dictionary relay temporarily unavailable" },
+            { status: 503 },
+          ),
+          originName: "unavailable",
+        }
+      );
+    }
+  }
   for (const [origin, originName] of origins) {
     if (!origin) continue;
     try {

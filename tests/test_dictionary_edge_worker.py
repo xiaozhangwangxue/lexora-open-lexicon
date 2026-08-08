@@ -1731,6 +1731,54 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
             config["migrations"][0]["new_sqlite_classes"],
         )
 
+    def test_read_only_lookup_races_both_free_origins(self) -> None:
+        script = f"""
+          globalThis.caches = {{
+            default: {{
+              match: async () => null,
+              put: async () => undefined,
+            }},
+          }};
+          const requested = [];
+          globalThis.fetch = async (input) => {{
+            const url = new URL(String(input));
+            requested.push(url.hostname);
+            if (url.hostname === "primary.example")
+              await new Promise((resolve) => setTimeout(resolve, 120));
+            else
+              await new Promise((resolve) => setTimeout(resolve, 5));
+            return Response.json({{ word: "word", origin: url.hostname }});
+          }};
+          const {{ default: worker }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const started = Date.now();
+          const response = await worker.fetch(
+            new Request("https://dict.example/v1/lookup?term=word"),
+            {{
+              ORIGIN_TOKEN: "test-token",
+              PRIMARY_ORIGIN: "https://primary.example",
+              SECONDARY_ORIGIN: "https://secondary.example",
+            }},
+            {{ waitUntil: () => undefined }},
+          );
+          console.log(JSON.stringify({{
+            status: response.status,
+            origin: response.headers.get("X-Lexora-Origin"),
+            elapsed: Date.now() - started,
+            requested,
+            body: await response.json(),
+          }}));
+        """
+        result = self.run_node(script)
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["origin"], "secondary")
+        self.assertEqual(result["body"]["origin"], "secondary.example")
+        self.assertCountEqual(
+            result["requested"], ["primary.example", "secondary.example"]
+        )
+        self.assertLess(result["elapsed"], 100)
+
 
 if __name__ == "__main__":
     unittest.main()
