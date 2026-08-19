@@ -96,13 +96,22 @@ jobs:
           quality_unit="lexora-top20k-quality-snapshot@${shard}.service"
           quality_timer="lexora-top20k-quality-snapshot@${shard}.timer"
           quality_path="/opt/lexora/state/top20k-quality-shard-${shard}.json"
-          # A strict scan on the smallest OCI instance may take several
-          # minutes while collection is writing.  Deployment must not block on
-          # it or start a duplicate scan.  The API deliberately reports
-          # top20k=null until the atomic snapshot is ready, and clients label a
-          # one-shard result as incomplete.
+          # The very first quality snapshot is part of this deployment's
+          # contract.  A Type=oneshot start waits for the read-only scan and is
+          # still bounded by the unit's 12 minute timeout.  Later hourly scans
+          # continue to run from the timer without blocking API requests.
           sudo systemctl enable --now "$quality_timer"
-          sudo systemctl start --no-block "$quality_unit" || true
+          if [ ! -s "$quality_path" ]; then
+            quality_started_at=$(date --utc +%Y-%m-%dT%H:%M:%SZ)
+            if ! sudo systemctl start "$quality_unit"; then
+              sudo systemctl show "$quality_unit" -p ActiveState -p SubState \
+                -p Job -p Result -p ExecMainCode -p ExecMainStatus \
+                -p ActiveEnterTimestamp -p InactiveEnterTimestamp || true
+              sudo journalctl -u "$quality_unit" \
+                --since "$quality_started_at" -n 160 --no-pager || true
+              exit 1
+            fi
+          fi
 
           if systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
             | grep -q lexora-lexicon-micro; then
@@ -129,23 +138,19 @@ jobs:
           import json
           from pathlib import Path
           path = Path("/opt/lexora/state/top20k-quality-shard-${shard}.json")
-          if path.exists():
-              value = json.loads(path.read_text())
-              assert value["total"] > 0
-              assert value["complete"] + value["incomplete"] == value["total"]
-              print(json.dumps({
-                  "shard": ${shard},
-                  "complete": value["complete"],
-                  "total": value["total"],
-                  "percent": value["percent"],
-              }, sort_keys=True))
-          else:
-              print(json.dumps({
-                  "shard": ${shard},
-                  "top20k": "generating",
-              }, sort_keys=True))
+          value = json.loads(path.read_text())
+          assert value["total"] > 0
+          assert value["complete"] + value["incomplete"] == value["total"]
+          print(json.dumps({
+              "shard": ${shard},
+              "complete": value["complete"],
+              "total": value["total"],
+              "percent": value["percent"],
+          }, sort_keys=True))
           PY
-          systemctl show "$quality_unit" -p ActiveState -p SubState -p Result
+          systemctl show "$quality_unit" -p ActiveState -p SubState -p Job \
+            -p Result -p ExecMainCode -p ExecMainStatus \
+            -p ActiveEnterTimestamp -p InactiveEnterTimestamp
           systemctl is-active "$api_unit"
           collector_after=$(systemctl is-active "$collector" || true)
           repair_after=$(systemctl is-active "$repair" || true)
