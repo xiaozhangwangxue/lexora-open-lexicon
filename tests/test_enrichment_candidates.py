@@ -1441,6 +1441,34 @@ class CandidateBatchTest(unittest.TestCase):
             ["pos", "phonetic"],
         )
 
+    def test_translation_quality_rejects_untranslated_or_truncated_text(self) -> None:
+        source = (
+            "A unit of language that carries meaning and may be spoken or "
+            "written in a sentence."
+        )
+        self.assertTrue(
+            enrichment.needs_definition_translation(source, source)
+        )
+        self.assertTrue(
+            enrichment.needs_definition_translation(
+                source,
+                "语言单位，that carries meaning and may be spoken or written "
+                "in a sentence with other words.",
+            )
+        )
+        self.assertFalse(
+            enrichment.needs_definition_translation(
+                source,
+                "一种承载意义、可在句子中说出或写下的语言单位。",
+            )
+        )
+        self.assertFalse(
+            enrichment.needs_definition_translation(
+                "A smartphone made by Apple.",
+                "苹果公司生产的 iPhone 智能手机。",
+            )
+        )
+
     def test_wiktionary_fallback_parses_only_exact_english_data(self) -> None:
         fields = enrichment.wiktionary_definition_fields(
             {
