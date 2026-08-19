@@ -10,8 +10,12 @@ ExecStart=/usr/bin/python3 /opt/lexora/tools/write_top20k_quality_snapshot.py \
   --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
   --output /opt/lexora/state/top20k-quality-shard-%i.json \
   --shard-index %i --shard-count 2 --unresolved-limit 8
-Nice=19
-IOSchedulingClass=idle
+# Keep the hourly read-only scan below the active repair/collector (Nice=10),
+# while still granting it enough disk service to finish on the E2 micro VM.
+# IOSchedulingClass=idle could be starved indefinitely by WAL writes.
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 TimeoutStartSec=12min
 NoNewPrivileges=true
 PrivateTmp=true
