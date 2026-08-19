@@ -97,6 +97,19 @@ class DeploymentConfigTest(unittest.TestCase):
         self.assertIn("OnUnitActiveSec=5min", timer)
         self.assertIn("AccuracySec=30s", timer)
 
+    def test_top20k_quality_snapshot_is_bounded_and_low_priority(self) -> None:
+        service = (
+            ROOT / "deploy" / "lexora-top20k-quality-snapshot@.service"
+        ).read_text(encoding="utf-8")
+        timer = (
+            ROOT / "deploy" / "lexora-top20k-quality-snapshot@.timer"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Nice=19", service)
+        self.assertIn("IOSchedulingClass=idle", service)
+        self.assertIn("TimeoutStartSec=5min", service)
+        self.assertIn("top20k-quality-shard-%i.json", service)
+        self.assertIn("OnUnitActiveSec=60min", timer)
+
 
 if __name__ == "__main__":
     unittest.main()

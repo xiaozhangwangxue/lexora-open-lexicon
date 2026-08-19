@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh cached Lexora top-20k quality progress for shard %i
+
+[Timer]
+OnBootSec=4min
+OnUnitActiveSec=60min
+AccuracySec=2min
+Persistent=true
+Unit=lexora-top20k-quality-snapshot@%i.service
+
+[Install]
+WantedBy=timers.target

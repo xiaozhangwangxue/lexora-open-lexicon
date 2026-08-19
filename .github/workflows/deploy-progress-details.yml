@@ -1,0 +1,143 @@
+name: Deploy detailed collection progress
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  origins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: 140.245.114.238
+            shard: 0
+          - host: 134.185.82.7
+            shard: 1
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare SSH credentials
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.LEXORA_OCI_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LEXORA_OCI_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lexora_oci
+          chmod 0600 ~/.ssh/lexora_oci
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Upload progress files
+        shell: bash
+        run: |
+          scp -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 \
+            service/server.py \
+            tools/enrich_oxford_scope.py \
+            tools/top20k_quality.py \
+            tools/write_top20k_quality_snapshot.py \
+            deploy/lexora-top20k-quality-snapshot@.service \
+            deploy/lexora-top20k-quality-snapshot@.timer \
+            "opc@${{ matrix.host }}:/tmp/"
+
+      - name: Install and verify without disturbing collection
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 "opc@${{ matrix.host }}" \
+            'bash -se' <<'REMOTE'
+          set -euo pipefail
+          shard='${{ matrix.shard }}'
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          collector="lexora-enrich-micro@${shard}.service"
+          repair="lexora-top20k-repair@${shard}.service"
+          collector_before=$(systemctl is-active "$collector" || true)
+          repair_before=$(systemctl is-active "$repair" || true)
+
+          sudo install -d -o opc -g opc -m 0755 \
+            /opt/lexora/service /opt/lexora/tools /opt/lexora/state
+          for file in server.py; do
+            if [ -f "/opt/lexora/service/$file" ]; then
+              sudo cp -a "/opt/lexora/service/$file" \
+                "/opt/lexora/service/$file.pre-progress-$stamp"
+            fi
+            sudo install -o opc -g opc -m 0644 "/tmp/$file" \
+              "/opt/lexora/service/$file"
+          done
+          for file in enrich_oxford_scope.py top20k_quality.py \
+            write_top20k_quality_snapshot.py; do
+            if [ -f "/opt/lexora/tools/$file" ]; then
+              sudo cp -a "/opt/lexora/tools/$file" \
+                "/opt/lexora/tools/$file.pre-progress-$stamp"
+            fi
+            sudo install -o opc -g opc -m 0755 "/tmp/$file" \
+              "/opt/lexora/tools/$file"
+          done
+          sudo install -m 0644 \
+            /tmp/lexora-top20k-quality-snapshot@.service \
+            /etc/systemd/system/lexora-top20k-quality-snapshot@.service
+          sudo install -m 0644 \
+            /tmp/lexora-top20k-quality-snapshot@.timer \
+            /etc/systemd/system/lexora-top20k-quality-snapshot@.timer
+
+          python3 -m py_compile \
+            /opt/lexora/service/server.py \
+            /opt/lexora/tools/enrich_oxford_scope.py \
+            /opt/lexora/tools/top20k_quality.py \
+            /opt/lexora/tools/write_top20k_quality_snapshot.py
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now \
+            "lexora-top20k-quality-snapshot@${shard}.timer"
+          sudo systemctl start --no-block \
+            "lexora-top20k-quality-snapshot@${shard}.service"
+
+          if systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
+            | grep -q lexora-lexicon-micro; then
+            api_unit=lexora-lexicon-micro.service
+          else
+            api_unit=lexora-lexicon.service
+          fi
+          sudo systemctl restart "$api_unit"
+          for attempt in $(seq 1 60); do
+            if [ -s "/opt/lexora/state/top20k-quality-shard-${shard}.json" ] \
+              && curl --fail --silent --max-time 3 \
+                http://127.0.0.1:8080/health >/tmp/lexora-health.json; then
+              break
+            fi
+            sleep 5
+          done
+          test -s "/opt/lexora/state/top20k-quality-shard-${shard}.json"
+          cat /tmp/lexora-health.json
+          python3 - <<PY
+          import json
+          from pathlib import Path
+          value = json.loads(Path(
+              "/opt/lexora/state/top20k-quality-shard-${shard}.json"
+          ).read_text())
+          assert value["total"] > 0
+          assert value["complete"] + value["incomplete"] == value["total"]
+          print(json.dumps({
+              "shard": ${shard},
+              "complete": value["complete"],
+              "total": value["total"],
+              "percent": value["percent"],
+          }, sort_keys=True))
+          PY
+          systemctl is-active "$api_unit"
+          collector_after=$(systemctl is-active "$collector" || true)
+          repair_after=$(systemctl is-active "$repair" || true)
+          printf 'collector_before=%s\ncollector_after=%s\n' \
+            "$collector_before" "$collector_after"
+          printf 'repair_before=%s\nrepair_after=%s\n' \
+            "$repair_before" "$repair_after"
+          case "$collector_after:$repair_after" in
+            active:inactive|inactive:active|inactive:activating) ;;
+            *) echo "unexpected collection state"; exit 1 ;;
+          esac
+          REMOTE
