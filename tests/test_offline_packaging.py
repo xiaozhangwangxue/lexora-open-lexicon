@@ -14,7 +14,12 @@ from build_oxford_scope import SCHEMA  # noqa: E402
 from auto_export_ready_shard import export_if_ready  # noqa: E402
 from export_enrichment_shard import export_delta  # noqa: E402
 from merge_enrichment_shards import merge  # noqa: E402
-from package_offline_lexicons import compress, copy_fast, copy_full  # noqa: E402
+from package_offline_lexicons import (  # noqa: E402
+    assert_fast_source_ready,
+    compress,
+    copy_fast,
+    copy_full,
+)
 
 
 def build_source(path: Path) -> None:
@@ -53,7 +58,7 @@ def build_source(path: Path) -> None:
                 "A1-A2",
                 8.0 - index,
                 index,
-                "",
+                "wɜːd",
                 "",
                 f"{word} definition",
                 f"{word} 中文",
@@ -80,6 +85,25 @@ def build_source(path: Path) -> None:
 
 
 class OfflinePackagingTest(unittest.TestCase):
+    def test_fast_package_gate_rejects_missing_required_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.sqlite"
+            build_source(source)
+            self.assertEqual(assert_fast_source_ready(source, 4)["complete"], 4)
+
+            database = sqlite3.connect(source)
+            database.execute(
+                "UPDATE entries SET definition='' WHERE frequency_rank=1"
+            )
+            database.commit()
+            database.close()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "fast lexicon quality gate failed",
+            ):
+                assert_fast_source_ready(source, 4)
+
     def test_auto_export_waits_and_then_creates_an_atomic_shard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

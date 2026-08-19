@@ -12,6 +12,7 @@ import sqlite3
 from pathlib import Path
 
 from build_oxford_scope import SCHEMA, rebuild_fts
+from top20k_quality import quality_report
 
 COLUMNS = (
     "word",
@@ -140,6 +141,45 @@ def package_entry(
     }
 
 
+def assert_fast_source_ready(source: Path, limit: int) -> dict[str, object]:
+    """Fail closed unless the source's highest-ranked rows meet the gate."""
+    if limit < 1:
+        raise ValueError("fast limit must be positive")
+    report = quality_report(
+        source,
+        max_frequency_rank=limit,
+        shard_index=None,
+        shard_count=1,
+        unresolved_limit=20,
+    )
+    database = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        integrity = str(database.execute("PRAGMA quick_check").fetchone()[0])
+    finally:
+        database.close()
+    report["sqliteQuickCheck"] = integrity
+    if (
+        int(report["total"]) != limit
+        or int(report["incomplete"]) != 0
+        or integrity != "ok"
+    ):
+        raise ValueError(
+            "fast lexicon quality gate failed: "
+            + json.dumps(
+                {
+                    "expectedRows": limit,
+                    "total": report["total"],
+                    "incomplete": report["incomplete"],
+                    "missing": report["missing"],
+                    "sqliteQuickCheck": integrity,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, required=True)
@@ -149,6 +189,7 @@ def main() -> None:
     parser.add_argument("--base-url", default="https://dict.12323456.xyz")
     args = parser.parse_args()
 
+    fast_quality = assert_fast_source_ready(args.source, args.fast_limit)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     full_db = args.output_dir / f"lexora-offline-full-{args.version}.sqlite"
     fast_db = args.output_dir / f"lexora-offline-fast20k-{args.version}.sqlite"
@@ -162,6 +203,7 @@ def main() -> None:
     manifest = {
         "schema_version": 1,
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "fast20kQuality": fast_quality,
         "packages": {
             "fast20k": package_entry(
                 "fast20k",
