@@ -28,9 +28,11 @@ def completion_proof(
         return None
     try:
         value = json.loads(snapshot.read_text(encoding="utf-8"))
-        finished = int(value["finished"])
-        total = int(value["total"])
-        remaining = int(value.get("remaining", total - finished))
+        finished = value["finished"]
+        total = value["total"]
+        remaining = value.get("remaining", total - finished)
+        if any(type(item) is not int for item in (finished, total, remaining)):
+            return None
         updated_at = dt.datetime.fromisoformat(
             str(value["updatedAt"]).replace("Z", "+00:00")
         )

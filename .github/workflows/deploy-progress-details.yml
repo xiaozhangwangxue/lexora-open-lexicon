@@ -83,6 +83,7 @@ jobs:
           test ! -e "$backup"
           install -d -m 0750 "$backup"
           server_target=/opt/lexora/service/server.py
+          progress_validation_target=/opt/lexora/service/progress_validation.py
           quality_main=/etc/systemd/system/lexora-top20k-quality-snapshot@.service
           quality_timer_file=/etc/systemd/system/lexora-top20k-quality-snapshot@.timer
           quality_dropin=/etc/systemd/system/lexora-top20k-quality-snapshot@.service.d/10-current-release.conf
@@ -120,6 +121,7 @@ jobs:
           sudo install -d -m 0755 \
             /etc/systemd/system/lexora-top20k-quality-snapshot@.service.d
           save_one "$server_target" server.py
+          save_one "$progress_validation_target" progress_validation.py
           save_one "$quality_main" quality.service
           save_one "$quality_timer_file" quality.timer
           save_one "$quality_dropin" quality.conf
@@ -133,6 +135,7 @@ jobs:
               --root /opt/lexora --track progress --release-id "$release_id" \
               rollback || true
             restore_one "$server_target" server.py || true
+            restore_one "$progress_validation_target" progress_validation.py || true
             restore_one "$quality_main" quality.service || true
             restore_one "$quality_timer_file" quality.timer || true
             restore_one "$quality_dropin" quality.conf || true
@@ -164,6 +167,9 @@ jobs:
 
           sudo install -o opc -g opc -m 0644 "$release/service/server.py" \
             "$server_target"
+          sudo install -o opc -g opc -m 0644 \
+            "$release/service/progress_validation.py" \
+            "$progress_validation_target"
           sudo install -m 0644 \
             "$release/deploy/lexora-top20k-quality-snapshot@.service" \
             "$quality_main"
@@ -176,9 +182,12 @@ jobs:
 
           python3 -m py_compile \
             /opt/lexora/service/server.py \
+            /opt/lexora/service/progress_validation.py \
             /opt/lexora/deployments/progress/current/tools/enrich_oxford_scope.py \
             /opt/lexora/deployments/progress/current/tools/top20k_quality.py \
             /opt/lexora/deployments/progress/current/tools/write_top20k_quality_snapshot.py
+          (cd /opt/lexora && python3 -c \
+            'import service.server; from service.progress_validation import validate_top20k_quality_snapshot')
           PYTHONPATH=/opt/lexora/deployments/progress/current/tools \
             python3 -c 'import enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot'
           sudo systemctl daemon-reload
@@ -222,27 +231,19 @@ jobs:
           quality_path="/opt/lexora/state/top20k-quality-shard-${shard}.json"
           candidate_path="/opt/lexora/deployments/repair/current/build/lexora-open-oxford-safe-20k.sqlite"
           snapshot_valid() {
-            python3 - "$quality_path" "$candidate_path" "$shard" <<'PY'
-          import json, sqlite3, sys
+            PYTHONPATH="$release" python3 - \
+              "$quality_path" "$candidate_path" "$shard" <<'PY'
+          import sys
           from pathlib import Path
+          from service.progress_validation import validate_top20k_quality_snapshot
+
           snapshot, candidate, shard = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
-          if not snapshot.is_file() or not candidate.is_file():
-              raise SystemExit(1)
-          try:
-              value = json.loads(snapshot.read_text(encoding="utf-8"))
-              db = sqlite3.connect(f"file:{candidate.resolve()}?mode=ro", uri=True)
-              digest = db.execute(
-                  "SELECT candidate_digest FROM fast20k_metadata WHERE id=1"
-              ).fetchone()[0]
-              db.close()
-              assert value["qualityGateVersion"] == 2
-              assert value["candidateDigest"] == digest
-              assert value["shardIndex"] == shard
-              assert value["shardCount"] == 2
-              assert value["total"] > 0
-              assert value["complete"] + value["incomplete"] == value["total"]
-          except Exception:
-              raise SystemExit(1)
+          validate_top20k_quality_snapshot(
+              snapshot,
+              Path("/opt/lexora/build/lexora-open-oxford-scope.sqlite"),
+              candidate,
+              shard_index=shard,
+          )
           PY
           }
           if ! snapshot_valid; then

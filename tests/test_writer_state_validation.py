@@ -117,6 +117,30 @@ class WriterStateValidationTest(unittest.TestCase):
                 repair="inactive",
             )
 
+    def test_boolean_snapshot_counts_are_not_completion_proof(self) -> None:
+        now = dt.datetime(2026, 8, 19, 12, 0, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "progress.json"
+            snapshot.write_text(
+                json.dumps(
+                    {
+                        "finished": True,
+                        "total": 1,
+                        "remaining": 0,
+                        "updatedAt": now.isoformat(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "without completion proof"):
+                validate_writer_states(
+                    micro="inactive",
+                    full="inactive",
+                    repair="inactive",
+                    progress_snapshot=snapshot,
+                    now=now,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

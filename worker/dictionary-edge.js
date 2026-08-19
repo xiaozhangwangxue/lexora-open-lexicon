@@ -362,7 +362,8 @@ async function combinedProgressResponse(request, env) {
   const onlyCandidateDigest =
     candidateDigests.size === 1 ? [...candidateDigests][0] : null;
   const matchingCandidateDigest =
-    typeof onlyCandidateDigest === "string" && onlyCandidateDigest.trim()
+    typeof onlyCandidateDigest === "string" &&
+    /^[0-9a-f]{64}$/.test(onlyCandidateDigest)
       ? onlyCandidateDigest
       : null;
   const qualityAvailable =

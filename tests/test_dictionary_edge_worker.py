@@ -1805,7 +1805,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
                 : "2026-08-19T01:01:00+00:00",
               top20k: {{
                 qualityGateVersion: 2,
-                candidateDigest: "candidate-a",
+                candidateDigest: "a".repeat(64),
                 shardIndex: primary ? 0 : 1,
                 shardCount: 2,
                 total: 10000,
@@ -1849,7 +1849,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
         self.assertTrue(body["top20k"]["available"])
         self.assertFalse(body["top20k"]["ready"])
         self.assertEqual(body["top20k"]["total"], 20000)
-        self.assertEqual(body["top20k"]["candidateDigest"], "candidate-a")
+        self.assertEqual(body["top20k"]["candidateDigest"], "a" * 64)
         self.assertEqual(body["top20k"]["complete"], 18999)
         self.assertEqual(body["top20k"]["missing"]["definition"], 901)
         self.assertEqual(body["top20k"]["updatedAt"], "2026-08-19T01:03:00+00:00")
@@ -1877,7 +1877,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
               updatedAt: "2026-08-19T01:00:00+00:00",
               top20k: {{
                 qualityGateVersion: 2,
-                candidateDigest: "candidate-a",
+                candidateDigest: "a".repeat(64),
                 shardIndex: host === "primary.example" ? 0 : 1,
                 shardCount: 2,
                 total: 10000,
@@ -1946,7 +1946,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
               updatedAt: "2026-08-19T01:00:00+00:00",
               top20k: {{
                 qualityGateVersion: 2,
-                candidateDigest: primary ? "candidate-a" : "candidate-b",
+                candidateDigest: primary ? "a".repeat(64) : "b".repeat(64),
                 shardIndex: primary ? 0 : 1,
                 shardCount: 2,
                 total: 10000,
@@ -1974,7 +1974,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
         self.assertFalse(body["top20k"]["ready"])
         self.assertIsNone(body["top20k"]["candidateDigest"])
 
-    def test_progress_rejects_invalid_top20k_shard_identity(self) -> None:
+    def test_progress_rejects_invalid_top20k_contract(self) -> None:
         script = f"""
           globalThis.caches = {{ default: {{
             match: async () => null,
@@ -1984,6 +1984,12 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
             {{ primaryIndex: 0, secondaryIndex: 0, shardCount: 2 }},
             {{ primaryIndex: 1, secondaryIndex: 0, shardCount: 2 }},
             {{ primaryIndex: 0, secondaryIndex: 1, shardCount: 3 }},
+            {{
+              primaryIndex: 0,
+              secondaryIndex: 1,
+              shardCount: 2,
+              candidateDigest: "matching-but-not-a-contract-digest",
+            }},
           ];
           const {{ default: worker }} = await import(
             {json.dumps(WORKER.as_uri())}
@@ -1999,7 +2005,8 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
                 updatedAt: "2026-08-19T01:00:00+00:00",
                 top20k: {{
                   qualityGateVersion: 2,
-                  candidateDigest: "candidate-a",
+                  candidateDigest:
+                    scenario.candidateDigest || "a".repeat(64),
                   shardIndex: primary
                     ? scenario.primaryIndex
                     : scenario.secondaryIndex,
@@ -2024,7 +2031,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
           console.log(JSON.stringify(outputs));
         """
         results = self.run_node(script)
-        self.assertEqual(len(results), 3)
+        self.assertEqual(len(results), 4)
         for result in results:
             self.assertFalse(result["available"])
             self.assertFalse(result["ready"])

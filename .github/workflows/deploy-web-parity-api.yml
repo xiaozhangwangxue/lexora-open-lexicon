@@ -43,7 +43,8 @@ jobs:
         run: |
           scp -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
             -o ConnectTimeout=30 \
-            service/server.py service/web_documents.py service/web_pdf.py \
+            service/server.py service/progress_validation.py \
+            service/web_documents.py service/web_pdf.py \
             requirements-web.txt \
             "opc@${{ matrix.host }}:/tmp/"
 
@@ -60,7 +61,7 @@ jobs:
           collector_before=$(systemctl is-active "$collector" || true)
 
           sudo install -d -o opc -g opc -m 0755 /opt/lexora/service
-          for file in server.py web_documents.py web_pdf.py; do
+          for file in server.py progress_validation.py web_documents.py web_pdf.py; do
             if [ -f "/opt/lexora/service/$file" ]; then
               sudo cp -a "/opt/lexora/service/$file" \
                 "/opt/lexora/service/$file.pre-web-parity-$stamp"
@@ -75,8 +76,11 @@ jobs:
             --no-warn-script-location -r /opt/lexora/requirements-web.txt
           python3 -m py_compile \
             /opt/lexora/service/server.py \
+            /opt/lexora/service/progress_validation.py \
             /opt/lexora/service/web_documents.py \
             /opt/lexora/service/web_pdf.py
+          (cd /opt/lexora && python3 -c \
+            'import service.server; from service.progress_validation import validate_top20k_quality_snapshot')
 
           if systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
             | grep -q lexora-lexicon-micro; then

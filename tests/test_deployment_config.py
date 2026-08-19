@@ -118,8 +118,12 @@ class DeploymentConfigTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('if ! snapshot_valid; then', workflow)
         self.assertIn('systemctl start "$quality_unit"', workflow)
-        self.assertIn('value["qualityGateVersion"] == 2', workflow)
-        self.assertIn('value["candidateDigest"] == digest', workflow)
+        self.assertIn(
+            "from service.progress_validation import validate_top20k_quality_snapshot",
+            workflow,
+        )
+        self.assertIn("validate_top20k_quality_snapshot(", workflow)
+        self.assertIn("progress_validation_target", workflow)
         self.assertIn('-p ExecMainCode -p ExecMainStatus', workflow)
         self.assertIn('journalctl -u "$quality_unit"', workflow)
         self.assertIn(

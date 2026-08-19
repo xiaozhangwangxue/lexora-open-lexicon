@@ -6,17 +6,25 @@ import sqlite3
 import re
 import threading
 import time
-from datetime import date, datetime, timezone
+from datetime import date
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field, field_validator
 from fastapi.responses import FileResponse, JSONResponse
+from service.progress_validation import validate_top20k_quality_snapshot
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
 STATE = ROOT / "state"
+TOP20K_CANDIDATE = Path(
+    os.environ.get(
+        "LEXORA_TOP20K_CANDIDATE",
+        ROOT
+        / "deployments/repair/current/build/lexora-open-oxford-safe-20k.sqlite",
+    )
+)
 ORIGIN_TOKEN = os.environ.get("LEXORA_ORIGIN_TOKEN", "")
 USAGE_DB = Path(os.environ.get("LEXORA_WEB_USAGE_DB", ROOT / "state" / "web-usage.sqlite"))
 WEB_LOOKUP_DAILY_LIMIT = int(os.environ.get("LEXORA_WEB_LOOKUP_DAILY_LIMIT", "10000"))
@@ -119,6 +127,7 @@ def lookup_entry(term: str, dataset: str = "oxford") -> dict[str, Any]:
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
+
 @app.get("/v1/progress")
 def collection_progress() -> dict[str, Any]:
     """Return this origin's cached shard progress without touching the live DB."""
@@ -161,40 +170,15 @@ def collection_progress() -> dict[str, Any]:
 
     quality_path = STATE / f"top20k-quality-shard-{shard}.json"
     try:
-        quality = json.loads(quality_path.read_text(encoding="utf-8"))
-        quality_updated_at = datetime.fromisoformat(
-            str(quality["updatedAt"]).replace("Z", "+00:00")
+        quality = validate_top20k_quality_snapshot(
+            quality_path,
+            BUILD / "lexora-open-oxford-scope.sqlite",
+            TOP20K_CANDIDATE,
+            shard_index=shard,
         )
-        if quality_updated_at.tzinfo is None:
-            quality_updated_at = quality_updated_at.replace(tzinfo=timezone.utc)
-        if (datetime.now(timezone.utc) - quality_updated_at).total_seconds() > 3 * 3600:
-            raise ValueError("quality snapshot is stale")
-        identity = quality["datasetIdentity"]
-        dataset_stat = (BUILD / "lexora-open-oxford-scope.sqlite").stat()
-        if (
-            int(identity["device"]) != dataset_stat.st_dev
-            or int(identity["inode"]) != dataset_stat.st_ino
-        ):
-            raise ValueError("quality snapshot belongs to a different dataset")
-        raw_counts = (
-            quality["total"],
-            quality["complete"],
-            quality["incomplete"],
-        )
-        if any(type(value) is not int or value < 0 for value in raw_counts):
-            raise ValueError("quality snapshot counts are invalid")
-        quality_total, quality_complete, quality_incomplete = raw_counts
-        quality_shard_index = quality["shardIndex"]
-        quality_shard_count = quality["shardCount"]
-        if type(quality_shard_index) is not int or type(quality_shard_count) is not int:
-            raise ValueError("quality snapshot shard identity is invalid")
-        candidate_digest = quality.get("candidateDigest")
-        if quality_shard_index != shard or quality_shard_count != 2:
-            raise ValueError("quality snapshot shard identity is invalid")
-        if candidate_digest is not None and not isinstance(candidate_digest, str):
-            raise ValueError("quality snapshot candidate digest is invalid")
-        if quality_complete + quality_incomplete != quality_total:
-            raise ValueError("quality counts do not add up")
+        quality_total = quality["total"]
+        quality_complete = quality["complete"]
+        quality_incomplete = quality["incomplete"]
         result["top20k"] = {
             "total": quality_total,
             "complete": quality_complete,
@@ -210,12 +194,19 @@ def collection_progress() -> dict[str, Any]:
             "entryStatus": quality.get("entryStatus", {}),
             "unresolved": quality.get("unresolved", []),
             "updatedAt": quality.get("updatedAt"),
-            "qualityGateVersion": quality.get("qualityGateVersion", 1),
-            "candidateDigest": candidate_digest,
-            "shardIndex": quality_shard_index,
-            "shardCount": quality_shard_count,
+            "qualityGateVersion": quality["qualityGateVersion"],
+            "candidateDigest": quality["candidateDigest"],
+            "shardIndex": quality["shardIndex"],
+            "shardCount": quality["shardCount"],
         }
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+    ):
         result["top20k"] = None
     return result
 

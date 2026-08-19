@@ -59,6 +59,12 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertIn("verify-release", workflow)
         self.assertIn("import enrich_oxford_scope,top20k_quality", workflow)
         self.assertIn("lexora-top20k-quality-current.conf", workflow)
+        self.assertIn("progress_validation_target", workflow)
+        self.assertIn(
+            'restore_one "$progress_validation_target" progress_validation.py',
+            workflow,
+        )
+        self.assertIn("import service.server", workflow)
         self.assertIn("full_collector_before", workflow)
         self.assertIn("validate_collection_writer_state.py", workflow)
         self.assertIn('--full "$full_collector_after"', workflow)
@@ -69,6 +75,11 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertIn('sudo systemctl stop "$quality_unit"', workflow)
         self.assertIn("canceling stale queued quality snapshot job", workflow)
         self.assertIn("quality_job_after_cancel", workflow)
+        self.assertIn(
+            "from service.progress_validation import validate_top20k_quality_snapshot",
+            workflow,
+        )
+        self.assertIn("validate_top20k_quality_snapshot(", workflow)
         self.assertLess(
             workflow.index("sudo systemctl daemon-reload"),
             workflow.index("quality_job_after_reload"),
@@ -83,6 +94,18 @@ class DeploymentWorkflowTest(unittest.TestCase):
         )
         self.assertIn("trap - ERR", workflow)
         self.assertNotIn('sudo install -o opc -g opc -m 0755 "/tmp/$file"', workflow)
+
+    def test_web_parity_deploys_progress_validator_with_server(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "deploy-web-parity-api.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("service/progress_validation.py", workflow)
+        self.assertIn(
+            "for file in server.py progress_validation.py web_documents.py web_pdf.py",
+            workflow,
+        )
+        self.assertIn("/opt/lexora/service/progress_validation.py", workflow)
+        self.assertIn("import service.server", workflow)
 
     def test_repair_release_uses_digest_isolated_state_and_exact_writer_restore(
         self,
