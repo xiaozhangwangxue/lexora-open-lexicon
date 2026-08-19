@@ -31,7 +31,7 @@ jobs:
           printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 0600 ~/.ssh/known_hosts
 
-      - name: Read repair status and quality
+      - name: Read repair and snapshot service status
         shell: bash
         run: |
           timeout 360s ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
@@ -46,13 +46,16 @@ jobs:
             -p MainPID -p ActiveState -p SubState -p Result
           systemctl list-timers \
             lexora-top20k-repair@'${{ matrix.shard }}'.timer --no-pager || true
-          echo "quality_report_begin=$(date -u +%FT%TZ)"
-          timeout 300s python3 /opt/lexora/tools/top20k_quality.py \
-            --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
-            --shard-index '${{ matrix.shard }}' --shard-count 2 \
-            --unresolved-limit 200 --json || \
-            echo "quality_report=busy_or_timed_out"
-          echo "quality_report_end=$(date -u +%FT%TZ)"
+          quality=lexora-top20k-quality-snapshot@'${{ matrix.shard }}'.service
+          systemctl show "$quality" \
+            -p Id -p MainPID -p Job -p ActiveState -p SubState -p Result \
+            -p ExecMainCode -p ExecMainStatus -p ActiveEnterTimestamp \
+            -p InactiveEnterTimestamp -p TimeoutStartUSec
+          systemctl list-jobs --no-pager || true
+          ls -l --time-style=full-iso \
+            /opt/lexora/state/top20k-quality-shard-'${{ matrix.shard }}'.json \
+            2>/dev/null || echo "quality_snapshot=missing"
+          timeout 10s journalctl -u "$quality" -n 80 --no-pager || true
           timeout 10s journalctl -u lexora-top20k-repair@'${{ matrix.shard }}'.service \
             -n 12 --no-pager || echo "journal=busy_or_timed_out"
           REMOTE
