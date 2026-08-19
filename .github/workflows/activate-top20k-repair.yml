@@ -1,0 +1,151 @@
+name: Activate prepared top-20k repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Immutable release id emitted by the preparation workflow
+        required: true
+        type: string
+      candidate_sha256:
+        description: Exact candidate SHA-256 emitted by preparation
+        required: true
+        type: string
+      canonical_identity_sha256:
+        description: Exact canonical identity SHA-256 emitted by preparation
+        required: true
+        type: string
+      confirmation:
+        description: Type ACTIVATE_SAFE_TOP20K exactly
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lexora-oci-production-deployment
+  cancel-in-progress: false
+
+jobs:
+  activate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Validate immutable activation inputs
+        shell: bash
+        env:
+          RELEASE_ID: ${{ inputs.release_id }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha256 }}
+          CANONICAL_SHA: ${{ inputs.canonical_identity_sha256 }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = ACTIVATE_SAFE_TOP20K
+          [[ "$RELEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CANONICAL_SHA" =~ ^[0-9a-f]{64}$ ]]
+          printf 'RELEASE_ID=%s\nCANDIDATE_SHA=%s\nCANONICAL_SHA=%s\n' \
+            "$RELEASE_ID" "$CANDIDATE_SHA" "$CANONICAL_SHA" >> "$GITHUB_ENV"
+
+      - name: Prepare SSH credentials
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.LEXORA_OCI_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LEXORA_OCI_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lexora_oci
+          chmod 0600 ~/.ssh/lexora_oci
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Verify both sealed releases before changing either host
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p activation-receipts
+          hosts=(140.245.114.238 134.185.82.7)
+          for shard in 0 1; do
+            host=${hosts[$shard]}
+            release="/opt/lexora/deployments/repair/releases/$RELEASE_ID"
+            ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=8 "opc@$host" \
+              "bash -se -- '$release' '$RELEASE_ID' '$CANDIDATE_SHA' '$CANONICAL_SHA'" \
+              > "activation-receipts/preflight-$shard.json" <<'REMOTE'
+          set -euo pipefail
+          release=$1
+          release_id=$2
+          candidate_sha=$3
+          canonical_sha=$4
+          current_identity=$(python3 \
+            "$release/tools/sqlite_snapshot_manifest.py" identity \
+            --database /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["canonical"]["identitySha256"])')
+          test "$current_identity" = "$canonical_sha"
+          python3 "$release/deploy/deployment_transaction.py" \
+            --root /opt/lexora --track repair --release-id "$release_id" \
+            verify-release --candidate-sha256 "$candidate_sha" \
+            --canonical-identity-sha256 "$canonical_sha"
+          REMOTE
+          done
+          python3 - "$CANDIDATE_SHA" "$CANONICAL_SHA" \
+            activation-receipts/preflight-0.json activation-receipts/preflight-1.json <<'PY'
+          import json, sys
+          candidate, canonical, *paths = sys.argv[1:]
+          reports = [json.load(open(path, encoding="utf-8")) for path in paths]
+          assert all(report["verified"] for report in reports)
+          assert {report["candidate"]["sha256"] for report in reports} == {candidate}
+          assert {report["canonical"]["identitySha256"] for report in reports} == {canonical}
+          PY
+
+      - name: Activate both hosts with coordinator rollback
+        shell: bash
+        run: |
+          set -euo pipefail
+          hosts=(140.245.114.238 134.185.82.7)
+          activated=()
+          rollback_activated() {
+            local item host shard release control
+            for ((index=${#activated[@]}-1; index>=0; index--)); do
+              item=${activated[$index]}
+              host=${item%%:*}
+              shard=${item##*:}
+              release="/opt/lexora/deployments/repair/releases/$RELEASE_ID"
+              control="$release/deploy/top20k_release_control.sh"
+              ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+                -o ConnectTimeout=30 -o ServerAliveInterval=15 \
+                -o ServerAliveCountMax=8 "opc@$host" \
+                "bash '$control' rollback '$RELEASE_ID' '$shard' '$CANDIDATE_SHA' '$CANONICAL_SHA'" \
+                || true
+            done
+          }
+          on_error() {
+            status=$?
+            trap - ERR
+            rollback_activated
+            exit "$status"
+          }
+          trap on_error ERR
+          for shard in 0 1; do
+            host=${hosts[$shard]}
+            release="/opt/lexora/deployments/repair/releases/$RELEASE_ID"
+            control="$release/deploy/top20k_release_control.sh"
+            # Record the host before entering SSH.  A lost connection can
+            # happen after the remote atomic switch; rollback must still be
+            # attempted for that host.
+            activated+=("$host:$shard")
+            ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=8 "opc@$host" \
+              "bash '$control' activate '$RELEASE_ID' '$shard' '$CANDIDATE_SHA' '$CANONICAL_SHA'"
+          done
+          for shard in 0 1; do
+            host=${hosts[$shard]}
+            ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 "opc@$host" \
+              "test \"\$(sha256sum /opt/lexora/deployments/repair/current/build/lexora-open-oxford-safe-20k.sqlite | awk '{print \$1}')\" = '$CANDIDATE_SHA'"
+          done
+          trap - ERR
+          printf 'activated_hosts=%s\n' "${activated[*]}" >> "$GITHUB_STEP_SUMMARY"

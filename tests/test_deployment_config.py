@@ -110,23 +110,27 @@ class DeploymentConfigTest(unittest.TestCase):
         self.assertIn("TimeoutStartSec=12min", service)
         self.assertIn("top20k-quality-shard-%i.json", service)
         self.assertIn("OnUnitActiveSec=60min", timer)
+        self.assertNotIn("After=lexora-progress-snapshot@", service)
 
-    def test_progress_deploy_does_not_block_on_quality_scan(self) -> None:
+    def test_progress_deploy_requires_a_current_atomic_quality_snapshot(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "deploy-progress-details.yml"
         ).read_text(encoding="utf-8")
+        self.assertIn('if ! snapshot_valid; then', workflow)
+        self.assertIn('systemctl start "$quality_unit"', workflow)
         self.assertIn(
-            'systemctl start --no-block "$quality_unit"',
+            "from service.progress_validation import validate_top20k_quality_snapshot",
             workflow,
         )
+        self.assertIn("validate_top20k_quality_snapshot(", workflow)
+        self.assertIn("progress_validation_target", workflow)
+        self.assertIn('-p ExecMainCode -p ExecMainStatus', workflow)
+        self.assertIn('journalctl -u "$quality_unit"', workflow)
         self.assertIn(
             'systemctl enable --now "$quality_timer"',
             workflow,
         )
-        self.assertNotIn(
-            'systemctl stop "$quality_timer"',
-            workflow,
-        )
+        self.assertNotIn('systemctl stop "$quality_timer"', workflow)
 
     def test_edge_smoke_allows_atomic_quality_snapshot_to_finish_later(self) -> None:
         script = (
@@ -136,6 +140,18 @@ class DeploymentConfigTest(unittest.TestCase):
         self.assertIn('if top["available"]:', script)
         self.assertIn('assert top["total"] == 20_000', script)
         self.assertNotIn('assert top["available"] is True', script)
+
+    def test_fast20k_repair_service_consumes_exact_queue_ids(self) -> None:
+        service = (
+            ROOT / "deploy" / "lexora-top20k-repair@.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "--repair-queue "
+            "/opt/lexora/build/lexora-open-oxford-safe-20k.sqlite",
+            service,
+        )
+        self.assertIn("--quality-repair-only", service)
+        self.assertNotIn("--max-frequency-rank", service)
 
 
 if __name__ == "__main__":

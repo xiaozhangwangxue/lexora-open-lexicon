@@ -15,8 +15,9 @@ Environment=LEXORA_EDGE_URL=https://dict.12323456.xyz/internal
 ExecStart=/usr/bin/python3 /opt/lexora/tools/enrich_oxford_scope.py \
   --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
   --state /opt/lexora/state/top20k-repair-shard-%i.sqlite \
+  --repair-queue /opt/lexora/build/lexora-open-oxford-safe-20k.sqlite \
   --shard-index %i --shard-count 2 \
-  --profile core --max-frequency-rank 20000 --quality-repair-only \
+  --profile core --quality-repair-only \
   --workers 8 --delay 16 --translation-delay 16 --retry-after-hours 0
 ExecStopPost=+/usr/bin/systemctl start --no-block lexora-enrich-micro@%i.service
 Nice=10

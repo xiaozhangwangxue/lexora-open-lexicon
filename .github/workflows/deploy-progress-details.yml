@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: lexora-oci-production-deployment
+  cancel-in-progress: false
+
 jobs:
   origins:
     runs-on: ubuntu-latest
@@ -36,14 +40,21 @@ jobs:
       - name: Upload progress files
         shell: bash
         run: |
+          find tools service deploy -type f \
+            \( -name '*.py' -o -name '*.service' -o -name '*.timer' \
+               -o -name '*.conf' -o -name '*.sh' \) -print0 \
+            | sort -z \
+            | tar --null --files-from=- --create --gzip \
+                --sort=name --mtime='UTC 1970-01-01' \
+                --owner=0 --group=0 --numeric-owner \
+                --file=/tmp/lexora-progress-code.tar.gz
+          code_sha=$(sha256sum /tmp/lexora-progress-code.tar.gz | awk '{print $1}')
+          printf '%s\n' "$code_sha" > /tmp/lexora-progress-code.sha256
           scp -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
             -o ConnectTimeout=30 \
-            service/server.py \
-            tools/enrich_oxford_scope.py \
-            tools/top20k_quality.py \
-            tools/write_top20k_quality_snapshot.py \
-            deploy/lexora-top20k-quality-snapshot@.service \
-            deploy/lexora-top20k-quality-snapshot@.timer \
+            /tmp/lexora-progress-code.tar.gz \
+            /tmp/lexora-progress-code.sha256 \
+            deploy/deployment_transaction.py \
             "opc@${{ matrix.host }}:/tmp/"
 
       - name: Install and verify without disturbing collection
@@ -55,61 +66,221 @@ jobs:
             'bash -se' <<'REMOTE'
           set -euo pipefail
           shard='${{ matrix.shard }}'
-          stamp=$(date -u +%Y%m%dT%H%M%SZ)
-          collector="lexora-enrich-micro@${shard}.service"
-          repair="lexora-top20k-repair@${shard}.service"
-          collector_before=$(systemctl is-active "$collector" || true)
-          repair_before=$(systemctl is-active "$repair" || true)
-
-          sudo install -d -o opc -g opc -m 0755 \
-            /opt/lexora/service /opt/lexora/tools /opt/lexora/state
-          for file in server.py; do
-            if [ -f "/opt/lexora/service/$file" ]; then
-              sudo cp -a "/opt/lexora/service/$file" \
-                "/opt/lexora/service/$file.pre-progress-$stamp"
-            fi
-            sudo install -o opc -g opc -m 0644 "/tmp/$file" \
-              "/opt/lexora/service/$file"
-          done
-          for file in enrich_oxford_scope.py top20k_quality.py \
-            write_top20k_quality_snapshot.py; do
-            if [ -f "/opt/lexora/tools/$file" ]; then
-              sudo cp -a "/opt/lexora/tools/$file" \
-                "/opt/lexora/tools/$file.pre-progress-$stamp"
-            fi
-            sudo install -o opc -g opc -m 0755 "/tmp/$file" \
-              "/opt/lexora/tools/$file"
-          done
-          sudo install -m 0644 \
-            /tmp/lexora-top20k-quality-snapshot@.service \
-            /etc/systemd/system/lexora-top20k-quality-snapshot@.service
-          sudo install -m 0644 \
-            /tmp/lexora-top20k-quality-snapshot@.timer \
-            /etc/systemd/system/lexora-top20k-quality-snapshot@.timer
-
-          python3 -m py_compile \
-            /opt/lexora/service/server.py \
-            /opt/lexora/tools/enrich_oxford_scope.py \
-            /opt/lexora/tools/top20k_quality.py \
-            /opt/lexora/tools/write_top20k_quality_snapshot.py
-          sudo systemctl daemon-reload
+          release_id="progress-${{ github.sha }}-${{ github.run_id }}-$shard"
+          transaction=/tmp/deployment_transaction.py
+          code_sha=$(cat /tmp/lexora-progress-code.sha256)
+          python3 "$transaction" --root /opt/lexora --track progress \
+            --release-id "$release_id" prepare-code \
+            --archive /tmp/lexora-progress-code.tar.gz \
+            --archive-sha256 "$code_sha" \
+            --imports enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot
+          python3 "$transaction" --root /opt/lexora --track progress \
+            --release-id "$release_id" seal
+          python3 "$transaction" --root /opt/lexora --track progress \
+            --release-id "$release_id" verify-release
+          release="/opt/lexora/deployments/progress/releases/$release_id"
+          backup="/opt/lexora/deployments/progress/systemd-backups/$release_id"
+          test ! -e "$backup"
+          install -d -m 0750 "$backup"
+          server_target=/opt/lexora/service/server.py
+          progress_validation_target=/opt/lexora/service/progress_validation.py
+          quality_main=/etc/systemd/system/lexora-top20k-quality-snapshot@.service
+          quality_timer_file=/etc/systemd/system/lexora-top20k-quality-snapshot@.timer
+          quality_dropin=/etc/systemd/system/lexora-top20k-quality-snapshot@.service.d/10-current-release.conf
           quality_unit="lexora-top20k-quality-snapshot@${shard}.service"
           quality_timer="lexora-top20k-quality-snapshot@${shard}.timer"
-          quality_path="/opt/lexora/state/top20k-quality-shard-${shard}.json"
-          # A strict scan on the smallest OCI instance may take several
-          # minutes while collection is writing.  Deployment must not block on
-          # it or start a duplicate scan.  The API deliberately reports
-          # top20k=null until the atomic snapshot is ready, and clients label a
-          # one-shard result as incomplete.
-          sudo systemctl enable --now "$quality_timer"
-          sudo systemctl start --no-block "$quality_unit" || true
-
           if systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
             | grep -q lexora-lexicon-micro; then
             api_unit=lexora-lexicon-micro.service
           else
             api_unit=lexora-lexicon.service
           fi
+          api_active_before=$(systemctl is-active "$api_unit" || true)
+          save_one() {
+            target=$1
+            name=$2
+            if [ -e "$target" ]; then
+              sudo cp -a "$target" "$backup/$name"
+            else
+              : > "$backup/$name.absent"
+            fi
+          }
+          restore_one() {
+            target=$1
+            name=$2
+            if [ -e "$backup/$name" ]; then
+              sudo cp -a "$backup/$name" "$target"
+            elif [ -e "$backup/$name.absent" ]; then
+              sudo rm -f -- "$target"
+            else
+              return 1
+            fi
+          }
+          sudo install -d -o opc -g opc -m 0755 \
+            /opt/lexora/service /opt/lexora/state
+          sudo install -d -m 0755 \
+            /etc/systemd/system/lexora-top20k-quality-snapshot@.service.d
+          save_one "$server_target" server.py
+          save_one "$progress_validation_target" progress_validation.py
+          save_one "$quality_main" quality.service
+          save_one "$quality_timer_file" quality.timer
+          save_one "$quality_dropin" quality.conf
+          timer_active_before=$(systemctl is-active "$quality_timer" || true)
+          timer_enabled_before=$(systemctl is-enabled "$quality_timer" || true)
+          rollback_progress() {
+            status=$?
+            trap - ERR
+            sudo systemctl stop "$quality_unit" "$quality_timer" || true
+            python3 "$release/deploy/deployment_transaction.py" \
+              --root /opt/lexora --track progress --release-id "$release_id" \
+              rollback || true
+            restore_one "$server_target" server.py || true
+            restore_one "$progress_validation_target" progress_validation.py || true
+            restore_one "$quality_main" quality.service || true
+            restore_one "$quality_timer_file" quality.timer || true
+            restore_one "$quality_dropin" quality.conf || true
+            sudo systemctl daemon-reload || true
+            if [ "$timer_enabled_before" = enabled ]; then
+              sudo systemctl enable "$quality_timer" || true
+            else
+              sudo systemctl disable "$quality_timer" || true
+            fi
+            if [ "$timer_active_before" = active ]; then
+              sudo systemctl start "$quality_timer" || true
+            fi
+            if [ "$api_active_before" = active ]; then
+              sudo systemctl restart "$api_unit" || true
+            else
+              sudo systemctl stop "$api_unit" || true
+            fi
+            exit "$status"
+          }
+          trap rollback_progress ERR
+          python3 "$transaction" --root /opt/lexora --track progress \
+            --release-id "$release_id" activate
+          collector="lexora-enrich-micro@${shard}.service"
+          full_collector="lexora-enrich@${shard}.service"
+          repair="lexora-top20k-repair@${shard}.service"
+          collector_before=$(systemctl is-active "$collector" || true)
+          full_collector_before=$(systemctl is-active "$full_collector" || true)
+          repair_before=$(systemctl is-active "$repair" || true)
+
+          sudo install -o opc -g opc -m 0644 "$release/service/server.py" \
+            "$server_target"
+          sudo install -o opc -g opc -m 0644 \
+            "$release/service/progress_validation.py" \
+            "$progress_validation_target"
+          sudo install -m 0644 \
+            "$release/deploy/lexora-top20k-quality-snapshot@.service" \
+            "$quality_main"
+          sudo install -m 0644 \
+            "$release/deploy/lexora-top20k-quality-snapshot@.timer" \
+            "$quality_timer_file"
+          sudo install -m 0644 \
+            "$release/deploy/lexora-top20k-quality-current.conf" \
+            "$quality_dropin"
+
+          python3 -m py_compile \
+            /opt/lexora/service/server.py \
+            /opt/lexora/service/progress_validation.py \
+            /opt/lexora/deployments/progress/current/tools/enrich_oxford_scope.py \
+            /opt/lexora/deployments/progress/current/tools/top20k_quality.py \
+            /opt/lexora/deployments/progress/current/tools/write_top20k_quality_snapshot.py
+          (cd /opt/lexora && python3 -c \
+            'import service.server; from service.progress_validation import validate_top20k_quality_snapshot')
+          PYTHONPATH=/opt/lexora/deployments/progress/current/tools \
+            python3 -c 'import enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot'
+          sudo systemctl daemon-reload
+          quality_active_after_reload=$(systemctl show "$quality_unit" \
+            -p ActiveState --value || true)
+          quality_sub_after_reload=$(systemctl show "$quality_unit" \
+            -p SubState --value || true)
+          quality_job_after_reload=$(systemctl show "$quality_unit" \
+            -p Job --value || true)
+          quality_main_pid_after_reload=$(systemctl show "$quality_unit" \
+            -p MainPID --value || true)
+          printf 'quality_active_after_reload=%s\n' "$quality_active_after_reload"
+          printf 'quality_sub_after_reload=%s\n' "$quality_sub_after_reload"
+          printf 'quality_job_after_reload=%s\n' "$quality_job_after_reload"
+          printf 'quality_main_pid_after_reload=%s\n' \
+            "$quality_main_pid_after_reload"
+          case "$quality_job_after_reload" in
+            ""|0) ;;
+            *)
+              case "$quality_active_after_reload:$quality_main_pid_after_reload" in
+                inactive:0|activating:0)
+                  echo "canceling stale queued quality snapshot job"
+                  sudo systemctl stop "$quality_unit" || true
+                  sudo systemctl reset-failed "$quality_unit" || true
+                  quality_job_after_cancel=$(systemctl show "$quality_unit" \
+                    -p Job --value || true)
+                  printf 'quality_job_after_cancel=%s\n' \
+                    "$quality_job_after_cancel"
+                  sudo systemctl show "$quality_unit" -p ActiveState \
+                    -p SubState -p Job -p Result -p ExecMainCode \
+                    -p ExecMainStatus || true
+                  sudo journalctl -u "$quality_unit" -n 40 --no-pager || true
+                  case "$quality_job_after_cancel" in
+                    ""|0) ;;
+                    *) echo "quality snapshot job remained queued" >&2; exit 1 ;;
+                  esac
+                  ;;
+              esac
+              ;;
+          esac
+          quality_path="/opt/lexora/state/top20k-quality-shard-${shard}.json"
+          candidate_path="/opt/lexora/deployments/repair/current/build/lexora-open-oxford-safe-20k.sqlite"
+          snapshot_valid() {
+            PYTHONPATH="$release" python3 - \
+              "$quality_path" "$candidate_path" "$shard" <<'PY'
+          import sys
+          from pathlib import Path
+          from service.progress_validation import validate_top20k_quality_snapshot
+
+          snapshot, candidate, shard = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+          validate_top20k_quality_snapshot(
+              snapshot,
+              Path("/opt/lexora/build/lexora-open-oxford-scope.sqlite"),
+              candidate,
+              shard_index=shard,
+          )
+          PY
+          }
+          if ! snapshot_valid; then
+            # A deployment without a current, candidate-bound atomic snapshot
+            # is incomplete.  Wait for any older invocation, then start this
+            # oneshot synchronously; its unit-level 12 minute timeout remains
+            # the upper bound.
+            deadline=$((SECONDS + 750))
+            while systemctl is-active --quiet "$quality_unit"; do
+              if (( SECONDS >= deadline )); then
+                echo "existing quality scan exceeded deployment wait" >&2
+                exit 1
+              fi
+              sleep 2
+            done
+            if ! snapshot_valid; then
+              sudo systemctl reset-failed "$quality_unit" || true
+              quality_started_at=$(date --utc +%Y-%m-%dT%H:%M:%SZ)
+              printf 'quality_job_started_at=%s\n' "$quality_started_at"
+              if ! sudo systemctl start "$quality_unit"; then
+                sudo systemctl show "$quality_unit" -p ActiveState -p SubState \
+                  -p Job -p Result -p ExecMainCode -p ExecMainStatus \
+                  -p ActiveEnterTimestamp -p InactiveEnterTimestamp || true
+                sudo journalctl -u "$quality_unit" \
+                  --since "$quality_started_at" -n 160 --no-pager || true
+                exit 1
+              fi
+              sudo systemctl show "$quality_unit" -p ActiveState -p SubState \
+                -p Job -p Result -p ExecMainCode -p ExecMainStatus \
+                -p ActiveEnterTimestamp -p InactiveEnterTimestamp
+              sudo journalctl -u "$quality_unit" \
+                --since "$quality_started_at" -n 80 --no-pager || true
+              snapshot_valid
+            fi
+          fi
+          sudo systemctl enable --now "$quality_timer"
+
           sudo systemctl restart "$api_unit"
           health_ok=0
           for attempt in $(seq 1 20); do
@@ -125,36 +296,34 @@ jobs:
             exit 1
           fi
           cat /tmp/lexora-health.json
-          python3 - <<PY
-          import json
-          from pathlib import Path
-          path = Path("/opt/lexora/state/top20k-quality-shard-${shard}.json")
-          if path.exists():
-              value = json.loads(path.read_text())
-              assert value["total"] > 0
-              assert value["complete"] + value["incomplete"] == value["total"]
-              print(json.dumps({
-                  "shard": ${shard},
-                  "complete": value["complete"],
-                  "total": value["total"],
-                  "percent": value["percent"],
-              }, sort_keys=True))
-          else:
-              print(json.dumps({
-                  "shard": ${shard},
-                  "top20k": "generating",
-              }, sort_keys=True))
+          snapshot_valid
+          python3 - "$quality_path" <<'PY'
+          import json, sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          print(json.dumps({
+              "shard": value["shardIndex"],
+              "candidateDigest": value["candidateDigest"],
+              "complete": value["complete"],
+              "total": value["total"],
+              "percent": value["percent"],
+          }, sort_keys=True))
           PY
           systemctl show "$quality_unit" -p ActiveState -p SubState -p Result
           systemctl is-active "$api_unit"
           collector_after=$(systemctl is-active "$collector" || true)
+          full_collector_after=$(systemctl is-active "$full_collector" || true)
           repair_after=$(systemctl is-active "$repair" || true)
           printf 'collector_before=%s\ncollector_after=%s\n' \
             "$collector_before" "$collector_after"
           printf 'repair_before=%s\nrepair_after=%s\n' \
             "$repair_before" "$repair_after"
-          case "$collector_after:$repair_after" in
-            active:inactive|inactive:active|inactive:activating) ;;
-            *) echo "unexpected collection state"; exit 1 ;;
-          esac
+          printf 'full_collector_before=%s\nfull_collector_after=%s\n' \
+            "$full_collector_before" "$full_collector_after"
+          python3 "$release/tools/validate_collection_writer_state.py" \
+            --micro "$collector_after" \
+            --full "$full_collector_after" \
+            --repair "$repair_after" \
+            --progress-snapshot \
+              "/opt/lexora/state/progress-shard-${shard}.json"
+          trap - ERR
           REMOTE

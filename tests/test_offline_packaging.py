@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -85,6 +86,30 @@ def build_source(path: Path) -> None:
 
 
 class OfflinePackagingTest(unittest.TestCase):
+    def test_include_full_is_rejected_before_creating_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "release"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "package_offline_lexicons.py"),
+                    "--source",
+                    str(root / "missing.sqlite"),
+                    "--output-dir",
+                    str(output),
+                    "--version",
+                    "test",
+                    "--include-full",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--include-full is disabled", result.stderr)
+            self.assertFalse(output.exists())
+
     def test_fast_package_gate_rejects_missing_required_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.sqlite"

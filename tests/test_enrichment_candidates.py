@@ -1440,6 +1440,8 @@ class CandidateBatchTest(unittest.TestCase):
             ),
             ["pos", "phonetic"],
         )
+        self.assertTrue(enrichment.needs_phonetic_repair("W ER1 D"))
+        self.assertTrue(enrichment.needs_phonetic_repair("w\ufffdrd"))
 
     def test_translation_quality_rejects_untranslated_or_truncated_text(self) -> None:
         source = (
