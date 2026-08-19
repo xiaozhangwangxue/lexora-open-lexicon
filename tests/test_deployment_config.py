@@ -104,8 +104,9 @@ class DeploymentConfigTest(unittest.TestCase):
         timer = (
             ROOT / "deploy" / "lexora-top20k-quality-snapshot@.timer"
         ).read_text(encoding="utf-8")
-        self.assertIn("Nice=19", service)
-        self.assertIn("IOSchedulingClass=idle", service)
+        self.assertIn("Nice=15", service)
+        self.assertIn("IOSchedulingClass=best-effort", service)
+        self.assertIn("IOSchedulingPriority=7", service)
         self.assertIn("TimeoutStartSec=12min", service)
         self.assertIn("top20k-quality-shard-%i.json", service)
         self.assertIn("OnUnitActiveSec=60min", timer)
