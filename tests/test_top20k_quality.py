@@ -30,6 +30,7 @@ class Top20kQualityTest(unittest.TestCase):
                   frequency_rank INTEGER,
                   enrichment_json TEXT
                 );
+                CREATE INDEX idx_entries_freq ON entries(frequency_rank);
                 """
             )
             database.executemany(

@@ -52,7 +52,8 @@ def quality_report(
         rows = database.execute(
             "SELECT normalized_word,definition,definition_zh,us_phonetic,"
             "uk_phonetic,pos,COALESCE(json_extract(enrichment_json,"
-            "'$.status'),'pending') FROM entries WHERE "
+            "'$.status'),'pending') FROM entries INDEXED BY "
+            "idx_entries_freq WHERE "
             + " AND ".join(clauses)
             + " ORDER BY frequency_rank,id",
             params,
