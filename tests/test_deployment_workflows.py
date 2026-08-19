@@ -45,6 +45,14 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertNotIn("systemctl start", workflow)
         self.assertNotIn("systemctl enable", workflow)
 
+    def test_preparation_exports_both_large_snapshots_in_parallel(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "deploy-top20k-repair.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("timeout-minutes: 120", workflow)
+        self.assertIn('snapshot_one "$shard" &', workflow)
+        self.assertIn('wait "$pid" || status=1', workflow)
+
     def test_activation_verifies_both_before_switch_and_has_rollback(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "activate-top20k-repair.yml"

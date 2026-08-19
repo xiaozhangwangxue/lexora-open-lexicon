@@ -22,7 +22,7 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
 
@@ -80,10 +80,11 @@ jobs:
         run: |
           set -euo pipefail
           hosts=(140.245.114.238 134.185.82.7)
-          for shard in 0 1; do
-            host=${hosts[$shard]}
-            remote_tmp="/tmp/lexora-safe-${RELEASE_ID}-${GITHUB_RUN_ID}"
-            ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+          snapshot_one() {
+            local shard=$1
+            local host=${hosts[$shard]}
+            local remote_tmp="/tmp/lexora-safe-${RELEASE_ID}-${GITHUB_RUN_ID}"
+            local -a ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
               -o ConnectTimeout=30 -o ServerAliveInterval=30 \
               -o ServerAliveCountMax=30)
             ssh "${ssh_opts[@]}" "opc@$host" \
@@ -114,7 +115,17 @@ jobs:
             scp "${ssh_opts[@]}" \
               "opc@$host:$remote_tmp/canonical.json" \
               "deployment-receipts/canonical-$shard.json"
+          }
+          pids=()
+          for shard in 0 1; do
+            snapshot_one "$shard" &
+            pids+=("$!")
           done
+          status=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || status=1
+          done
+          exit "$status"
 
       - name: Require the same immutable canonical corpus on both servers
         shell: bash
