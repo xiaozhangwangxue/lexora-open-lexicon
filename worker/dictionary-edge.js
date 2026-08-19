@@ -229,6 +229,17 @@ async function combinedProgressResponse(request, env) {
     [env.PRIMARY_ORIGIN, "primary"],
     [env.SECONDARY_ORIGIN, "secondary"],
   ].filter(([origin]) => Boolean(origin));
+  const expectedShardIds = [0, 1];
+  if (origins.length !== expectedShardIds.length) {
+    return withCors(
+      Response.json(
+        { detail: "collection progress temporarily unavailable" },
+        { status: 503, headers: { "Cache-Control": "no-store" } },
+      ),
+      "progress",
+      "MISS",
+    );
+  }
   const results = await Promise.allSettled(
     origins.map(async ([origin, name]) => {
       const target = new URL("/v1/progress", origin);
@@ -270,13 +281,9 @@ async function combinedProgressResponse(request, env) {
     )
     .sort((left, right) => left.shard - right.shard);
   const shardIds = new Set(shards.map((shard) => shard.shard));
-  const expectedShardIds = Array.from(
-    { length: origins.length },
-    (_, index) => index,
-  );
   if (
-    shards.length !== origins.length ||
-    shardIds.size !== origins.length ||
+    shards.length !== expectedShardIds.length ||
+    shardIds.size !== expectedShardIds.length ||
     !expectedShardIds.every((shard) => shardIds.has(shard))
   ) {
     return withCors(
@@ -306,34 +313,65 @@ async function combinedProgressResponse(request, env) {
     values.filter(Boolean).sort().at(-1) || null;
   const qualityShards = shards
     .filter((shard) => shard.top20k && typeof shard.top20k === "object")
-    .map((shard) => ({ shard: shard.shard, ...shard.top20k }));
+    .map((shard) => ({ ...shard.top20k, outerShard: shard.shard }));
+  const finiteNonnegativeInteger = (value) =>
+    typeof value === "number" && Number.isInteger(value) && value >= 0;
+  const safeQualityCount = (value) =>
+    finiteNonnegativeInteger(value) ? value : 0;
+  const qualityCountsValid = qualityShards.every(
+    (shard) =>
+      finiteNonnegativeInteger(shard.total) &&
+      Number(shard.total) > 0 &&
+      finiteNonnegativeInteger(shard.complete) &&
+      finiteNonnegativeInteger(shard.incomplete) &&
+      Number(shard.complete) + Number(shard.incomplete) ===
+        Number(shard.total),
+  );
+  const qualityShardIds = new Set(
+    qualityShards.map((shard) => shard.shardIndex),
+  );
+  const qualityShardIdentityValid =
+    qualityShards.length === expectedShardIds.length &&
+    qualityShardIds.size === expectedShardIds.length &&
+    expectedShardIds.every((shard) => qualityShardIds.has(shard)) &&
+    qualityShards.every(
+      (shard) =>
+        shard.shardCount === expectedShardIds.length &&
+        shard.shardIndex === shard.outerShard,
+    );
   const qualityTotal = qualityShards.reduce(
-    (sum, shard) => sum + Number(shard.total || 0),
+    (sum, shard) => sum + safeQualityCount(shard.total),
     0,
   );
   const qualityComplete = qualityShards.reduce(
-    (sum, shard) => sum + Number(shard.complete || 0),
+    (sum, shard) => sum + safeQualityCount(shard.complete),
     0,
   );
   const qualityIncomplete = qualityShards.reduce(
-    (sum, shard) => sum + Number(shard.incomplete || 0),
+    (sum, shard) => sum + safeQualityCount(shard.incomplete),
     0,
   );
   const qualityGateVersions = new Set(
-    qualityShards.map((shard) => Number(shard.qualityGateVersion || 0)),
+    qualityShards.map((shard) => shard.qualityGateVersion),
   );
   const qualityGateVersion =
     qualityGateVersions.size === 1 ? [...qualityGateVersions][0] : null;
   const candidateDigests = new Set(
-    qualityShards.map((shard) => String(shard.candidateDigest || "")),
+    qualityShards.map((shard) => shard.candidateDigest),
   );
-  const candidateDigest =
+  const onlyCandidateDigest =
     candidateDigests.size === 1 ? [...candidateDigests][0] : null;
+  const matchingCandidateDigest =
+    typeof onlyCandidateDigest === "string" && onlyCandidateDigest.trim()
+      ? onlyCandidateDigest
+      : null;
   const qualityAvailable =
-    qualityShards.length === origins.length &&
+    qualityShardIdentityValid &&
+    qualityCountsValid &&
     Number.isInteger(qualityGateVersion) &&
-    qualityGateVersion > 0 &&
-    Boolean(candidateDigest);
+    qualityGateVersion >= 2 &&
+    Boolean(matchingCandidateDigest);
+  const candidateDigest = qualityAvailable ? matchingCandidateDigest : null;
   const top20k = {
     available: qualityAvailable,
     ready:
@@ -360,15 +398,27 @@ async function combinedProgressResponse(request, env) {
     unresolved: qualityShards
       .flatMap((shard) =>
         Array.isArray(shard.unresolved)
-          ? shard.unresolved.map((item) => ({ ...item, shard: shard.shard }))
+          ? shard.unresolved.map((item) => ({
+              ...item,
+              shard: Number.isInteger(shard.shardIndex)
+                ? shard.shardIndex
+                : null,
+            }))
           : [],
       )
       .slice(0, 12),
     shards: qualityShards.map((shard) => ({
-      shard: shard.shard,
-      total: Number(shard.total || 0),
-      complete: Number(shard.complete || 0),
-      incomplete: Number(shard.incomplete || 0),
+      shard: Number.isInteger(shard.shardIndex) ? shard.shardIndex : null,
+      shardIndex: Number.isInteger(shard.shardIndex)
+        ? shard.shardIndex
+        : null,
+      shardCount: Number.isInteger(shard.shardCount)
+        ? shard.shardCount
+        : null,
+      outerShard: shard.outerShard,
+      total: safeQualityCount(shard.total),
+      complete: safeQualityCount(shard.complete),
+      incomplete: safeQualityCount(shard.incomplete),
       percent: Number(shard.percent || 0),
       updatedAt: shard.updatedAt || null,
     })),

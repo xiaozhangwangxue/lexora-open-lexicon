@@ -60,6 +60,27 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertIn("import enrich_oxford_scope,top20k_quality", workflow)
         self.assertIn("lexora-top20k-quality-current.conf", workflow)
         self.assertIn("full_collector_before", workflow)
+        self.assertIn("validate_collection_writer_state.py", workflow)
+        self.assertIn('--full "$full_collector_after"', workflow)
+        self.assertNotIn('case "$collector_after:$repair_after"', workflow)
+        self.assertIn("quality_job_after_reload", workflow)
+        self.assertIn("quality_main_pid_after_reload", workflow)
+        self.assertIn("inactive:0|activating:0", workflow)
+        self.assertIn('sudo systemctl stop "$quality_unit"', workflow)
+        self.assertIn("canceling stale queued quality snapshot job", workflow)
+        self.assertIn("quality_job_after_cancel", workflow)
+        self.assertLess(
+            workflow.index("sudo systemctl daemon-reload"),
+            workflow.index("quality_job_after_reload"),
+        )
+        self.assertLess(
+            workflow.index("quality_job_after_reload"),
+            workflow.index('sudo systemctl start "$quality_unit"'),
+        )
+        self.assertLess(
+            workflow.index('sudo systemctl start "$quality_unit"'),
+            workflow.index('sudo systemctl enable --now "$quality_timer"'),
+        )
         self.assertIn("trap - ERR", workflow)
         self.assertNotIn('sudo install -o opc -g opc -m 0755 "/tmp/$file"', workflow)
 

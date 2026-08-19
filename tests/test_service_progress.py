@@ -58,6 +58,10 @@ class ServiceProgressTest(unittest.TestCase):
                             }
                         ],
                         "updatedAt": quality_updated_at,
+                        "qualityGateVersion": 2,
+                        "candidateDigest": "candidate-a",
+                        "shardIndex": 1,
+                        "shardCount": 2,
                         "datasetIdentity": {
                             "device": dataset_stat.st_dev,
                             "inode": dataset_stat.st_ino,
@@ -79,6 +83,47 @@ class ServiceProgressTest(unittest.TestCase):
             self.assertEqual(value["providerAttempts"], 987)
             self.assertEqual(value["top20k"]["complete"], 8)
             self.assertEqual(value["top20k"]["missing"]["definition"], 2)
+            self.assertEqual(value["top20k"]["candidateDigest"], "candidate-a")
+            self.assertEqual(value["top20k"]["shardIndex"], 1)
+            self.assertEqual(value["top20k"]["shardCount"], 2)
+
+    def test_mismatched_quality_shard_identity_is_not_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            build = state / "build"
+            build.mkdir()
+            dataset = build / "lexora-open-oxford-scope.sqlite"
+            dataset.write_bytes(b"test-dataset-identity")
+            dataset_stat = dataset.stat()
+            (state / "progress-shard-1.json").write_text(
+                json.dumps({"finished": 4, "total": 10}),
+                encoding="utf-8",
+            )
+            (state / "top20k-quality-shard-1.json").write_text(
+                json.dumps(
+                    {
+                        "total": 10,
+                        "complete": 10,
+                        "incomplete": 0,
+                        "updatedAt": datetime.now(timezone.utc).isoformat(),
+                        "qualityGateVersion": 2,
+                        "candidateDigest": "candidate-a",
+                        "shardIndex": 0,
+                        "shardCount": 2,
+                        "datasetIdentity": {
+                            "device": dataset_stat.st_dev,
+                            "inode": dataset_stat.st_ino,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(server, "STATE", state),
+                patch.object(server, "BUILD", build),
+            ):
+                value = server.collection_progress()
+            self.assertIsNone(value["top20k"])
 
     def test_stale_or_wrong_dataset_quality_is_not_reported(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

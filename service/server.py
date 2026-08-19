@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import hashlib
 import re
 import threading
 import time
@@ -177,9 +176,23 @@ def collection_progress() -> dict[str, Any]:
             or int(identity["inode"]) != dataset_stat.st_ino
         ):
             raise ValueError("quality snapshot belongs to a different dataset")
-        quality_total = max(0, int(quality["total"]))
-        quality_complete = max(0, int(quality["complete"]))
-        quality_incomplete = max(0, int(quality["incomplete"]))
+        raw_counts = (
+            quality["total"],
+            quality["complete"],
+            quality["incomplete"],
+        )
+        if any(type(value) is not int or value < 0 for value in raw_counts):
+            raise ValueError("quality snapshot counts are invalid")
+        quality_total, quality_complete, quality_incomplete = raw_counts
+        quality_shard_index = quality["shardIndex"]
+        quality_shard_count = quality["shardCount"]
+        if type(quality_shard_index) is not int or type(quality_shard_count) is not int:
+            raise ValueError("quality snapshot shard identity is invalid")
+        candidate_digest = quality.get("candidateDigest")
+        if quality_shard_index != shard or quality_shard_count != 2:
+            raise ValueError("quality snapshot shard identity is invalid")
+        if candidate_digest is not None and not isinstance(candidate_digest, str):
+            raise ValueError("quality snapshot candidate digest is invalid")
         if quality_complete + quality_incomplete != quality_total:
             raise ValueError("quality counts do not add up")
         result["top20k"] = {
@@ -197,7 +210,10 @@ def collection_progress() -> dict[str, Any]:
             "entryStatus": quality.get("entryStatus", {}),
             "unresolved": quality.get("unresolved", []),
             "updatedAt": quality.get("updatedAt"),
-            "qualityGateVersion": int(quality.get("qualityGateVersion", 1)),
+            "qualityGateVersion": quality.get("qualityGateVersion", 1),
+            "candidateDigest": candidate_digest,
+            "shardIndex": quality_shard_index,
+            "shardCount": quality_shard_count,
         }
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         result["top20k"] = None

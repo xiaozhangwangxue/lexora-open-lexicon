@@ -182,6 +182,43 @@ jobs:
           PYTHONPATH=/opt/lexora/deployments/progress/current/tools \
             python3 -c 'import enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot'
           sudo systemctl daemon-reload
+          quality_active_after_reload=$(systemctl show "$quality_unit" \
+            -p ActiveState --value || true)
+          quality_sub_after_reload=$(systemctl show "$quality_unit" \
+            -p SubState --value || true)
+          quality_job_after_reload=$(systemctl show "$quality_unit" \
+            -p Job --value || true)
+          quality_main_pid_after_reload=$(systemctl show "$quality_unit" \
+            -p MainPID --value || true)
+          printf 'quality_active_after_reload=%s\n' "$quality_active_after_reload"
+          printf 'quality_sub_after_reload=%s\n' "$quality_sub_after_reload"
+          printf 'quality_job_after_reload=%s\n' "$quality_job_after_reload"
+          printf 'quality_main_pid_after_reload=%s\n' \
+            "$quality_main_pid_after_reload"
+          case "$quality_job_after_reload" in
+            ""|0) ;;
+            *)
+              case "$quality_active_after_reload:$quality_main_pid_after_reload" in
+                inactive:0|activating:0)
+                  echo "canceling stale queued quality snapshot job"
+                  sudo systemctl stop "$quality_unit" || true
+                  sudo systemctl reset-failed "$quality_unit" || true
+                  quality_job_after_cancel=$(systemctl show "$quality_unit" \
+                    -p Job --value || true)
+                  printf 'quality_job_after_cancel=%s\n' \
+                    "$quality_job_after_cancel"
+                  sudo systemctl show "$quality_unit" -p ActiveState \
+                    -p SubState -p Job -p Result -p ExecMainCode \
+                    -p ExecMainStatus || true
+                  sudo journalctl -u "$quality_unit" -n 40 --no-pager || true
+                  case "$quality_job_after_cancel" in
+                    ""|0) ;;
+                    *) echo "quality snapshot job remained queued" >&2; exit 1 ;;
+                  esac
+                  ;;
+              esac
+              ;;
+          esac
           quality_path="/opt/lexora/state/top20k-quality-shard-${shard}.json"
           candidate_path="/opt/lexora/deployments/repair/current/build/lexora-open-oxford-safe-20k.sqlite"
           snapshot_valid() {
@@ -208,7 +245,6 @@ jobs:
               raise SystemExit(1)
           PY
           }
-          sudo systemctl enable --now "$quality_timer"
           if ! snapshot_valid; then
             # A deployment without a current, candidate-bound atomic snapshot
             # is incomplete.  Wait for any older invocation, then start this
@@ -222,24 +258,27 @@ jobs:
               fi
               sleep 2
             done
-            sudo systemctl reset-failed "$quality_unit" || true
-            quality_started_at=$(date --utc +%Y-%m-%dT%H:%M:%SZ)
-            printf 'quality_job_started_at=%s\n' "$quality_started_at"
-            if ! sudo systemctl start "$quality_unit"; then
+            if ! snapshot_valid; then
+              sudo systemctl reset-failed "$quality_unit" || true
+              quality_started_at=$(date --utc +%Y-%m-%dT%H:%M:%SZ)
+              printf 'quality_job_started_at=%s\n' "$quality_started_at"
+              if ! sudo systemctl start "$quality_unit"; then
+                sudo systemctl show "$quality_unit" -p ActiveState -p SubState \
+                  -p Job -p Result -p ExecMainCode -p ExecMainStatus \
+                  -p ActiveEnterTimestamp -p InactiveEnterTimestamp || true
+                sudo journalctl -u "$quality_unit" \
+                  --since "$quality_started_at" -n 160 --no-pager || true
+                exit 1
+              fi
               sudo systemctl show "$quality_unit" -p ActiveState -p SubState \
                 -p Job -p Result -p ExecMainCode -p ExecMainStatus \
-                -p ActiveEnterTimestamp -p InactiveEnterTimestamp || true
+                -p ActiveEnterTimestamp -p InactiveEnterTimestamp
               sudo journalctl -u "$quality_unit" \
-                --since "$quality_started_at" -n 160 --no-pager || true
-              exit 1
+                --since "$quality_started_at" -n 80 --no-pager || true
+              snapshot_valid
             fi
-            sudo systemctl show "$quality_unit" -p ActiveState -p SubState \
-              -p Job -p Result -p ExecMainCode -p ExecMainStatus \
-              -p ActiveEnterTimestamp -p InactiveEnterTimestamp
-            sudo journalctl -u "$quality_unit" \
-              --since "$quality_started_at" -n 80 --no-pager || true
-            snapshot_valid
           fi
+          sudo systemctl enable --now "$quality_timer"
 
           sudo systemctl restart "$api_unit"
           health_ok=0
@@ -279,9 +318,11 @@ jobs:
             "$repair_before" "$repair_after"
           printf 'full_collector_before=%s\nfull_collector_after=%s\n' \
             "$full_collector_before" "$full_collector_after"
-          case "$collector_after:$repair_after" in
-            active:inactive|inactive:active|inactive:activating) ;;
-            *) echo "unexpected collection state"; exit 1 ;;
-          esac
+          python3 "$release/tools/validate_collection_writer_state.py" \
+            --micro "$collector_after" \
+            --full "$full_collector_after" \
+            --repair "$repair_after" \
+            --progress-snapshot \
+              "/opt/lexora/state/progress-shard-${shard}.json"
           trap - ERR
           REMOTE

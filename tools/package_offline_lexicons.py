@@ -280,9 +280,17 @@ def main() -> None:
     mode.add_argument(
         "--include-full",
         action="store_true",
-        help="also package a full snapshot after explicitly approving it",
+        help=(
+            "reserved for a future full-dataset gate; currently rejected "
+            "before any output is created"
+        ),
     )
     args = parser.parse_args()
+    if args.include_full:
+        parser.error(
+            "--include-full is disabled until full collection and quality "
+            "gates are implemented"
+        )
 
     fast_source = args.fast_source or args.source
     if args.output_dir.exists():
@@ -328,24 +336,10 @@ def main() -> None:
                 args.base_url,
             )
         }
-        if args.include_full:
-            full_db = staged_release / f"lexora-offline-full-{args.version}.sqlite"
-            full_rows = copy_full(staged_canonical, full_db)
-            full_archive = full_db.with_suffix(".sqlite.gz")
-            compress(full_db, full_archive)
-            packages["full"] = package_entry(
-                "full",
-                args.version,
-                full_db,
-                full_archive,
-                full_rows,
-                args.base_url,
-            )
-
         manifest = {
             "schema_version": 2,
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "mode": "full-and-fast20k" if args.include_full else "fast20k-only",
+            "mode": "fast20k-only",
             "fast20kQuality": fast_quality,
             "packages": packages,
         }

@@ -170,5 +170,6 @@ python tools/package_offline_lexicons.py \
 The packager uses SQLite online backups to stage both inputs, gates those exact
 snapshots, copies the candidate into a private release directory, and gates
 that actual release copy again before compression. Fast-only is the default;
-the incomplete full dataset is not generated unless `--include-full` is
-explicitly supplied in a future approved release workflow.
+`--include-full` is currently a fail-closed reserved flag and always exits
+before creating output. A future release may enable it only after separate
+full-collection and full-quality gates are implemented.
