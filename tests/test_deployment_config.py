@@ -127,6 +127,15 @@ class DeploymentConfigTest(unittest.TestCase):
             workflow,
         )
 
+    def test_edge_smoke_allows_atomic_quality_snapshot_to_finish_later(self) -> None:
+        script = (
+            ROOT / "deploy" / "deploy-progress-edge.sh"
+        ).read_text(encoding="utf-8")
+        self.assertIn("for attempt in {1..18}", script)
+        self.assertIn('if top["available"]:', script)
+        self.assertIn('assert top["total"] == 20_000', script)
+        self.assertNotIn('assert top["available"] is True', script)
+
 
 if __name__ == "__main__":
     unittest.main()
