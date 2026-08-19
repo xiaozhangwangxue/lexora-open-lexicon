@@ -80,7 +80,8 @@ def copy_fast(source: Path, destination: Path, limit: int) -> int:
                 tuple(row[column] for column in COLUMNS)
                 for row in source_db.execute(
                     f"SELECT {column_sql} FROM entries "
-                    "ORDER BY frequency_rank LIMIT ?",
+                    "WHERE frequency_rank IS NOT NULL "
+                    "ORDER BY frequency_rank,id LIMIT ?",
                     (limit,),
                 )
             ),
