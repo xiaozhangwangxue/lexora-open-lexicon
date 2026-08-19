@@ -110,6 +110,23 @@ class DeploymentConfigTest(unittest.TestCase):
         self.assertIn("top20k-quality-shard-%i.json", service)
         self.assertIn("OnUnitActiveSec=60min", timer)
 
+    def test_progress_deploy_does_not_block_on_quality_scan(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "deploy-progress-details.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'systemctl start --no-block "$quality_unit"',
+            workflow,
+        )
+        self.assertIn(
+            'systemctl enable --now "$quality_timer"',
+            workflow,
+        )
+        self.assertNotIn(
+            'systemctl stop "$quality_timer"',
+            workflow,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

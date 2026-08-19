@@ -96,39 +96,13 @@ jobs:
           quality_unit="lexora-top20k-quality-snapshot@${shard}.service"
           quality_timer="lexora-top20k-quality-snapshot@${shard}.timer"
           quality_path="/opt/lexora/state/top20k-quality-shard-${shard}.json"
-          timer_needs_restart=0
-          restart_quality_timer() {
-            if [ "$timer_needs_restart" = 1 ]; then
-              sudo systemctl start "$quality_timer" || true
-            fi
-          }
-          trap restart_quality_timer EXIT
-          sudo systemctl stop "$quality_timer" || true
-          timer_needs_restart=1
-          sudo systemctl enable "$quality_timer"
-          for attempt in $(seq 1 60); do
-            if ! systemctl is-active --quiet "$quality_unit"; then break; fi
-            sleep 5
-          done
-          if systemctl is-active --quiet "$quality_unit"; then
-            echo "previous quality snapshot is still running"
-            exit 1
-          fi
-          before_digest=$(sha256sum "$quality_path" 2>/dev/null \
-            | awk '{print $1}' || true)
-          if ! sudo systemctl start "$quality_unit"; then
-            sudo journalctl -u "$quality_unit" -n 120 --no-pager
-            exit 1
-          fi
-          result=$(systemctl show "$quality_unit" -p Result --value)
-          exit_status=$(systemctl show "$quality_unit" -p ExecMainStatus --value)
-          test "$result" = success
-          test "$exit_status" = 0
-          after_digest=$(sha256sum "$quality_path" | awk '{print $1}')
-          test -n "$after_digest"
-          test "$after_digest" != "$before_digest"
-          sudo systemctl start "$quality_timer"
-          timer_needs_restart=0
+          # A strict scan on the smallest OCI instance may take several
+          # minutes while collection is writing.  Deployment must not block on
+          # it or start a duplicate scan.  The API deliberately reports
+          # top20k=null until the atomic snapshot is ready, and clients label a
+          # one-shard result as incomplete.
+          sudo systemctl enable --now "$quality_timer"
+          sudo systemctl start --no-block "$quality_unit" || true
 
           if systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
             | grep -q lexora-lexicon-micro; then
@@ -150,23 +124,28 @@ jobs:
             sudo journalctl -u "$api_unit" -n 120 --no-pager
             exit 1
           fi
-          test -s "$quality_path"
           cat /tmp/lexora-health.json
           python3 - <<PY
           import json
           from pathlib import Path
-          value = json.loads(Path(
-              "/opt/lexora/state/top20k-quality-shard-${shard}.json"
-          ).read_text())
-          assert value["total"] > 0
-          assert value["complete"] + value["incomplete"] == value["total"]
-          print(json.dumps({
-              "shard": ${shard},
-              "complete": value["complete"],
-              "total": value["total"],
-              "percent": value["percent"],
-          }, sort_keys=True))
+          path = Path("/opt/lexora/state/top20k-quality-shard-${shard}.json")
+          if path.exists():
+              value = json.loads(path.read_text())
+              assert value["total"] > 0
+              assert value["complete"] + value["incomplete"] == value["total"]
+              print(json.dumps({
+                  "shard": ${shard},
+                  "complete": value["complete"],
+                  "total": value["total"],
+                  "percent": value["percent"],
+              }, sort_keys=True))
+          else:
+              print(json.dumps({
+                  "shard": ${shard},
+                  "top20k": "generating",
+              }, sort_keys=True))
           PY
+          systemctl show "$quality_unit" -p ActiveState -p SubState -p Result
           systemctl is-active "$api_unit"
           collector_after=$(systemctl is-active "$collector" || true)
           repair_after=$(systemctl is-active "$repair" || true)
@@ -178,5 +157,4 @@ jobs:
             active:inactive|inactive:active|inactive:activating) ;;
             *) echo "unexpected collection state"; exit 1 ;;
           esac
-          trap - EXIT
           REMOTE
