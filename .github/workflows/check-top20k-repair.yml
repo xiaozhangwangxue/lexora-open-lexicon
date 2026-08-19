@@ -49,10 +49,15 @@ jobs:
             || echo "quality_report=busy_or_timed_out"
           import json
           import os
+          import re
           import sqlite3
           from collections import Counter
 
-          from enrich_oxford_scope import entry_quality_gaps, is_phrase
+          from enrich_oxford_scope import (
+              entry_quality_gaps,
+              is_phrase,
+              normalized_term,
+          )
 
           shard = int(os.environ["SHARD"])
           path = "/opt/lexora/build/lexora-open-oxford-scope.sqlite"
@@ -65,8 +70,9 @@ jobs:
           start = int(minimum) + (span * shard) // 2
           end = int(minimum) + (span * (shard + 1)) // 2 - 1
           rows = database.execute(
-              "SELECT normalized_word,definition,definition_zh,us_phonetic,"
-              "uk_phonetic,pos,COALESCE(json_extract(enrichment_json,"
+              "SELECT word,normalized_word,definition,definition_zh,"
+              "us_phonetic,uk_phonetic,pos,frequency,"
+              "COALESCE(json_extract(enrichment_json,"
               "'$.status'),'pending') FROM entries INDEXED BY idx_entries_freq "
               "WHERE frequency_rank <= ? AND id >= ? AND id <= ?",
               (20_000, start, end),
@@ -76,10 +82,26 @@ jobs:
 
           gaps = Counter()
           statuses = Counter()
+          strict = Counter()
+          strict_samples = {}
           phrases = 0
           incomplete = 0
           unresolved = []
-          for term, definition, translation, us, uk, pos, status in rows:
+          mojibake_markers = ("\ufffd", "Ã", "Â", "â€", "ä¸", "å¤", "æ˜")
+          han_pattern = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+          eight_english_words = re.compile(
+              r"(?:\b[A-Za-z][A-Za-z'-]*\b[\s,;:()\-]+){7}"
+              r"\b[A-Za-z][A-Za-z'-]*\b"
+          )
+          arpabet_pattern = re.compile(r"^[A-Z0-9 .'-]+$")
+
+          def mark(name, term):
+              strict[name] += 1
+              strict_samples.setdefault(name, [])
+              if len(strict_samples[name]) < 12:
+                  strict_samples[name].append(term)
+
+          for word, term, definition, translation, us, uk, pos, frequency, status in rows:
               phrase = is_phrase(term, pos)
               phrases += int(phrase)
               statuses[str(status)] += 1
@@ -89,13 +111,60 @@ jobs:
               gaps.update(missing)
               if missing:
                   incomplete += 1
-                  if len(unresolved) < 100:
+                  if len(unresolved) < 20:
                       unresolved.append({
                           "term": term,
                           "kind": "phrase" if phrase else "word",
                           "gaps": missing,
                           "status": status,
                       })
+              definition_text = str(definition or "")
+              translation_text = str(translation or "")
+              if any(marker in definition_text for marker in mojibake_markers):
+                  mark("definition_mojibake", term)
+              if any(marker in translation_text for marker in mojibake_markers):
+                  mark("translation_mojibake", term)
+              han_count = len(han_pattern.findall(translation_text))
+              ascii_count = len(re.findall(r"[A-Za-z]", translation_text))
+              if translation_text and han_count == 0:
+                  mark("translation_without_han", term)
+              if (
+                  ascii_count + han_count > 0
+                  and ascii_count / (ascii_count + han_count) > 0.4
+              ):
+                  mark("translation_ascii_ratio_over_40pct", term)
+              if eight_english_words.search(translation_text):
+                  mark("translation_eight_consecutive_english_words", term)
+              if normalized_term(word) != term:
+                  mark("word_normalization_mismatch", term)
+              if frequency is not None and float(frequency) > 10:
+                  mark("frequency_over_10", term)
+              if term.startswith("-"):
+                  mark("leading_hyphen", term)
+              if term.endswith("-"):
+                  mark("trailing_hyphen", term)
+              if term.endswith("."):
+                  mark("trailing_period", term)
+              if "..." in term or "…" in term:
+                  mark("ellipsis", term)
+              pos_names = {
+                  item.strip().lower()
+                  for item in re.split(r"[,;/]", str(pos or ""))
+                  if item.strip()
+              }
+              if pos_names & {"prefix", "suffix"}:
+                  mark("pos_affix", term)
+              if not phrase:
+                  phonetics = (str(us or "").strip(), str(uk or "").strip())
+                  if any("\ufffd" in value for value in phonetics):
+                      mark("word_phonetic_replacement_char", term)
+                  if all(
+                      value
+                      and arpabet_pattern.fullmatch(value)
+                      and any(character.isdigit() for character in value)
+                      for value in phonetics
+                  ):
+                      mark("word_both_phonetics_arpabet", term)
           total = len(rows)
           complete = total - incomplete
           print(json.dumps({
@@ -109,6 +178,8 @@ jobs:
               "missing": dict(sorted(gaps.items())),
               "entryStatus": dict(sorted(statuses.items())),
               "unresolved": unresolved,
+              "strict": dict(sorted(strict.items())),
+              "strictSamples": dict(sorted(strict_samples.items())),
           }, ensure_ascii=False, sort_keys=True))
           PY
           df -h /
