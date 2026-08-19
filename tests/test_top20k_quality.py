@@ -72,9 +72,11 @@ class Top20kQualityTest(unittest.TestCase):
                     (
                         4,
                         "untranslated",
-                        "A definition that should be translated completely.",
-                        "释义 that should be translated completely without "
-                        "leaving a long English block in place.",
+                        "A definition that should be translated completely "
+                        "without leaving a long English block in place.",
+                        "释义 A definition that should be translated "
+                        "completely without leaving a long English block in "
+                        "place.",
                         "ʌntrænsleɪtɪd",
                         "",
                         "adjective",

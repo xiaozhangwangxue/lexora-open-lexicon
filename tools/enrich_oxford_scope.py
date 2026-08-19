@@ -291,25 +291,32 @@ def needs_definition_translation(definition: Any, translation: Any) -> bool:
     if len(source) > 120 and len(target) < max(20, int(len(source) * 0.15)):
         return True
 
-    latin_characters = re.findall(r"[A-Za-z]", target)
-    chinese_characters = re.findall(
-        r"[\u3400-\u4dbf\u4e00-\u9fff]",
-        target,
-    )
-    translated_characters = len(latin_characters) + len(chinese_characters)
-    if (
-        len(latin_characters) >= 20
-        and translated_characters
-        and len(latin_characters) / translated_characters > 0.40
-    ):
+    if "\ufffd" in target:
         return True
 
-    english_words = re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", target)
-    if len(english_words) >= 8 and re.search(
-        r"(?:\b[A-Za-z]+(?:['’-][A-Za-z]+)*\b[\s,;:()\[\]/-]*){8,}",
-        target,
-    ):
-        return True
+    # Detect a copied English block by comparing it with the source.  A raw
+    # Latin-character ratio incorrectly rejects valid Chinese translations
+    # that preserve names such as "Cascading Style Sheets" or chemical names.
+    # Eight consecutive source words is long enough to identify an untouched
+    # provider chunk without penalizing those short, intentional labels.
+    source_words = [
+        item.lower()
+        for item in re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", source)
+    ]
+    target_words = [
+        item.lower()
+        for item in re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", target)
+    ]
+    if len(source_words) >= 8 and len(target_words) >= 8:
+        source_runs = {
+            tuple(source_words[index:index + 8])
+            for index in range(len(source_words) - 7)
+        }
+        if any(
+            tuple(target_words[index:index + 8]) in source_runs
+            for index in range(len(target_words) - 7)
+        ):
+            return True
     return False
 
 

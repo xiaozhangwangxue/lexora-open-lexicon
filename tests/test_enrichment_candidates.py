@@ -1468,6 +1468,24 @@ class CandidateBatchTest(unittest.TestCase):
                 "苹果公司生产的 iPhone 智能手机。",
             )
         )
+        self.assertFalse(
+            enrichment.needs_definition_translation(
+                "CSS is short for Cascading Style Sheets.",
+                "CSS 是 Cascading Style Sheets 的缩写，中文为层叠样式表。",
+            )
+        )
+        self.assertFalse(
+            enrichment.needs_definition_translation(
+                "DNA is deoxyribonucleic acid.",
+                "DNA（deoxyribonucleic acid，脱氧核糖核酸）。",
+            )
+        )
+        self.assertTrue(
+            enrichment.needs_definition_translation(
+                source,
+                "语言单位，但包含损坏字符 \ufffd。",
+            )
+        )
 
     def test_wiktionary_fallback_parses_only_exact_english_data(self) -> None:
         fields = enrichment.wiktionary_definition_fields(
