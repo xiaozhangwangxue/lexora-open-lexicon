@@ -1,0 +1,107 @@
+name: Retire legacy top-20k repair
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type RETIRE_LEGACY_TOP20K_SHARD0 exactly
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lexora-oci-production-deployment
+  cancel-in-progress: false
+
+jobs:
+  retire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Require explicit confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: test "$CONFIRMATION" = RETIRE_LEGACY_TOP20K_SHARD0
+
+      - name: Prepare SSH credentials
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.LEXORA_OCI_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LEXORA_OCI_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lexora_oci
+          chmod 0600 ~/.ssh/lexora_oci
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Stop only the obsolete repair and restore collection
+        run: |
+          ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=8 opc@140.245.114.238 'bash -se' <<'REMOTE'
+          set -euo pipefail
+          repair=lexora-top20k-repair@0.service
+          timer=lexora-top20k-repair@0.timer
+          micro=lexora-enrich-micro@0.service
+          full=lexora-enrich@0.service
+
+          before_repair=$(systemctl is-active "$repair" || true)
+          before_timer=$(systemctl is-enabled "$timer" || true)
+          before_micro=$(systemctl is-active "$micro" || true)
+          before_full=$(systemctl is-active "$full" || true)
+          printf 'before repair=%s timer=%s micro=%s full=%s\n' \
+            "$before_repair" "$before_timer" "$before_micro" "$before_full"
+
+          recover_collection() {
+            status=$?
+            trap - ERR
+            micro_state=$(systemctl is-active "$micro" || true)
+            full_state=$(systemctl is-active "$full" || true)
+            if [[ "$micro_state" != active && "$full_state" != active ]]; then
+              sudo systemctl start --no-block "$micro" || true
+            fi
+            sudo systemctl show "$repair" "$micro" "$full" \
+              -p Id -p ActiveState -p SubState -p Result -p MainPID || true
+            exit "$status"
+          }
+          trap recover_collection ERR
+
+          # This intentionally retires only the obsolete phrase-heavy repair.
+          # It does not remove its database, state, logs, or prior results.
+          sudo systemctl disable --now "$timer"
+          sudo systemctl stop "$repair"
+          for _ in $(seq 1 60); do
+            state=$(systemctl is-active "$repair" || true)
+            [[ "$state" == inactive || "$state" == failed ]] && break
+            sleep 2
+          done
+          repair_state=$(systemctl is-active "$repair" || true)
+          [[ "$repair_state" == inactive || "$repair_state" == failed ]]
+
+          # The old unit normally restores the exact previous writer through
+          # ExecStopPost.  If it does not, resume the micro collector explicitly.
+          micro_state=$(systemctl is-active "$micro" || true)
+          full_state=$(systemctl is-active "$full" || true)
+          if [[ "$micro_state" != active && "$full_state" != active ]]; then
+            sudo systemctl start --no-block "$micro"
+          fi
+          collection_ready=0
+          for _ in $(seq 1 60); do
+            micro_state=$(systemctl is-active "$micro" || true)
+            full_state=$(systemctl is-active "$full" || true)
+            if [[ "$micro_state" == active && "$full_state" != active ]] \
+              || [[ "$full_state" == active && "$micro_state" != active ]]; then
+              collection_ready=1
+              break
+            fi
+            sleep 2
+          done
+          test "$collection_ready" = 1
+          test "$(systemctl is-enabled "$timer" || true)" = disabled
+          sudo systemctl show "$repair" "$timer" "$micro" "$full" \
+            -p Id -p ActiveState -p SubState -p UnitFileState -p Result -p MainPID
+          sudo journalctl -u "$repair" -n 80 --no-pager || true
+          trap - ERR
+          REMOTE

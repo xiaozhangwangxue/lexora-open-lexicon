@@ -11,6 +11,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class DeploymentWorkflowTest(unittest.TestCase):
+    def test_legacy_repair_retirement_preserves_data_and_restores_one_writer(
+        self,
+    ) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "retire-legacy-top20k-repair.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("RETIRE_LEGACY_TOP20K_SHARD0", workflow)
+        self.assertIn("opc@140.245.114.238", workflow)
+        self.assertIn('systemctl stop "$repair"', workflow)
+        self.assertIn('systemctl start --no-block "$micro"', workflow)
+        self.assertIn('systemctl disable --now "$timer"', workflow)
+        self.assertNotIn("rm -", workflow)
+        self.assertNotIn("134.185.82.7", workflow)
+
     def test_preparation_is_non_activating_and_compares_two_snapshots(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "deploy-top20k-repair.yml"
