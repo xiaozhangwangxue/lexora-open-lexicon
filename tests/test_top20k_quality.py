@@ -69,6 +69,18 @@ class Top20kQualityTest(unittest.TestCase):
                         3,
                         '{"status":"partial"}',
                     ),
+                    (
+                        4,
+                        "untranslated",
+                        "A definition that should be translated completely.",
+                        "释义 that should be translated completely without "
+                        "leaving a long English block in place.",
+                        "ʌntrænsleɪtɪd",
+                        "",
+                        "adjective",
+                        4,
+                        '{"status":"completed"}',
+                    ),
                 ],
             )
             database.commit()
@@ -76,13 +88,13 @@ class Top20kQualityTest(unittest.TestCase):
 
             report = quality_report(dataset, unresolved_limit=5)
 
-        self.assertEqual(report["total"], 3)
+        self.assertEqual(report["total"], 4)
         self.assertEqual(report["complete"], 2)
-        self.assertEqual(report["incomplete"], 1)
-        self.assertEqual(report["terms"], {"words": 2, "phrases": 1})
+        self.assertEqual(report["incomplete"], 2)
+        self.assertEqual(report["terms"], {"words": 3, "phrases": 1})
         self.assertEqual(
             report["missing"],
-            {"definition_zh": 1, "phonetic": 1, "pos": 1},
+            {"definition_zh": 2, "phonetic": 1, "pos": 1},
         )
 
 

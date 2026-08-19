@@ -273,16 +273,44 @@ def needs_phonetic_repair(value: Any) -> bool:
 
 
 def needs_definition_translation(definition: Any, translation: Any) -> bool:
-    """Detect missing or obviously abbreviated translations of long entries."""
+    """Detect missing, truncated, or substantially untranslated Chinese text.
+
+    A non-empty value is not sufficient: some interrupted batch translations
+    contain a short Chinese prefix followed by a large untouched English
+    block.  Keep the checks deliberately conservative so product names and
+    short English labels inside an otherwise Chinese definition remain valid.
+    """
     source = " ".join(str(definition or "").split()).strip()
     target = " ".join(str(translation or "").split()).strip()
     if not source:
         return False
     if not target:
         return True
-    if len(source) <= 120:
-        return False
-    return len(target) < max(20, int(len(source) * 0.15))
+    if not re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", target):
+        return True
+    if len(source) > 120 and len(target) < max(20, int(len(source) * 0.15)):
+        return True
+
+    latin_characters = re.findall(r"[A-Za-z]", target)
+    chinese_characters = re.findall(
+        r"[\u3400-\u4dbf\u4e00-\u9fff]",
+        target,
+    )
+    translated_characters = len(latin_characters) + len(chinese_characters)
+    if (
+        len(latin_characters) >= 20
+        and translated_characters
+        and len(latin_characters) / translated_characters > 0.40
+    ):
+        return True
+
+    english_words = re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", target)
+    if len(english_words) >= 8 and re.search(
+        r"(?:\b[A-Za-z]+(?:['’-][A-Za-z]+)*\b[\s,;:()\[\]/-]*){8,}",
+        target,
+    ):
+        return True
+    return False
 
 
 def needs_frequency_repair(value: Any) -> bool:
