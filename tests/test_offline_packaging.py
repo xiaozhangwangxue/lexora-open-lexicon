@@ -188,6 +188,39 @@ class OfflinePackagingTest(unittest.TestCase):
             )
             database.close()
 
+    def test_fast_copy_never_includes_an_unranked_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sqlite"
+            fast = root / "fast.sqlite"
+            build_source(source)
+            database = sqlite3.connect(source)
+            database.execute(
+                """
+                INSERT INTO entries(
+                  word,normalized_word,pos,frequency_rank,definition,
+                  definition_zh,enrichment_json
+                ) VALUES('unranked','unranked','',NULL,'','','{}')
+                """
+            )
+            database.commit()
+            database.close()
+
+            self.assertEqual(assert_fast_source_ready(source, 4)["complete"], 4)
+            self.assertEqual(copy_fast(source, fast, 4), 4)
+
+            database = sqlite3.connect(fast)
+            try:
+                self.assertEqual(
+                    database.execute(
+                        "SELECT normalized_word FROM entries "
+                        "ORDER BY frequency_rank,id"
+                    ).fetchall(),
+                    [("alpha",), ("bravo",), ("charlie",), ("delta",)],
+                )
+            finally:
+                database.close()
+
     def test_merge_streams_shards_in_small_batches_and_refreshes_fts(
         self,
     ) -> None:
