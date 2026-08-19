@@ -34,7 +34,7 @@ jobs:
       - name: Read repair status and quality
         shell: bash
         run: |
-          timeout 90s ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+          timeout 240s ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
             -o ConnectTimeout=30 -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=8 "opc@${{ matrix.host }}" \
             'bash -se' <<'REMOTE'
@@ -44,10 +44,75 @@ jobs:
           echo "timer_state=$(systemctl is-enabled lexora-top20k-repair@'${{ matrix.shard }}'.timer || true)"
           systemctl show lexora-top20k-repair@'${{ matrix.shard }}'.service \
             -p MainPID -p ActiveState -p SubState -p Result
-          timeout 30s python3 /opt/lexora/tools/top20k_quality.py \
-            --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
-            --shard-index '${{ matrix.shard }}' --shard-count 2 \
-            --unresolved-limit 0 || echo "quality_report=busy_or_timed_out"
+          timeout 180s env SHARD='${{ matrix.shard }}' \
+            PYTHONPATH=/opt/lexora/tools python3 - <<'PY' \
+            || echo "quality_report=busy_or_timed_out"
+          import json
+          import os
+          import sqlite3
+          from collections import Counter
+
+          from enrich_oxford_scope import entry_quality_gaps, is_phrase
+
+          shard = int(os.environ["SHARD"])
+          path = "/opt/lexora/build/lexora-open-oxford-scope.sqlite"
+          database = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60)
+          database.execute("PRAGMA query_only=ON")
+          minimum, maximum = database.execute(
+              "SELECT COALESCE(MIN(id),0),COALESCE(MAX(id),-1) FROM entries"
+          ).fetchone()
+          span = max(0, int(maximum) - int(minimum) + 1)
+          start = int(minimum) + (span * shard) // 2
+          end = int(minimum) + (span * (shard + 1)) // 2 - 1
+          rows = database.execute(
+              "SELECT normalized_word,definition,definition_zh,us_phonetic,"
+              "uk_phonetic,pos,COALESCE(json_extract(enrichment_json,"
+              "'$.status'),'pending') FROM entries INDEXED BY idx_entries_freq "
+              "WHERE frequency_rank <= ? AND id >= ? AND id <= ?",
+              (20_000, start, end),
+          ).fetchall()
+          journal_mode = database.execute("PRAGMA journal_mode").fetchone()[0]
+          database.close()
+
+          gaps = Counter()
+          statuses = Counter()
+          phrases = 0
+          incomplete = 0
+          unresolved = []
+          for term, definition, translation, us, uk, pos, status in rows:
+              phrase = is_phrase(term, pos)
+              phrases += int(phrase)
+              statuses[str(status)] += 1
+              missing = entry_quality_gaps(
+                  term, definition, translation, us, uk, pos
+              )
+              gaps.update(missing)
+              if missing:
+                  incomplete += 1
+                  if len(unresolved) < 100:
+                      unresolved.append({
+                          "term": term,
+                          "kind": "phrase" if phrase else "word",
+                          "gaps": missing,
+                          "status": status,
+                      })
+          total = len(rows)
+          complete = total - incomplete
+          print(json.dumps({
+              "shard": shard,
+              "journalMode": journal_mode,
+              "total": total,
+              "complete": complete,
+              "incomplete": incomplete,
+              "percent": round((complete / total * 100) if total else 100, 3),
+              "terms": {"words": total - phrases, "phrases": phrases},
+              "missing": dict(sorted(gaps.items())),
+              "entryStatus": dict(sorted(statuses.items())),
+              "unresolved": unresolved,
+          }, ensure_ascii=False, sort_keys=True))
+          PY
+          df -h /
+          free -m
           timeout 10s journalctl -u lexora-top20k-repair@'${{ matrix.shard }}'.service \
             -n 12 --no-pager || echo "journal=busy_or_timed_out"
           REMOTE
