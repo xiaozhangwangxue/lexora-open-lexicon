@@ -7,7 +7,7 @@ import hashlib
 import re
 import threading
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -137,12 +137,71 @@ def collection_progress() -> dict[str, Any]:
         shard = int(snapshots[0].stem.rsplit("-", 1)[-1])
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
         raise HTTPException(503, "progress snapshot is invalid") from error
-    return {
+    result: dict[str, Any] = {
         "shard": shard,
         "finished": min(finished, total) if total else finished,
         "total": total,
+        "remaining": max(0, total - finished),
+        "percent": round((finished / total * 100) if total else 100.0, 3),
         "updatedAt": payload.get("updatedAt"),
     }
+    for source, target in (
+        ("entry_status", "entryStatus"),
+        ("provider_status", "providerStatus"),
+    ):
+        value = payload.get(source)
+        if isinstance(value, dict):
+            result[target] = {
+                str(key): max(0, int(count))
+                for key, count in value.items()
+                if isinstance(count, (int, float))
+            }
+    attempts = payload.get("provider_attempts")
+    if isinstance(attempts, (int, float)):
+        result["providerAttempts"] = max(0, int(attempts))
+
+    quality_path = STATE / f"top20k-quality-shard-{shard}.json"
+    try:
+        quality = json.loads(quality_path.read_text(encoding="utf-8"))
+        quality_updated_at = datetime.fromisoformat(
+            str(quality["updatedAt"]).replace("Z", "+00:00")
+        )
+        if quality_updated_at.tzinfo is None:
+            quality_updated_at = quality_updated_at.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - quality_updated_at).total_seconds() > 3 * 3600:
+            raise ValueError("quality snapshot is stale")
+        identity = quality["datasetIdentity"]
+        dataset_stat = (BUILD / "lexora-open-oxford-scope.sqlite").stat()
+        if (
+            int(identity["device"]) != dataset_stat.st_dev
+            or int(identity["inode"]) != dataset_stat.st_ino
+        ):
+            raise ValueError("quality snapshot belongs to a different dataset")
+        quality_total = max(0, int(quality["total"]))
+        quality_complete = max(0, int(quality["complete"]))
+        quality_incomplete = max(0, int(quality["incomplete"]))
+        if quality_complete + quality_incomplete != quality_total:
+            raise ValueError("quality counts do not add up")
+        result["top20k"] = {
+            "total": quality_total,
+            "complete": quality_complete,
+            "incomplete": quality_incomplete,
+            "percent": round(
+                (quality_complete / quality_total * 100)
+                if quality_total
+                else 100.0,
+                3,
+            ),
+            "terms": quality.get("terms", {}),
+            "missing": quality.get("missing", {}),
+            "entryStatus": quality.get("entryStatus", {}),
+            "unresolved": quality.get("unresolved", []),
+            "updatedAt": quality.get("updatedAt"),
+            "qualityGateVersion": int(quality.get("qualityGateVersion", 1)),
+        }
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        result["top20k"] = None
+    return result
 
 @app.get("/manifest")
 def manifest():

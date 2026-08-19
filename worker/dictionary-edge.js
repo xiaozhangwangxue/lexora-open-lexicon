@@ -246,6 +246,12 @@ async function combinedProgressResponse(request, env) {
         shard: Number(value.shard),
         finished: Number(value.finished),
         total: Number(value.total),
+        remaining: Number(value.remaining),
+        percent: Number(value.percent),
+        entryStatus: value.entryStatus || {},
+        providerStatus: value.providerStatus || {},
+        providerAttempts: Number(value.providerAttempts || 0),
+        top20k: value.top20k || null,
         updatedAt: value.updatedAt || null,
       };
     }),
@@ -255,13 +261,24 @@ async function combinedProgressResponse(request, env) {
     .map((result) => result.value)
     .filter(
       (value) =>
+        Number.isInteger(value.shard) &&
         Number.isFinite(value.finished) &&
         Number.isFinite(value.total) &&
         value.finished >= 0 &&
-        value.total > 0,
+        value.total > 0 &&
+        value.finished <= value.total,
     )
     .sort((left, right) => left.shard - right.shard);
-  if (shards.length !== origins.length) {
+  const shardIds = new Set(shards.map((shard) => shard.shard));
+  const expectedShardIds = Array.from(
+    { length: origins.length },
+    (_, index) => index,
+  );
+  if (
+    shards.length !== origins.length ||
+    shardIds.size !== origins.length ||
+    !expectedShardIds.every((shard) => shardIds.has(shard))
+  ) {
     return withCors(
       Response.json(
         { detail: "collection progress temporarily unavailable" },
@@ -273,17 +290,100 @@ async function combinedProgressResponse(request, env) {
   }
   const finished = shards.reduce((sum, shard) => sum + shard.finished, 0);
   const total = shards.reduce((sum, shard) => sum + shard.total, 0);
+  const sumMaps = (values) => {
+    const combined = {};
+    for (const value of values) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      for (const [key, rawCount] of Object.entries(value)) {
+        const count = Number(rawCount);
+        if (!Number.isFinite(count) || count < 0) continue;
+        combined[key] = (combined[key] || 0) + count;
+      }
+    }
+    return combined;
+  };
+  const latestTimestamp = (values) =>
+    values.filter(Boolean).sort().at(-1) || null;
+  const qualityShards = shards
+    .filter((shard) => shard.top20k && typeof shard.top20k === "object")
+    .map((shard) => ({ shard: shard.shard, ...shard.top20k }));
+  const qualityTotal = qualityShards.reduce(
+    (sum, shard) => sum + Number(shard.total || 0),
+    0,
+  );
+  const qualityComplete = qualityShards.reduce(
+    (sum, shard) => sum + Number(shard.complete || 0),
+    0,
+  );
+  const qualityIncomplete = qualityShards.reduce(
+    (sum, shard) => sum + Number(shard.incomplete || 0),
+    0,
+  );
+  const qualityGateVersions = new Set(
+    qualityShards.map((shard) => Number(shard.qualityGateVersion || 0)),
+  );
+  const qualityGateVersion =
+    qualityGateVersions.size === 1 ? [...qualityGateVersions][0] : null;
+  const qualityAvailable =
+    qualityShards.length === origins.length &&
+    Number.isInteger(qualityGateVersion) &&
+    qualityGateVersion > 0;
+  const top20k = {
+    available: qualityAvailable,
+    ready:
+      qualityAvailable &&
+      qualityTotal === 20000 &&
+      qualityIncomplete === 0,
+    total: qualityTotal,
+    qualityGateVersion,
+    complete: qualityComplete,
+    incomplete: qualityIncomplete,
+    percent:
+      qualityTotal > 0
+        ? Number(((qualityComplete / qualityTotal) * 100).toFixed(3))
+        : 0,
+    terms: sumMaps(qualityShards.map((shard) => shard.terms)),
+    missing: sumMaps(qualityShards.map((shard) => shard.missing)),
+    entryStatus: sumMaps(
+      qualityShards.map((shard) => shard.entryStatus),
+    ),
+    updatedAt: latestTimestamp(
+      qualityShards.map((shard) => shard.updatedAt),
+    ),
+    unresolved: qualityShards
+      .flatMap((shard) =>
+        Array.isArray(shard.unresolved)
+          ? shard.unresolved.map((item) => ({ ...item, shard: shard.shard }))
+          : [],
+      )
+      .slice(0, 12),
+    shards: qualityShards.map((shard) => ({
+      shard: shard.shard,
+      total: Number(shard.total || 0),
+      complete: Number(shard.complete || 0),
+      incomplete: Number(shard.incomplete || 0),
+      percent: Number(shard.percent || 0),
+      updatedAt: shard.updatedAt || null,
+    })),
+  };
   const response = Response.json(
     {
       finished,
       total,
+      remaining: Math.max(0, total - finished),
       percent: total > 0 ? Number(((finished / total) * 100).toFixed(3)) : 100,
-      updatedAt: shards
-        .map((shard) => shard.updatedAt)
-        .filter(Boolean)
-        .sort()
-        .at(-1) || null,
+      entryStatus: sumMaps(shards.map((shard) => shard.entryStatus)),
+      providerStatus: sumMaps(shards.map((shard) => shard.providerStatus)),
+      providerAttempts: shards.reduce(
+        (sum, shard) => sum + Number(shard.providerAttempts || 0),
+        0,
+      ),
+      updatedAt: latestTimestamp(shards.map((shard) => shard.updatedAt)),
+      oldestShardUpdatedAt:
+        shards.map((shard) => shard.updatedAt).filter(Boolean).sort().at(0) ||
+        null,
       shards,
+      top20k,
     },
     { headers: { "Cache-Control": "public, max-age=60" } },
   );
@@ -1408,7 +1508,45 @@ export default {
       ["GET", "HEAD"].includes(request.method) &&
       url.pathname === "/v1/progress"
     ) {
-      return combinedProgressResponse(request, env);
+      const progressCache = caches.default;
+      const normalizedProgressUrl = new URL(url.origin);
+      normalizedProgressUrl.pathname = "/v1/progress";
+      const progressKey = new Request(normalizedProgressUrl.toString(), {
+        method: "GET",
+      });
+      const cached = await progressCache.match(progressKey);
+      if (cached) {
+        const headers = new Headers(cached.headers);
+        headers.set("X-Lexora-Cache", "HIT");
+        if (request.method === "HEAD") {
+          return new Response(null, {
+            status: cached.status,
+            statusText: cached.statusText,
+            headers,
+          });
+        }
+        return new Response(cached.body, {
+          status: cached.status,
+          statusText: cached.statusText,
+          headers,
+        });
+      }
+      const fullRequest = new Request(request.url, {
+        method: "GET",
+        headers: request.headers,
+      });
+      const progress = await combinedProgressResponse(fullRequest, env);
+      if (progress.ok) {
+        ctx.waitUntil(progressCache.put(progressKey, progress.clone()));
+      }
+      if (request.method === "HEAD") {
+        return new Response(null, {
+          status: progress.status,
+          statusText: progress.statusText,
+          headers: progress.headers,
+        });
+      }
+      return progress;
     }
     const allowedMethod =
       ["GET", "HEAD"].includes(request.method) ||

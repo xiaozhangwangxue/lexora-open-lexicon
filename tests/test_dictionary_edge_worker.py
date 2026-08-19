@@ -1779,6 +1779,151 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
         )
         self.assertLess(result["elapsed"], 100)
 
+    def test_progress_combines_full_and_top20k_quality_details(self) -> None:
+        script = f"""
+          globalThis.caches = {{
+            default: {{
+              match: async () => null,
+              put: async () => undefined,
+            }},
+          }};
+          globalThis.fetch = async (input) => {{
+            const host = new URL(String(input)).hostname;
+            const primary = host === "primary.example";
+            return Response.json({{
+              shard: primary ? 0 : 1,
+              finished: primary ? 40 : 55,
+              total: primary ? 50 : 60,
+              entryStatus: {{
+                completed: primary ? 30 : 45,
+                partial: 10,
+              }},
+              providerStatus: {{ completed: primary ? 80 : 90 }},
+              providerAttempts: primary ? 100 : 120,
+              updatedAt: primary
+                ? "2026-08-19T01:00:00+00:00"
+                : "2026-08-19T01:01:00+00:00",
+              top20k: {{
+                qualityGateVersion: 1,
+                total: 10000,
+                complete: primary ? 9000 : 9999,
+                incomplete: primary ? 1000 : 1,
+                percent: primary ? 90 : 99.99,
+                terms: {{ words: primary ? 6000 : 5500, phrases: primary ? 4000 : 4500 }},
+                missing: {{ definition: primary ? 900 : 1, phonetic: primary ? 100 : 0 }},
+                entryStatus: {{ completed: primary ? 9000 : 9999 }},
+                unresolved: primary ? [{{ term: "missing", gaps: ["definition"] }}] : [],
+                updatedAt: primary
+                  ? "2026-08-19T01:02:00+00:00"
+                  : "2026-08-19T01:03:00+00:00",
+              }},
+            }});
+          }};
+          const {{ default: worker }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const response = await worker.fetch(
+            new Request("https://dict.example/v1/progress"),
+            {{
+              ORIGIN_TOKEN: "test-token",
+              PRIMARY_ORIGIN: "https://primary.example",
+              SECONDARY_ORIGIN: "https://secondary.example",
+            }},
+            {{ waitUntil: () => undefined }},
+          );
+          console.log(JSON.stringify({{
+            status: response.status,
+            body: await response.json(),
+          }}));
+        """
+        result = self.run_node(script)
+        self.assertEqual(result["status"], 200)
+        body = result["body"]
+        self.assertEqual(body["finished"], 95)
+        self.assertEqual(body["remaining"], 15)
+        self.assertEqual(body["entryStatus"]["completed"], 75)
+        self.assertEqual(body["providerAttempts"], 220)
+        self.assertTrue(body["top20k"]["available"])
+        self.assertFalse(body["top20k"]["ready"])
+        self.assertEqual(body["top20k"]["total"], 20000)
+        self.assertEqual(body["top20k"]["complete"], 18999)
+        self.assertEqual(body["top20k"]["missing"]["definition"], 901)
+        self.assertEqual(body["top20k"]["updatedAt"], "2026-08-19T01:03:00+00:00")
+
+    def test_progress_head_never_poisons_get_cache(self) -> None:
+        script = f"""
+          const cache = new Map();
+          globalThis.caches = {{
+            default: {{
+              match: async (request) => {{
+                const value = cache.get(request.url);
+                return value ? value.clone() : null;
+              }},
+              put: async (request, response) => {{
+                cache.set(request.url, response.clone());
+              }},
+            }},
+          }};
+          globalThis.fetch = async (input) => {{
+            const host = new URL(String(input)).hostname;
+            return Response.json({{
+              shard: host === "primary.example" ? 0 : 1,
+              finished: 5,
+              total: 10,
+              updatedAt: "2026-08-19T01:00:00+00:00",
+              top20k: {{
+                qualityGateVersion: 1,
+                total: 10000,
+                complete: 9000,
+                incomplete: 1000,
+                percent: 90,
+                updatedAt: "2026-08-19T01:00:00+00:00",
+              }},
+            }});
+          }};
+          const {{ default: worker }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const env = {{
+            ORIGIN_TOKEN: "test-token",
+            PRIMARY_ORIGIN: "https://primary.example",
+            SECONDARY_ORIGIN: "https://secondary.example",
+          }};
+          const pending = [];
+          const ctx = {{ waitUntil: (value) => pending.push(value) }};
+          const head = await worker.fetch(
+            new Request("https://dict.example/v1/progress?cache-bust=1", {{
+              method: "HEAD",
+            }}),
+            env,
+            ctx,
+          );
+          await Promise.all(pending);
+          const get = await worker.fetch(
+            new Request("https://dict.example/v1/progress?different=1"),
+            env,
+            {{ waitUntil: () => undefined }},
+          );
+          const body = await get.json();
+          console.log(JSON.stringify({{
+            headStatus: head.status,
+            headBody: await head.text(),
+            getStatus: get.status,
+            getCache: get.headers.get("X-Lexora-Cache"),
+            finished: body.finished,
+            topTotal: body.top20k.total,
+            cacheEntries: cache.size,
+          }}));
+        """
+        result = self.run_node(script)
+        self.assertEqual(result["headStatus"], 200)
+        self.assertEqual(result["headBody"], "")
+        self.assertEqual(result["getStatus"], 200)
+        self.assertEqual(result["getCache"], "HIT")
+        self.assertEqual(result["finished"], 10)
+        self.assertEqual(result["topTotal"], 20000)
+        self.assertEqual(result["cacheEntries"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,19 @@
+[Unit]
+Description=Cache Lexora top-20k quality progress for shard %i
+After=lexora-progress-snapshot@%i.service
+
+[Service]
+Type=oneshot
+User=opc
+WorkingDirectory=/opt/lexora
+ExecStart=/usr/bin/python3 /opt/lexora/tools/write_top20k_quality_snapshot.py \
+  --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+  --output /opt/lexora/state/top20k-quality-shard-%i.json \
+  --shard-index %i --shard-count 2 --unresolved-limit 8
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=5min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/opt/lexora/state
