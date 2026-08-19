@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: lexora-oci-production-deployment
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest

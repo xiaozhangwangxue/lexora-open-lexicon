@@ -8,6 +8,7 @@ User=opc
 WorkingDirectory=/opt/lexora
 ExecStart=/usr/bin/python3 /opt/lexora/tools/write_top20k_quality_snapshot.py \
   --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+  --candidate /opt/lexora/deployments/repair/current/build/lexora-open-oxford-safe-20k.sqlite \
   --output /opt/lexora/state/top20k-quality-shard-%i.json \
   --shard-index %i --shard-count 2 --unresolved-limit 8
 # Keep the hourly read-only scan below the active repair/collector (Nice=10),

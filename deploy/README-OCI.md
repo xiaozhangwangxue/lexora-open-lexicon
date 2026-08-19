@@ -130,3 +130,30 @@ sudo systemctl start lexora-top20k-repair@N.service
 
 Wiktionary 回退只接受原词或空格与连字符等价的页面标题，不采用拼写相似但不同的
 词条。仍无法可靠补全的词条保留在每日重试队列中，不能将极速包标记为完成。
+
+完成全局候选清洗后，应把同一份原子候选 SQLite 同步到两台实例，并改用其中的
+精确 ID 修复队列。不要再给这一步添加 `--max-frequency-rank 20000`，因为清洗后
+补位词条的原始排名可能大于 20,000：
+
+```sh
+python3 /opt/lexora/tools/enrich_oxford_scope.py \
+  --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+  --state /opt/lexora/state/fast20k-repair-N.sqlite \
+  --repair-queue /opt/lexora/build/lexora-open-oxford-safe-20k.sqlite \
+  --quality-repair-only \
+  --shard-index N --shard-count 2 \
+  --workers 8 --delay 16
+```
+
+队列在构建时已把 `canonical_id % shard_count` 固化为 `shard_owner`，不再根据两台
+服务器各自的 MIN/MAX 动态计算边界。消费者会先一次性核对本分片的全部词条、原始
+排名和来源身份摘要，全部通过后才创建联网客户端；状态库也绑定候选摘要。两台机器
+必须安装同一 SHA-256 的候选文件，并分别使用独立的新状态库。该模式沿用现有
+Cloudflare/Datamuse 全局免费额度限制，不能通过额外启动消费者突破每日 90,000 次
+上限。
+
+修复完成后使用 `tools/fast20k_repair_delta.py export` 在每台机器导出精确队列增量，
+本地执行 `validate-union` 确认两个 `shard_owner` 完整、无重叠、无漏项，再用
+`apply-union` 生成新的 canonical 快照。随后必须使用
+`fast20k_pipeline.py refresh` 保留原选集刷新内容；禁止重新执行 `select --replace`，
+否则修复产生的词性变化可能让选集漂移。

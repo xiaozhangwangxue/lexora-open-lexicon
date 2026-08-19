@@ -1805,6 +1805,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
                 : "2026-08-19T01:01:00+00:00",
               top20k: {{
                 qualityGateVersion: 1,
+                candidateDigest: "candidate-a",
                 total: 10000,
                 complete: primary ? 9000 : 9999,
                 incomplete: primary ? 1000 : 1,
@@ -1846,6 +1847,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
         self.assertTrue(body["top20k"]["available"])
         self.assertFalse(body["top20k"]["ready"])
         self.assertEqual(body["top20k"]["total"], 20000)
+        self.assertEqual(body["top20k"]["candidateDigest"], "candidate-a")
         self.assertEqual(body["top20k"]["complete"], 18999)
         self.assertEqual(body["top20k"]["missing"]["definition"], 901)
         self.assertEqual(body["top20k"]["updatedAt"], "2026-08-19T01:03:00+00:00")
@@ -1923,6 +1925,47 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
         self.assertEqual(result["finished"], 10)
         self.assertEqual(result["topTotal"], 20000)
         self.assertEqual(result["cacheEntries"], 1)
+
+    def test_progress_rejects_mixed_top20k_candidate_digests(self) -> None:
+        script = f"""
+          globalThis.caches = {{ default: {{
+            match: async () => null,
+            put: async () => undefined,
+          }} }};
+          globalThis.fetch = async (input) => {{
+            const primary = new URL(String(input)).hostname === "primary.example";
+            return Response.json({{
+              shard: primary ? 0 : 1,
+              finished: 1,
+              total: 1,
+              updatedAt: "2026-08-19T01:00:00+00:00",
+              top20k: {{
+                qualityGateVersion: 1,
+                candidateDigest: primary ? "candidate-a" : "candidate-b",
+                total: 10000,
+                complete: 10000,
+                incomplete: 0,
+              }},
+            }});
+          }};
+          const {{ default: worker }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const response = await worker.fetch(
+            new Request("https://dict.example/v1/progress"),
+            {{
+              ORIGIN_TOKEN: "test-token",
+              PRIMARY_ORIGIN: "https://primary.example",
+              SECONDARY_ORIGIN: "https://secondary.example",
+            }},
+            {{ waitUntil: () => undefined }},
+          );
+          console.log(JSON.stringify(await response.json()));
+        """
+        body = self.run_node(script)
+        self.assertFalse(body["top20k"]["available"])
+        self.assertFalse(body["top20k"]["ready"])
+        self.assertIsNone(body["top20k"]["candidateDigest"])
 
 
 if __name__ == "__main__":

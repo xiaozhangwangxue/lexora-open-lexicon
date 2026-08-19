@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import hashlib
 import html
 import json
 import math
@@ -17,6 +18,7 @@ import random
 import re
 import sqlite3
 import time
+import unicodedata
 from html.parser import HTMLParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -24,6 +26,17 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+from fast20k_contract import (
+    ENTRY_COLUMNS,
+    POLICY_NAME as FAST20K_POLICY_NAME,
+    SELECTION_VERSION as FAST20K_SELECTION_VERSION,
+    candidate_contract_digest,
+    canonical_content_digest,
+    canonical_identity_digest,
+    queue_row_digest,
+    selection_row_digest,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / "build"
@@ -37,6 +50,32 @@ ENTRY_SELECT_COLUMNS = (
     "related_words_json,related_entries_json,frequency,difficulty,"
     "enrichment_json,pos"
 )
+REPAIR_PAYLOAD_COLUMNS = (
+    "pos",
+    "definition",
+    "definition_zh",
+    "us_phonetic",
+    "uk_phonetic",
+    "synonyms_json",
+    "antonyms_json",
+    "examples_json",
+    "phrases_json",
+    "phrase_entries_json",
+    "related_words_json",
+    "related_entries_json",
+    "frequency",
+    "difficulty",
+)
+
+
+def repair_payload_digest(row: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        [row.get(column) for column in REPAIR_PAYLOAD_COLUMNS],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -60,6 +99,10 @@ def normalized_term(value: Any) -> str:
     return " ".join(str(value or "").strip().lower().replace("’", "'").split())
 
 
+def candidate_term_key(value: Any) -> str:
+    return normalized_term(unicodedata.normalize("NFKC", str(value or "")))
+
+
 PHRASE_POS_NAMES = {
     "phrase",
     "prep_phrase",
@@ -67,6 +110,10 @@ PHRASE_POS_NAMES = {
     "proverb",
     "idiom",
 }
+
+ARPABET_PHONETIC = re.compile(
+    r"(?:[A-Z]+[0-2]?)(?:\s+[A-Z]+[0-2]?)+"
+)
 
 
 def is_phrase(term: Any, pos: Any = "") -> bool:
@@ -268,8 +315,14 @@ def normalize_phonetic(value: Any) -> str:
 
 def needs_phonetic_repair(value: Any) -> bool:
     """Treat empty and known legacy transcription forms as incomplete."""
-    text = str(value or "").strip()
-    return not text or "ә" in text or ":" in text
+    text = str(value or "").strip().strip("/")
+    return (
+        not text
+        or "ә" in text
+        or ":" in text
+        or "\ufffd" in text
+        or bool(ARPABET_PHONETIC.fullmatch(text))
+    )
 
 
 def needs_definition_translation(definition: Any, translation: Any) -> bool:
@@ -364,8 +417,59 @@ def init_state(path: Path) -> sqlite3.Connection:
       updated_at TEXT NOT NULL, PRIMARY KEY(term,source))""")
     db.execute("CREATE INDEX IF NOT EXISTS idx_provider_state_status ON provider_state(status,updated_at)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_provider_state_updated_at ON provider_state(updated_at)")
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS run_contract(
+          name TEXT PRIMARY KEY, value TEXT NOT NULL)"""
+    )
     db.commit()
     return db
+
+
+def bind_state_candidate(
+    state: sqlite3.Connection,
+    candidate_digest: str,
+    *,
+    shard_owner: int,
+) -> None:
+    """Refuse to reuse provider state for a different fixed candidate queue."""
+    expected = {
+        "candidate_digest": candidate_digest,
+        "shard_owner": str(shard_owner),
+    }
+    state.execute("BEGIN IMMEDIATE")
+    try:
+        existing = {
+            str(row[0]): str(row[1])
+            for row in state.execute("SELECT name,value FROM run_contract")
+        }
+        if not existing:
+            legacy_rows = int(
+                state.execute("SELECT count(*) FROM provider_state").fetchone()[0]
+            )
+            if legacy_rows:
+                raise ValueError(
+                    "repair state has provider rows but no candidate digest: "
+                    "use a fresh --state file"
+                )
+            state.executemany(
+                "INSERT INTO run_contract(name,value) VALUES(?,?)",
+                expected.items(),
+            )
+        elif existing != expected:
+            raise ValueError(
+                "repair state candidate digest or shard mismatch: "
+                "use a fresh --state file"
+            )
+        rebound = {
+            str(row[0]): str(row[1])
+            for row in state.execute("SELECT name,value FROM run_contract")
+        }
+        if rebound != expected:
+            raise ValueError("repair state binding verification failed")
+        state.commit()
+    except Exception:
+        state.rollback()
+        raise
 
 
 def ensure_dataset_columns(database: sqlite3.Connection) -> None:
@@ -462,6 +566,435 @@ def fetch_candidate_batch(
         return [tuple(row[:-1]) for row in raw_rows], next_rank, next_id
     next_id = int(raw_rows[-1][0])
     return [tuple(row) for row in raw_rows], None, next_id
+
+
+def _contract_stream_digest(rows: Any, row_hasher: Any) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(row_hasher(tuple(row)).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def validate_repair_queue_internal(
+    database: sqlite3.Connection,
+    metadata: dict[str, Any],
+) -> None:
+    queue_rows = {
+        int(row[0]): tuple(row)
+        for row in database.execute(
+            "SELECT canonical_id,selected_rank,canonical_frequency_rank,"
+            "normalized_word,canonical_identity_sha256,gaps_json,shard_owner "
+            "FROM repair_queue ORDER BY canonical_id"
+        )
+    }
+    seen = 0
+    columns = ",".join(f"e.{column}" for column in ENTRY_COLUMNS)
+    cursor = database.execute(
+        "SELECT e.id," + columns
+        + ",p.selected_rank,p.canonical_frequency_rank,"
+        "p.normalized_word AS provenance_word,p.term_key,"
+        "p.canonical_content_sha256,p.canonical_identity_sha256 "
+        "FROM entries e JOIN fast20k_provenance p ON p.canonical_id=e.id "
+        "ORDER BY p.selected_rank"
+    )
+    for raw in cursor:
+        seen += 1
+        entry_id = int(raw[0])
+        values = tuple(raw[1 : 1 + len(ENTRY_COLUMNS)])
+        selected_rank = int(raw[1 + len(ENTRY_COLUMNS)])
+        canonical_rank = int(raw[2 + len(ENTRY_COLUMNS)])
+        provenance_word = str(raw[3 + len(ENTRY_COLUMNS)])
+        provenance_key = str(raw[4 + len(ENTRY_COLUMNS)])
+        expected_content = str(raw[5 + len(ENTRY_COLUMNS)])
+        expected_identity = str(raw[6 + len(ENTRY_COLUMNS)])
+        candidate_row = dict(zip(ENTRY_COLUMNS, values))
+        if int(candidate_row["frequency_rank"]) != selected_rank:
+            raise ValueError(
+                f"repair queue internal rank mismatch: id={entry_id}"
+            )
+        baseline_row = {"id": entry_id, **candidate_row}
+        baseline_row["frequency_rank"] = canonical_rank
+        if (
+            normalized_term(candidate_row["normalized_word"])
+            != normalized_term(provenance_word)
+            or candidate_term_key(candidate_row["normalized_word"])
+            != provenance_key
+            or canonical_content_digest(baseline_row) != expected_content
+            or canonical_identity_digest(baseline_row) != expected_identity
+        ):
+            raise ValueError(
+                f"repair queue internal provenance mismatch: id={entry_id}"
+            )
+        gaps = entry_quality_gaps(
+            candidate_row["normalized_word"],
+            candidate_row["definition"],
+            candidate_row["definition_zh"],
+            candidate_row["us_phonetic"],
+            candidate_row["uk_phonetic"],
+            candidate_row["pos"],
+        )
+        actual_queue = queue_rows.pop(entry_id, None)
+        if not gaps:
+            if actual_queue is not None:
+                raise ValueError(
+                    f"repair queue contains complete entry: id={entry_id}"
+                )
+            continue
+        expected_queue = (
+            entry_id,
+            selected_rank,
+            canonical_rank,
+            str(candidate_row["normalized_word"]),
+            expected_identity,
+            json.dumps(gaps, ensure_ascii=False, separators=(",", ":")),
+            entry_id % int(metadata["shard_count"]),
+        )
+        if actual_queue != expected_queue:
+            raise ValueError(
+                f"repair queue internal row mismatch: id={entry_id}"
+            )
+    cursor.close()
+    expected_rows = int(metadata["expected_rows"])
+    entry_count = int(database.execute("SELECT count(*) FROM entries").fetchone()[0])
+    provenance_count = int(
+        database.execute("SELECT count(*) FROM fast20k_provenance").fetchone()[0]
+    )
+    ranks = tuple(
+        database.execute(
+            "SELECT MIN(selected_rank),MAX(selected_rank),"
+            "COUNT(DISTINCT selected_rank) FROM fast20k_provenance"
+        ).fetchone()
+    )
+    kind_counts = {
+        str(row[0]): int(row[1])
+        for row in database.execute(
+            "SELECT kind,count(*) FROM fast20k_provenance GROUP BY kind"
+        )
+    }
+    if (
+        entry_count != expected_rows
+        or provenance_count != expected_rows
+        or seen != expected_rows
+        or ranks != (1, expected_rows, expected_rows)
+        or kind_counts.get("word", 0) != int(metadata["word_count"])
+        or kind_counts.get("phrase", 0) != int(metadata["phrase_count"])
+        or queue_rows
+    ):
+        raise ValueError(
+            "repair queue internal coverage mismatch: "
+            f"expected={expected_rows} entries={entry_count} "
+            f"provenance={provenance_count}/{seen} ranks={ranks} "
+            f"kinds={kind_counts} extra_queue={len(queue_rows)}"
+        )
+
+
+def repair_queue_metadata(database: sqlite3.Connection) -> dict[str, Any]:
+    row = database.execute(
+        "SELECT selection_version,policy_name,expected_rows,word_count,phrase_count,"
+        "shard_count,selection_digest,"
+        "baseline_content_digest,repair_queue_digest,candidate_digest "
+        "FROM fast20k_metadata WHERE id=1"
+    ).fetchone()
+    if row is None:
+        raise ValueError("repair queue contract mismatch: metadata missing")
+    metadata = {
+        "selection_version": int(row[0]),
+        "policy_name": str(row[1]),
+        "expected_rows": int(row[2]),
+        "word_count": int(row[3]),
+        "phrase_count": int(row[4]),
+        "shard_count": int(row[5]),
+        "selection_digest": str(row[6]),
+        "baseline_content_digest": str(row[7]),
+        "repair_queue_digest": str(row[8]),
+        "candidate_digest": str(row[9]),
+    }
+    if (
+        metadata["selection_version"] != FAST20K_SELECTION_VERSION
+        or metadata["policy_name"] != FAST20K_POLICY_NAME
+        or metadata["shard_count"] < 1
+    ):
+        raise ValueError("repair queue contract mismatch: unsupported metadata")
+    actual_selection = _contract_stream_digest(
+        database.execute(
+            "SELECT canonical_id,selected_rank,canonical_frequency_rank,"
+            "normalized_word,term_key,kind,ranking_evidence,phrase_evidence,"
+            "canonical_identity_sha256 FROM fast20k_provenance "
+            "ORDER BY selected_rank"
+        ),
+        selection_row_digest,
+    )
+    actual_queue = _contract_stream_digest(
+        database.execute(
+            "SELECT canonical_id,selected_rank,canonical_frequency_rank,"
+            "normalized_word,canonical_identity_sha256,gaps_json,shard_owner "
+            "FROM repair_queue ORDER BY canonical_id"
+        ),
+        queue_row_digest,
+    )
+    actual_baseline = _contract_stream_digest(
+        database.execute(
+            "SELECT canonical_id,canonical_content_sha256 "
+            "FROM fast20k_provenance ORDER BY selected_rank"
+        ),
+        selection_row_digest,
+    )
+    actual_candidate = candidate_contract_digest(
+        actual_selection,
+        actual_baseline,
+        actual_queue,
+        shard_count=metadata["shard_count"],
+    )
+    if (
+        actual_selection != metadata["selection_digest"]
+        or actual_baseline != metadata["baseline_content_digest"]
+        or actual_queue != metadata["repair_queue_digest"]
+        or actual_candidate != metadata["candidate_digest"]
+    ):
+        raise ValueError("repair queue contract mismatch: digest mismatch")
+    validate_repair_queue_internal(database, metadata)
+    return metadata
+
+
+def open_repair_queue(path: Path) -> sqlite3.Connection:
+    """Open and validate a candidate-embedded repair queue read-only."""
+    database = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+    try:
+        database.row_factory = sqlite3.Row
+        database.execute("PRAGMA query_only=ON")
+        # Pin every metadata, provenance and queue read to one immutable WAL
+        # snapshot.  A candidate replacement during validation must never let
+        # one process consume a mixture of two contracts.
+        database.execute("BEGIN")
+        integrity = [
+            str(row[0]) for row in database.execute("PRAGMA quick_check").fetchmany(21)
+        ]
+        if integrity != ["ok"]:
+            raise ValueError(
+                "repair queue contract mismatch: SQLite quick_check failed"
+            )
+        tables = {
+            str(row[0])
+            for row in database.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        required = {"fast20k_metadata", "fast20k_provenance", "repair_queue"}
+        if not required <= tables:
+            raise ValueError(
+                "repair queue contract mismatch: missing "
+                + ",".join(sorted(required - tables))
+            )
+        queue_columns = {
+            str(row[1]) for row in database.execute("PRAGMA table_info(repair_queue)")
+        }
+        if "shard_owner" not in queue_columns:
+            raise ValueError(
+                "repair queue contract mismatch: shard_owner is missing"
+            )
+        repair_queue_metadata(database)
+    except Exception:
+        database.close()
+        raise
+    return database
+
+
+def fetch_repair_queue_batch(
+    dataset: sqlite3.Connection,
+    queue: sqlite3.Connection,
+    *,
+    start_id: int | None,
+    end_id: int | None,
+    after_id: int | None,
+    batch_size: int,
+    shard_owner: int | None = None,
+) -> tuple[list[tuple[Any, ...]], int | None]:
+    """Fetch exact queued IDs without applying a frequency-rank ceiling."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    clauses: list[str] = []
+    params: list[int] = []
+    if shard_owner is not None:
+        clauses.append("shard_owner=?")
+        params.append(shard_owner)
+    if start_id is not None:
+        clauses.append("canonical_id>=?")
+        params.append(start_id)
+    if end_id is not None:
+        clauses.append("canonical_id<=?")
+        params.append(end_id)
+    if after_id is not None:
+        clauses.append("canonical_id>?")
+        params.append(after_id)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    queue_rows = queue.execute(
+        "SELECT canonical_id,normalized_word,canonical_frequency_rank,"
+        "canonical_identity_sha256 FROM repair_queue"
+        + where
+        + " ORDER BY canonical_id LIMIT ?",
+        (*params, batch_size),
+    ).fetchall()
+    if not queue_rows:
+        return [], after_id
+    ids = [int(row[0]) for row in queue_rows]
+    placeholders = ",".join("?" for _ in ids)
+    rows = dataset.execute(
+        f"SELECT {ENTRY_SELECT_COLUMNS},frequency_rank,source_json,scope_json "
+        f"FROM entries WHERE id IN ({placeholders}) ORDER BY id",
+        ids,
+    ).fetchall()
+    by_id = {int(row[0]): row for row in rows}
+    selected: list[tuple[Any, ...]] = []
+    for queued in queue_rows:
+        canonical_id = int(queued[0])
+        row = by_id.get(canonical_id)
+        if row is None:
+            raise ValueError(
+                "repair queue provenance mismatch: "
+                f"canonical id {canonical_id} is missing"
+            )
+        identity = canonical_identity_digest(
+            {
+                "id": row[0],
+                "word": row[1],
+                "normalized_word": row[2],
+                "frequency_rank": row[18],
+                "source_json": row[19],
+                "scope_json": row[20],
+            }
+        )
+        if (
+            normalized_term(row[2]) != normalized_term(queued[1])
+            or int(row[18]) != int(queued[2])
+            or identity != str(queued[3])
+        ):
+            raise ValueError(
+                "repair queue provenance mismatch: "
+                f"canonical id {canonical_id} changed"
+            )
+        selected.append(tuple(row[:18]))
+    return selected, ids[-1]
+
+
+def verify_repair_page_content(
+    dataset: sqlite3.Connection,
+    queue: sqlite3.Connection,
+    entry_ids: list[int],
+    *,
+    candidate_digest: str,
+    shard_owner: int,
+) -> None:
+    if not entry_ids:
+        return
+    placeholders = ",".join("?" for _ in entry_ids)
+    expected = {
+        int(row[0]): str(row[1])
+        for row in queue.execute(
+            "SELECT p.canonical_id,p.canonical_content_sha256 "
+            "FROM fast20k_provenance p JOIN repair_queue q "
+            "ON q.canonical_id=p.canonical_id "
+            f"WHERE p.canonical_id IN ({placeholders})",
+            entry_ids,
+        )
+    }
+    columns = ("id", *ENTRY_COLUMNS)
+    rows = dataset.execute(
+        "SELECT " + ",".join(columns)
+        + f" FROM entries WHERE id IN ({placeholders})",
+        entry_ids,
+    ).fetchall()
+    current = {int(row[0]): dict(zip(columns, tuple(row))) for row in rows}
+    for entry_id in entry_ids:
+        row = current.get(entry_id)
+        if row is None or entry_id not in expected:
+            raise ValueError(
+                f"repair queue content provenance mismatch: id={entry_id} missing"
+            )
+        if canonical_content_digest(row) == expected[entry_id]:
+            continue
+        try:
+            marker = json.loads(str(row.get("enrichment_json") or "{}"))
+        except json.JSONDecodeError:
+            marker = {}
+        if (
+            not isinstance(marker, dict)
+            or str(marker.get("repairCandidateDigest") or "") != candidate_digest
+            or int(marker.get("repairShardOwner", -1)) != shard_owner
+            or str(marker.get("repairPayloadDigest") or "")
+            != repair_payload_digest(row)
+        ):
+            raise ValueError(
+                "repair queue content provenance mismatch: "
+                f"canonical id {entry_id} differs from candidate baseline"
+            )
+
+
+def preflight_repair_queue_shard(
+    dataset: sqlite3.Connection,
+    queue: sqlite3.Connection,
+    *,
+    shard_index: int,
+    shard_count: int,
+    batch_size: int = 512,
+) -> tuple[list[tuple[Any, ...]], dict[str, Any]]:
+    """Validate every queued identity for one fixed shard before networking."""
+    metadata = repair_queue_metadata(queue)
+    if shard_count != int(metadata["shard_count"]):
+        raise ValueError(
+            "repair queue shard count mismatch: "
+            f"candidate={metadata['shard_count']} runtime={shard_count}"
+        )
+    if not 0 <= shard_index < shard_count:
+        raise ValueError("--shard-index must be within [0, --shard-count)")
+    invalid_owner = queue.execute(
+        "SELECT canonical_id FROM repair_queue "
+        "WHERE shard_owner != (canonical_id % ?) LIMIT 1",
+        (shard_count,),
+    ).fetchone()
+    if invalid_owner is not None:
+        raise ValueError(
+            "repair queue shard ownership mismatch: "
+            f"canonical id {invalid_owner[0]}"
+        )
+    expected = int(
+        queue.execute(
+            "SELECT count(*) FROM repair_queue WHERE shard_owner=?",
+            (shard_index,),
+        ).fetchone()[0]
+    )
+    rows: list[tuple[Any, ...]] = []
+    after_id: int | None = None
+    dataset.execute("BEGIN")
+    try:
+        while True:
+            page, next_id = fetch_repair_queue_batch(
+                dataset,
+                queue,
+                start_id=None,
+                end_id=None,
+                after_id=after_id,
+                batch_size=batch_size,
+                shard_owner=shard_index,
+            )
+            if not page:
+                break
+            verify_repair_page_content(
+                dataset,
+                queue,
+                [int(row[0]) for row in page],
+                candidate_digest=str(metadata["candidate_digest"]),
+                shard_owner=shard_index,
+            )
+            rows.extend(page)
+            after_id = next_id
+    finally:
+        dataset.rollback()
+    if len(rows) != expected:
+        raise ValueError(
+            f"repair queue preflight count mismatch: expected={expected} actual={len(rows)}"
+        )
+    return rows, metadata
 
 
 class HostGate:
@@ -1396,7 +1929,7 @@ async def enrich_term(
     }
     sources: list[str] = []
     phrase = is_phrase(term, existing.get("pos"))
-    needs_definition = not existing.get("definition")
+    needs_definition = not str(existing.get("definition") or "").strip()
     needs_pos = not phrase and not str(existing.get("pos") or "").strip()
     needs_phonetic = (
         not phrase
@@ -1635,45 +2168,87 @@ async def run(
     profile: str = "core",
     max_frequency_rank: int | None = None,
     quality_repair_only: bool = False,
+    repair_queue: Path | None = None,
 ) -> None:
-    state = init_state(state_path)
+    if repair_queue is not None and not quality_repair_only:
+        raise ValueError("--repair-queue requires --quality-repair-only")
+    if repair_queue is not None and max_frequency_rank is not None:
+        raise ValueError(
+            "--repair-queue cannot be combined with --max-frequency-rank; "
+            "replacement candidates may rank beyond 20,000"
+        )
+    if repair_queue is not None and shard_index is None:
+        raise ValueError("--repair-queue requires --shard-index")
+    if repair_queue is not None and (start_id is not None or end_id is not None):
+        raise ValueError("--repair-queue uses fixed shard_owner, not ID bounds")
     workers = max(1, workers)
     profile = "deep" if profile == "deep" else "core"
-    gates = {
-        "edge": HostGate(delay, min(4, workers)),
-        "dictionary": HostGate(delay, min(4, workers)),
-        "datamuse": HostGate(delay, min(8, workers)),
-        "translation": HostGate(max(delay, translation_delay), min(2, workers)),
-        "wiktionary": HostGate(max(2.0, min(delay, 4.0)), 1),
-    }
-    client_timeout = httpx.Timeout(20.0, connect=10.0)
-    client = httpx.AsyncClient(timeout=client_timeout, follow_redirects=True)
-    edge_batcher = (
-        EdgeDictionaryBatcher(
-            client,
-            gates["edge"],
-            batch_size=workers,
-            profile=profile,
-        )
-        if EDGE_BASE
-        else None
-    )
-    translation_batcher = (
-        EdgeTranslationBatcher(client, gates["translation"], batch_size=workers)
-        if EDGE_BASE
-        else None
-    )
+    state: sqlite3.Connection | None = None
+    client: httpx.AsyncClient | None = None
     db: sqlite3.Connection | None = None
+    repair_queue_db: sqlite3.Connection | None = None
+    prevalidated_repair_rows: list[tuple[Any, ...]] | None = None
+    queue_metadata: dict[str, Any] | None = None
     try:
         db = sqlite3.connect(dataset)
         ensure_dataset_columns(db)
-        if shard_index is not None:
+        if repair_queue is not None:
+            repair_queue_db = open_repair_queue(repair_queue)
+            prevalidated_repair_rows, queue_metadata = preflight_repair_queue_shard(
+                db,
+                repair_queue_db,
+                shard_index=int(shard_index),
+                shard_count=shard_count,
+            )
+            state = init_state(state_path)
+            bind_state_candidate(
+                state,
+                str(queue_metadata["candidate_digest"]),
+                shard_owner=int(shard_index),
+            )
+        else:
+            state = init_state(state_path)
+        if shard_index is not None and repair_queue_db is None:
             if shard_count < 1 or not 0 <= shard_index < shard_count:
                 raise ValueError("--shard-index must be within [0, --shard-count)")
             min_id, max_id = db.execute("SELECT COALESCE(MIN(id), 0), COALESCE(MAX(id), -1) FROM entries").fetchone()
             total = max(0, max_id - min_id + 1)
             start_id = min_id + (total * shard_index) // shard_count
             end_id = min_id + (total * (shard_index + 1)) // shard_count - 1
+
+        # No HTTP client or batcher exists until the complete fixed shard has
+        # passed provenance validation and its state file is bound to the
+        # candidate contract digest.
+        gates = {
+            "edge": HostGate(delay, min(4, workers)),
+            "dictionary": HostGate(delay, min(4, workers)),
+            "datamuse": HostGate(delay, min(8, workers)),
+            "translation": HostGate(
+                max(delay, translation_delay), min(2, workers)
+            ),
+            "wiktionary": HostGate(max(2.0, min(delay, 4.0)), 1),
+        }
+        client_timeout = httpx.Timeout(20.0, connect=10.0)
+        client = httpx.AsyncClient(timeout=client_timeout, follow_redirects=True)
+        edge_batcher = (
+            EdgeDictionaryBatcher(
+                client,
+                gates["edge"],
+                batch_size=workers,
+                profile=profile,
+            )
+            if EDGE_BASE
+            else None
+        )
+        translation_batcher = (
+            EdgeTranslationBatcher(
+                client,
+                gates["translation"],
+                batch_size=workers,
+            )
+            if EDGE_BASE
+            else None
+        )
         processed = 0
         async def process_row(row: tuple[Any, ...]) -> tuple[str, str]:
             entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, phrases_json, phrase_entries_json, related_json, related_entries_json, freq, diff, enrich_json, pos = row
@@ -1702,8 +2277,10 @@ async def run(
                 profile=profile,
                 quality_repair_only=quality_repair_only,
             )
-            pos = pos or data.get("pos", "")
-            definition = definition or data.get("definition", "")
+            if not str(pos or "").strip():
+                pos = data.get("pos", "")
+            if not str(definition or "").strip():
+                definition = data.get("definition", "")
             if needs_phonetic_repair(us):
                 us = normalize_phonetic(
                     data.get("us", "") or data.get("us_phonetic", "")
@@ -1813,8 +2390,30 @@ async def run(
                 },
                 "qualityGaps": quality_gaps,
             }
+            payload = {
+                "pos": pos,
+                "definition": definition,
+                "definition_zh": zh,
+                "us_phonetic": us,
+                "uk_phonetic": uk,
+                "synonyms_json": j(synonyms),
+                "antonyms_json": j(antonyms),
+                "examples_json": j(examples),
+                "phrases_json": j(phrases),
+                "phrase_entries_json": j(phrase_entries),
+                "related_words_json": j(related),
+                "related_entries_json": j(related_entries),
+                "frequency": score,
+                "difficulty": resolved_difficulty(diff, freq, score),
+            }
+            if queue_metadata is not None:
+                marker["repairCandidateDigest"] = queue_metadata[
+                    "candidate_digest"
+                ]
+                marker["repairShardOwner"] = int(shard_index)
+                marker["repairPayloadDigest"] = repair_payload_digest(payload)
             db.execute("""UPDATE entries SET pos=?,definition=?,definition_zh=?,us_phonetic=?,uk_phonetic=?,synonyms_json=?,antonyms_json=?,examples_json=?,phrases_json=?,phrase_entries_json=?,related_words_json=?,related_entries_json=?,frequency=?,difficulty=?,enrichment_json=? WHERE id=?""",
-              (pos, definition, zh, us, uk, j(synonyms), j(antonyms), j(examples), j(phrases), j(phrase_entries), j(related), j(related_entries), score, resolved_difficulty(diff, freq, score), j(marker), entry_id))
+              (*(payload[column] for column in REPAIR_PAYLOAD_COLUMNS), j(marker), entry_id))
             db.execute("""INSERT OR REPLACE INTO entries_fts(rowid,word,definition,definition_zh,examples,phrases)
               SELECT id,word,definition,definition_zh,examples_json,phrases_json FROM entries WHERE id=?""", (entry_id,))
             db.commit(); state.commit()
@@ -1862,18 +2461,27 @@ async def run(
         candidate_batch_size = max(64, min(512, workers * 16))
         after_frequency_rank: int | None = None
         after_id: int | None = None
+        repair_offset = 0
         reached_limit = False
         while not reached_limit:
-            rows, next_frequency_rank, next_id = fetch_candidate_batch(
-                db,
-                start_id=start_id,
-                end_id=end_id,
-                frequency_first=shard_index is not None,
-                after_frequency_rank=after_frequency_rank,
-                after_id=after_id,
-                batch_size=candidate_batch_size,
-                max_frequency_rank=max_frequency_rank,
-            )
+            if prevalidated_repair_rows is not None:
+                rows = prevalidated_repair_rows[
+                    repair_offset : repair_offset + candidate_batch_size
+                ]
+                repair_offset += len(rows)
+                next_id = int(rows[-1][0]) if rows else after_id
+                next_frequency_rank = None
+            else:
+                rows, next_frequency_rank, next_id = fetch_candidate_batch(
+                    db,
+                    start_id=start_id,
+                    end_id=end_id,
+                    frequency_first=shard_index is not None,
+                    after_frequency_rank=after_frequency_rank,
+                    after_id=after_id,
+                    batch_size=candidate_batch_size,
+                    max_frequency_rank=max_frequency_rank,
+                )
             if not rows:
                 break
             # Advance the keyset only after a complete, closed read page.  If
@@ -1933,10 +2541,14 @@ async def run(
         if pending:
             await flush_pending()
     finally:
+        if repair_queue_db is not None:
+            repair_queue_db.close()
         if db is not None:
             db.close()
-        await client.aclose()
-        state.close()
+        if client is not None:
+            await client.aclose()
+        if state is not None:
+            state.close()
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -1974,9 +2586,21 @@ def main() -> None:
             "single-word phonetic gaps"
         ),
     )
+    ap.add_argument(
+        "--repair-queue",
+        type=Path,
+        help=(
+            "candidate SQLite produced by fast20k_pipeline.py; process only "
+            "its exact repair_queue IDs (including replacements ranked above 20,000)"
+        ),
+    )
     args = ap.parse_args()
     if args.shard_index is not None and (args.start_id is not None or args.end_id is not None):
         ap.error("use either --shard-index/--shard-count or --start-id/--end-id, not both")
+    if args.repair_queue is not None and not args.quality_repair_only:
+        ap.error("--repair-queue requires --quality-repair-only")
+    if args.repair_queue is not None and args.max_frequency_rank is not None:
+        ap.error("--repair-queue cannot be combined with --max-frequency-rank")
     profiles = ("core", "deep") if args.profile == "auto" else (args.profile,)
     for profile in profiles:
         asyncio.run(
@@ -1995,6 +2619,7 @@ def main() -> None:
                 profile=profile,
                 max_frequency_rank=args.max_frequency_rank,
                 quality_repair_only=args.quality_repair_only,
+                repair_queue=args.repair_queue,
             )
         )
 

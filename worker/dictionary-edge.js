@@ -324,10 +324,16 @@ async function combinedProgressResponse(request, env) {
   );
   const qualityGateVersion =
     qualityGateVersions.size === 1 ? [...qualityGateVersions][0] : null;
+  const candidateDigests = new Set(
+    qualityShards.map((shard) => String(shard.candidateDigest || "")),
+  );
+  const candidateDigest =
+    candidateDigests.size === 1 ? [...candidateDigests][0] : null;
   const qualityAvailable =
     qualityShards.length === origins.length &&
     Number.isInteger(qualityGateVersion) &&
-    qualityGateVersion > 0;
+    qualityGateVersion > 0 &&
+    Boolean(candidateDigest);
   const top20k = {
     available: qualityAvailable,
     ready:
@@ -336,6 +342,7 @@ async function combinedProgressResponse(request, env) {
       qualityIncomplete === 0,
     total: qualityTotal,
     qualityGateVersion,
+    candidateDigest,
     complete: qualityComplete,
     incomplete: qualityIncomplete,
     percent:

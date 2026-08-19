@@ -1,25 +1,37 @@
-name: Deploy top-20k repair
+name: Prepare top-20k repair deployment
 
 on:
   workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type PREPARE_SAFE_TOP20K exactly; this does not activate services
+        required: true
+        type: string
+      release_id:
+        description: Optional immutable release id (letters, digits, dot, dash, underscore)
+        required: false
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: lexora-oci-production-deployment
+  cancel-in-progress: false
+
 jobs:
-  deploy:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - host: 140.245.114.238
-            shard: 0
-          - host: 134.185.82.7
-            shard: 1
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+
+      - name: Require an explicit non-activating confirmation
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          test "$CONFIRMATION" = PREPARE_SAFE_TOP20K
 
       - name: Prepare SSH credentials
         shell: bash
@@ -33,51 +45,225 @@ jobs:
           printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 0600 ~/.ssh/known_hosts
 
-      - name: Upload repair files
+      - name: Build one immutable code bundle
         shell: bash
+        env:
+          REQUESTED_RELEASE_ID: ${{ inputs.release_id }}
         run: |
-          scp -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
-            -o ConnectTimeout=30 \
-            tools/enrich_oxford_scope.py tools/top20k_quality.py \
-            deploy/lexora-top20k-repair@.service \
-            deploy/lexora-top20k-repair@.timer \
-            "opc@${{ matrix.host }}:/tmp/"
-
-      - name: Install and start bounded repair
-        shell: bash
-        run: |
-          ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
-            -o ConnectTimeout=30 "opc@${{ matrix.host }}" \
-            'bash -se' <<'REMOTE'
           set -euo pipefail
-          stamp=$(date -u +%Y%m%dT%H%M%SZ)
-          cp /opt/lexora/tools/enrich_oxford_scope.py \
-            "/opt/lexora/tools/enrich_oxford_scope.py.pre-top20k-$stamp"
-          sudo install -o opc -g opc -m 0755 \
-            /tmp/enrich_oxford_scope.py \
-            /opt/lexora/tools/enrich_oxford_scope.py
-          sudo install -o opc -g opc -m 0755 \
-            /tmp/top20k_quality.py \
-            /opt/lexora/tools/top20k_quality.py
-          sudo install -m 0644 /tmp/lexora-top20k-repair@.service \
-            /etc/systemd/system/lexora-top20k-repair@.service
-          sudo install -m 0644 /tmp/lexora-top20k-repair@.timer \
-            /etc/systemd/system/lexora-top20k-repair@.timer
-          python3 -m py_compile \
-            /opt/lexora/tools/enrich_oxford_scope.py \
-            /opt/lexora/tools/top20k_quality.py
-          python3 -c "import sqlite3; db=sqlite3.connect('/opt/lexora/build/lexora-open-oxford-scope.sqlite'); print('top20k_rows=' + str(db.execute('SELECT count(*) FROM entries WHERE frequency_rank <= 20000').fetchone()[0])); db.close()"
-          sudo systemctl daemon-reload
-          sudo systemctl enable lexora-top20k-repair@'${{ matrix.shard }}'.timer
-          sudo systemctl start --no-block \
-            lexora-top20k-repair@'${{ matrix.shard }}'.service
-          sleep 3
-          state=$(systemctl is-active \
-            lexora-top20k-repair@'${{ matrix.shard }}'.service || true)
-          case "$state" in
-            active|activating) ;;
-            *) echo "unexpected repair state: $state"; exit 1 ;;
-          esac
-          systemctl show lexora-top20k-repair@'${{ matrix.shard }}'.service \
-            -p MainPID -p ActiveState -p SubState
+          release_id=$REQUESTED_RELEASE_ID
+          if [ -z "$release_id" ]; then
+            release_id="${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}"
+          fi
+          [[ "$release_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          test -f tools/fast20k_pipeline.py
+          test -f tools/fast20k_contract.py
+          test -f deploy/deployment_transaction.py
+          test -f deploy/top20k_release_control.sh
+          mkdir -p deployment-receipts
+          find tools service deploy -type f \
+            \( -name '*.py' -o -name '*.service' -o -name '*.timer' \
+               -o -name '*.conf' -o -name '*.sh' \) -print0 \
+            | sort -z \
+            | tar --null --files-from=- --create --gzip \
+                --sort=name --mtime='UTC 1970-01-01' \
+                --owner=0 --group=0 --numeric-owner \
+                --file=deployment-receipts/code.tar.gz
+          code_sha=$(sha256sum deployment-receipts/code.tar.gz | awk '{print $1}')
+          printf 'RELEASE_ID=%s\nCODE_SHA=%s\n' "$release_id" "$code_sha" \
+            >> "$GITHUB_ENV"
+          printf 'release_id=%s\ncode_sha256=%s\n' "$release_id" "$code_sha" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage full code and export online canonical snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          hosts=(140.245.114.238 134.185.82.7)
+          for shard in 0 1; do
+            host=${hosts[$shard]}
+            remote_tmp="/tmp/lexora-safe-${RELEASE_ID}-${GITHUB_RUN_ID}"
+            ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=30)
+            ssh "${ssh_opts[@]}" "opc@$host" \
+              "install -d -m 0700 '$remote_tmp'"
+            scp "${ssh_opts[@]}" \
+              deployment-receipts/code.tar.gz \
+              deploy/deployment_transaction.py \
+              tools/sqlite_snapshot_manifest.py \
+              "opc@$host:$remote_tmp/"
+            ssh "${ssh_opts[@]}" "opc@$host" \
+              "bash -se -- '$remote_tmp' '$RELEASE_ID' '$CODE_SHA'" <<'REMOTE'
+          set -euo pipefail
+          remote_tmp=$1
+          release_id=$2
+          code_sha=$3
+          python3 "$remote_tmp/deployment_transaction.py" \
+            --root /opt/lexora --track repair --release-id "$release_id" \
+            prepare-code --archive "$remote_tmp/code.tar.gz" \
+            --archive-sha256 "$code_sha" \
+            --imports enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot,fast20k_contract,fast20k_pipeline,fast20k_repair_delta
+          PYTHONPATH="/opt/lexora/deployments/repair/preparations/$release_id/tools" \
+            python3 -c 'import enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot,fast20k_contract,fast20k_pipeline,fast20k_repair_delta'
+          python3 "$remote_tmp/sqlite_snapshot_manifest.py" backup \
+            --source /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+            --snapshot "$remote_tmp/canonical.sqlite" \
+            --manifest "$remote_tmp/canonical.json"
           REMOTE
+            scp "${ssh_opts[@]}" \
+              "opc@$host:$remote_tmp/canonical.json" \
+              "deployment-receipts/canonical-$shard.json"
+          done
+
+      - name: Require the same immutable canonical corpus on both servers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/sqlite_snapshot_manifest.py compare \
+            --manifests deployment-receipts/canonical-0.json \
+              deployment-receipts/canonical-1.json \
+            | tee deployment-receipts/canonical-compatibility.json
+          canonical_sha=$(python3 -c \
+            'import json; print(json.load(open("deployment-receipts/canonical-compatibility.json"))["identitySha256"])')
+          printf 'CANONICAL_SHA=%s\n' "$canonical_sha" >> "$GITHUB_ENV"
+          printf 'canonical_identity_sha256=%s\n' "$canonical_sha" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the candidate once from the first online snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          host=140.245.114.238
+          remote_tmp="/tmp/lexora-safe-${RELEASE_ID}-${GITHUB_RUN_ID}"
+          ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=30)
+          ssh "${ssh_opts[@]}" "opc@$host" \
+            "bash -se -- '$remote_tmp' '$RELEASE_ID'" <<'REMOTE'
+          set -euo pipefail
+          remote_tmp=$1
+          release_id=$2
+          tools="/opt/lexora/deployments/repair/preparations/$release_id/tools"
+          python3 "$tools/fast20k_pipeline.py" select \
+            --canonical "$remote_tmp/canonical.sqlite" \
+            --output "$remote_tmp/candidate.sqlite" \
+            --limit 20000 --phrase-target 4000
+          set +e
+          python3 "$tools/fast20k_pipeline.py" validate \
+            --canonical "$remote_tmp/canonical.sqlite" \
+            --candidate "$remote_tmp/candidate.sqlite" \
+            --expected-rows 20000 > "$remote_tmp/candidate-report.json"
+          validate_status=$?
+          set -e
+          python3 - "$remote_tmp/candidate-report.json" "$validate_status" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert report["structuralReady"] is True, report
+          assert report["total"] == 20_000, report
+          assert report["candidateQuickCheck"] == "ok", report
+          assert int(sys.argv[2]) in (0, 2)
+          PY
+          REMOTE
+          scp "${ssh_opts[@]}" \
+            "opc@$host:$remote_tmp/candidate.sqlite" \
+            deployment-receipts/candidate.sqlite
+          candidate_sha=$(sha256sum deployment-receipts/candidate.sqlite \
+            | awk '{print $1}')
+          printf 'CANDIDATE_SHA=%s\n' "$candidate_sha" >> "$GITHUB_ENV"
+          printf 'candidate_sha256=%s\n' "$candidate_sha" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the exact candidate, seal both releases, and verify again
+        shell: bash
+        run: |
+          set -euo pipefail
+          hosts=(140.245.114.238 134.185.82.7)
+          for shard in 0 1; do
+            host=${hosts[$shard]}
+            remote_tmp="/tmp/lexora-safe-${RELEASE_ID}-${GITHUB_RUN_ID}"
+            ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=30)
+            scp "${ssh_opts[@]}" deployment-receipts/candidate.sqlite \
+              "opc@$host:$remote_tmp/candidate-upload.sqlite"
+            ssh "${ssh_opts[@]}" "opc@$host" \
+              "bash -se -- '$remote_tmp' '$RELEASE_ID' '$CANDIDATE_SHA' '$CANONICAL_SHA' '$shard'" \
+              > "deployment-receipts/sealed-$shard.json" <<'REMOTE'
+          set -euo pipefail
+          remote_tmp=$1
+          release_id=$2
+          candidate_sha=$3
+          canonical_sha=$4
+          shard=$5
+          transaction="$remote_tmp/deployment_transaction.py"
+          release="/opt/lexora/deployments/repair/preparations/$release_id"
+          # Prove this host's entire fixed shard still has the exact candidate
+          # baseline before sealing anything.  This catches replica content
+          # drift during the non-activating preparation phase.
+          candidate_digest=$(PYTHONPATH="$release/tools" python3 -c \
+            'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("SELECT candidate_digest FROM fast20k_metadata WHERE id=1").fetchone()[0])' \
+            "$remote_tmp/candidate-upload.sqlite")
+          LEXORA_CANDIDATE_DIGEST="$candidate_digest" \
+            python3 "$release/deploy/preflight_repair_queue.py" \
+              --dataset "$remote_tmp/canonical.sqlite" \
+              --repair-queue "$remote_tmp/candidate-upload.sqlite" \
+              --shard-index "$shard" --shard-count 2 \
+              --tools "$release/tools" >/dev/null
+          python3 "$transaction" --root /opt/lexora --track repair \
+            --release-id "$release_id" seal \
+            --candidate "$remote_tmp/candidate-upload.sqlite" \
+            --candidate-sha256 "$candidate_sha" \
+            --canonical-manifest "$remote_tmp/canonical.json" >/dev/null
+          python3 "$transaction" --root /opt/lexora --track repair \
+            --release-id "$release_id" verify-release \
+            --candidate-sha256 "$candidate_sha" \
+            --canonical-identity-sha256 "$canonical_sha"
+          rm -f -- "$remote_tmp/candidate-upload.sqlite" \
+            "$remote_tmp/candidate.sqlite" "$remote_tmp/candidate-report.json" \
+            "$remote_tmp/canonical.sqlite"
+          REMOTE
+          done
+          python3 - "$CANDIDATE_SHA" "$CANONICAL_SHA" \
+            deployment-receipts/sealed-0.json deployment-receipts/sealed-1.json <<'PY'
+          import json, sys
+          candidate, canonical, *paths = sys.argv[1:]
+          reports = [json.load(open(path, encoding="utf-8")) for path in paths]
+          assert all(report["verified"] for report in reports)
+          assert {report["candidate"]["sha256"] for report in reports} == {candidate}
+          assert {report["canonical"]["identitySha256"] for report in reports} == {canonical}
+          PY
+
+      - name: Preserve small audit receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: top20k-preparation-${{ env.RELEASE_ID }}
+          path: deployment-receipts/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Explain the separate activation step
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+
+          No service was activated by this workflow.
+
+          Run **Activate prepared top-20k repair** with exactly these values:
+
+          - release_id: \`$RELEASE_ID\`
+          - candidate_sha256: \`$CANDIDATE_SHA\`
+          - canonical_identity_sha256: \`$CANONICAL_SHA\`
+          EOF
+
+      - name: Remove only this workflow's remote temporary snapshots
+        if: ${{ always() && env.RELEASE_ID != '' }}
+        shell: bash
+        run: |
+          hosts=(140.245.114.238 134.185.82.7)
+          for host in "${hosts[@]}"; do
+            remote_tmp="/tmp/lexora-safe-${RELEASE_ID}-${GITHUB_RUN_ID}"
+            ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 "opc@$host" \
+              "rm -rf -- '$remote_tmp'" || true
+          done
