@@ -56,6 +56,34 @@ jobs:
             /opt/lexora/state/top20k-quality-shard-'${{ matrix.shard }}'.json \
             2>/dev/null || echo "quality_snapshot=missing"
           timeout 10s journalctl -u "$quality" -n 80 --no-pager || true
+          if [[ '${{ matrix.shard }}' == 0 && \
+                ! -s /opt/lexora/state/top20k-quality-shard-0.json ]]; then
+            # The old quality unit is ordered after the much heavier full
+            # progress scan.  Cancel only those read-only monitoring jobs,
+            # then create the missing atomic snapshot directly.  Neither the
+            # repair writer nor the collector is touched.
+            sudo systemctl stop "$quality" || true
+            sudo systemctl stop lexora-progress-snapshot@0.service || true
+            timeout 300s nice -n 10 ionice -c 2 -n 7 \
+              python3 /opt/lexora/tools/write_top20k_quality_snapshot.py \
+                --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+                --output /opt/lexora/state/top20k-quality-shard-0.json \
+                --shard-index 0 --shard-count 2 --unresolved-limit 8
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path("/opt/lexora/state/top20k-quality-shard-0.json")
+          value = json.loads(path.read_text(encoding="utf-8"))
+          assert value["shardIndex"] == 0
+          assert value["total"] == 13044
+          assert value["complete"] + value["incomplete"] == value["total"]
+          print(json.dumps({
+              "snapshot": str(path),
+              "complete": value["complete"],
+              "total": value["total"],
+          }, sort_keys=True))
+          PY
+          fi
           timeout 10s journalctl -u lexora-top20k-repair@'${{ matrix.shard }}'.service \
             -n 12 --no-pager || echo "journal=busy_or_timed_out"
           REMOTE
