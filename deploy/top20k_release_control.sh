@@ -31,6 +31,16 @@ full_collector="lexora-enrich@${shard}.service"
 backup="$track_root/systemd-backups/$release_id"
 state_file="$backup/state.env"
 started_file="$backup/activation-started"
+candidate_digest=""
+if [[ -f "$release/candidate.env" ]]; then
+  candidate_digest=$(sed -n 's/^LEXORA_CANDIDATE_DIGEST=//p' \
+    "$release/candidate.env" | head -n 1)
+fi
+if [[ ! "$candidate_digest" =~ ^[0-9a-f]{64}$ ]]; then
+  candidate_digest=""
+fi
+preflight_marker="$root/state/fast20k/${candidate_digest:-invalid}/preflight-shard-$shard.json"
+runtime_marker="$root/state/fast20k/${candidate_digest:-invalid}/runtime-ready-shard-$shard.json"
 install -d -m 0750 "$track_root"
 exec 9>"$track_root/.control.lock"
 flock -w 10 9 || { echo "another release control operation is active" >&2; exit 1; }
@@ -42,6 +52,60 @@ dropin_target="$dropin_dir/10-current-release.conf"
 
 run_systemctl() {
   sudo systemctl "$@"
+}
+
+marker_valid() {
+  python3 "$release/deploy/validate_preflight_marker.py" \
+    --marker "$preflight_marker" --release-id "$release_id" \
+    --candidate-digest "$candidate_digest" --shard-index "$shard" \
+    --shard-count 2 --kind preflight >/dev/null \
+    && python3 "$release/deploy/validate_preflight_marker.py" \
+      --marker "$runtime_marker" --release-id "$release_id" \
+      --candidate-digest "$candidate_digest" --shard-index "$shard" \
+      --shard-count 2 --kind runtime >/dev/null
+}
+
+service_ready_once() {
+  local state substate main_pid exec_started result exec_code exec_status
+  marker_valid || return 1
+  state=$(systemctl is-active "$service" || true)
+  substate=$(systemctl show "$service" -p SubState --value || true)
+  main_pid=$(systemctl show "$service" -p MainPID --value || true)
+  exec_started=$(systemctl show "$service" \
+    -p ExecMainStartTimestampMonotonic --value || true)
+  result=$(systemctl show "$service" -p Result --value || true)
+  exec_code=$(systemctl show "$service" -p ExecMainCode --value || true)
+  exec_status=$(systemctl show "$service" -p ExecMainStatus --value || true)
+  [[ "$main_pid" =~ ^[0-9]+$ && "$exec_started" =~ ^[0-9]+$ \
+    && "$exec_status" =~ ^-?[0-9]+$ ]] || return 1
+  # The runtime marker PID must match the live MainPID.  Type=oneshot may also
+  # legitimately finish an empty shard; that path requires an exited/0 result.
+  python3 "$release/deploy/validate_preflight_marker.py" \
+    --marker "$runtime_marker" --release-id "$release_id" \
+    --candidate-digest "$candidate_digest" --shard-index "$shard" \
+    --shard-count 2 --kind runtime --active-state "$state" \
+    --sub-state "$substate" --main-pid "$main_pid" \
+    --exec-started-monotonic "$exec_started" --result "$result" \
+    --exec-code "$exec_code" --exec-status "$exec_status" >/dev/null
+}
+
+confirm_service_ready() {
+  local attempts=${1:-3} consecutive=0
+  for _ in $(seq 1 "$attempts"); do
+    if service_ready_once; then
+      if [[ "$(systemctl is-active "$service" || true)" == inactive ]]; then
+        return 0
+      fi
+      consecutive=$((consecutive + 1))
+      if [[ "$consecutive" -ge 3 ]]; then
+        return 0
+      fi
+    else
+      consecutive=0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 save_one() {
@@ -160,7 +224,7 @@ rollback_impl() {
   fi
   set -e
   if [[ "$rollback_status" == 0 ]]; then
-    rm -f -- "$started_file"
+    rm -f -- "$started_file" "$preflight_marker" "$runtime_marker"
   fi
   return "$rollback_status"
 }
@@ -180,6 +244,12 @@ fi
 [[ -f "$release/deploy/lexora-top20k-repair-current.conf" ]] || {
   echo "missing current-release drop-in" >&2; exit 1;
 }
+[[ -f "$release/deploy/validate_preflight_marker.py" ]] || {
+  echo "missing preflight marker validator in release" >&2; exit 1;
+}
+[[ "$candidate_digest" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "release candidate digest is missing or invalid" >&2; exit 1;
+}
 
 python3 "$transaction" --root "$root" --track repair \
   --release-id "$release_id" verify-release \
@@ -190,8 +260,12 @@ if [[ -e "$backup" ]]; then
   if [[ -f "$backup/activation-complete" ]] \
     && [[ -L "$track_root/current" ]] \
     && [[ "$(readlink "$track_root/current")" == "releases/$release_id" ]]; then
-    echo "release is already active and verified: $release_id"
-    exit 0
+    if confirm_service_ready 5; then
+      echo "release is already active and ready: $release_id"
+      exit 0
+    fi
+    echo "active release has no valid stable preflight/main-process evidence" >&2
+    exit 1
   fi
   echo "refusing to overwrite activation backup: $backup" >&2
   exit 1
@@ -230,21 +304,28 @@ set +e
   # ExecStopPost.  Reset both possible writers to the exact pre-deploy state
   # before the new unit captures and temporarily stops them.
   restore_writer_snapshot
+  rm -f -- "$preflight_marker" "$runtime_marker"
   run_systemctl start --no-block "$service"
   started=0
+  consecutive=0
   # The fail-closed full-shard preflight reads thousands of rows before the
   # network process becomes ExecStart.  Allow that bounded local validation
   # to finish instead of treating a healthy low-power OCI host as failed.
   for attempt in $(seq 1 180); do
-    state=$(systemctl is-active "$service" || true)
-    substate=$(systemctl show "$service" -p SubState --value || true)
-    main_pid=$(systemctl show "$service" -p MainPID --value || true)
-    if [[ "$state" == active ]] \
-      || [[ "$state" == activating && "$substate" == start \
-        && "${main_pid:-0}" -gt 0 ]]; then
-      started=1
-      break
+    if service_ready_once; then
+      if [[ "$(systemctl is-active "$service" || true)" == inactive ]]; then
+        started=1
+        break
+      fi
+      consecutive=$((consecutive + 1))
+      if [[ "$consecutive" -ge 3 ]]; then
+        started=1
+        break
+      fi
+    else
+      consecutive=0
     fi
+    state=$(systemctl is-active "$service" || true)
     if [[ "$state" == failed || "$state" == inactive ]]; then
       break
     fi
@@ -252,7 +333,7 @@ set +e
   done
   if [[ "$started" != 1 ]]; then
     run_systemctl show "$service" -p ActiveState -p SubState -p Result \
-      -p ExecMainStatus -p ExecMainCode || true
+      -p ExecMainStatus -p ExecMainCode -p ExecMainStartTimestampMonotonic || true
     sudo journalctl -u "$service" -n 120 --no-pager || true
     exit 1
   fi

@@ -125,7 +125,11 @@ class DeploymentTransactionTest(unittest.TestCase):
         )
         self.assertEqual(
             candidate_environment.read_text(encoding="ascii"),
-            "LEXORA_CANDIDATE_DIGEST=" + "e" * 64 + "\n",
+            "LEXORA_CANDIDATE_DIGEST="
+            + "e" * 64
+            + "\nLEXORA_RELEASE_ID="
+            + release_id
+            + "\n",
         )
         return candidate, sha256(candidate)
 

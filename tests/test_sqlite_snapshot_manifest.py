@@ -131,6 +131,60 @@ class SqliteSnapshotManifestTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "canonical identity mismatch"):
                 snapshot_manifest.compare_manifests(manifests)
 
+    def test_merge_owned_snapshots_uses_each_fixed_owner_mutable_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshots: list[Path] = []
+            for shard in range(2):
+                source = root / f"source-{shard}.sqlite"
+                make_canonical(source, definition=f"default-{shard}")
+                database = sqlite3.connect(source)
+                try:
+                    database.execute(
+                        "UPDATE entries SET definition=? WHERE id=1",
+                        (f"owner-one-from-{shard}",),
+                    )
+                    database.execute(
+                        "UPDATE entries SET definition=? WHERE id=2",
+                        (f"owner-zero-from-{shard}",),
+                    )
+                    database.commit()
+                finally:
+                    database.close()
+                snapshots.append(source)
+
+            output = root / "owned.sqlite"
+            report = snapshot_manifest.merge_owned_snapshots(
+                snapshots, output, shard_count=2, batch_size=1
+            )
+
+            database = sqlite3.connect(output)
+            try:
+                values = dict(database.execute("SELECT id,definition FROM entries"))
+            finally:
+                database.close()
+            # shard_owner is canonical_id % 2.
+            self.assertEqual(values[1], "owner-one-from-1")
+            self.assertEqual(values[2], "owner-zero-from-0")
+            self.assertEqual(report["shardCount"], 2)
+            self.assertEqual(len(report["ownerContentSha256"]), 2)
+
+    def test_merge_owned_snapshots_rejects_identity_drift_without_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.sqlite"
+            second = root / "second.sqlite"
+            output = root / "owned.sqlite"
+            make_canonical(first)
+            make_canonical(second, source='["kaikki"]')
+
+            with self.assertRaisesRegex(RuntimeError, "canonical identity mismatch"):
+                snapshot_manifest.merge_owned_snapshots(
+                    [first, second], output, shard_count=2
+                )
+
+            self.assertFalse(output.exists())
+
     def test_backup_refuses_to_replace_existing_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

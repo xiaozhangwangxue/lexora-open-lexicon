@@ -242,6 +242,199 @@ def compare_manifests(paths: list[Path]) -> dict[str, Any]:
     return {"compatible": True, "replicas": len(paths), **expected}
 
 
+def _entry_columns(database: sqlite3.Connection) -> tuple[str, ...]:
+    return tuple(str(row[1]) for row in database.execute("PRAGMA table_info(entries)"))
+
+
+def _rebuild_optional_fts(database: sqlite3.Connection) -> None:
+    tables = {
+        str(row[0])
+        for row in database.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+        )
+    }
+    if "entries_fts" not in tables:
+        return
+    fts_columns = tuple(
+        str(row[1]) for row in database.execute("PRAGMA table_info(entries_fts)")
+    )
+    expected = ("word", "definition", "definition_zh", "examples", "phrases")
+    if fts_columns != expected:
+        raise RuntimeError(f"unsupported entries_fts columns: {fts_columns}")
+    database.execute("DELETE FROM entries_fts")
+    database.execute(
+        "INSERT INTO entries_fts(rowid,word,definition,definition_zh,examples,phrases) "
+        "SELECT id,word,definition,definition_zh,examples_json,phrases_json "
+        "FROM entries ORDER BY id"
+    )
+
+
+def _owner_content_digest(
+    database: sqlite3.Connection,
+    *,
+    columns: tuple[str, ...],
+    shard_index: int,
+    shard_count: int,
+) -> str:
+    return _framed_digest(
+        database.execute(
+            "SELECT "
+            + ",".join(columns)
+            + " FROM entries WHERE (id % ?) = ? ORDER BY id",
+            (shard_count, shard_index),
+        )
+    )
+
+
+def merge_owned_snapshots(
+    snapshots: list[Path],
+    output: Path,
+    *,
+    shard_count: int,
+    batch_size: int = 1024,
+) -> dict[str, Any]:
+    """Merge mutable rows from each row owner's immutable-compatible snapshot.
+
+    Entry identity is required to be byte-for-byte equivalent at the logical
+    manifest level.  Mutable content for ``id % shard_count == shard`` is then
+    copied only from that shard's snapshot.  The output is published without
+    replacing any existing file and is suitable as the single candidate
+    baseline shared by all repair workers.
+    """
+    if shard_count < 1 or len(snapshots) != shard_count:
+        raise ValueError("one canonical snapshot is required for every shard")
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if output.exists():
+        raise FileExistsError(f"refusing to replace existing output: {output}")
+    resolved = [path.resolve() for path in snapshots]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("canonical snapshots must be distinct files")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    manifests = [database_manifest(path, include_file=True) for path in snapshots]
+    expected_identity = canonical_identity(manifests[0])
+    for path, manifest in zip(snapshots[1:], manifests[1:]):
+        actual = canonical_identity(manifest)
+        if actual != expected_identity:
+            raise RuntimeError(
+                f"canonical identity mismatch for {path}: "
+                f"expected={expected_identity} actual={actual}"
+            )
+
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    os.close(descriptor)
+    temporary = Path(name)
+    destination: sqlite3.Connection | None = None
+    try:
+        base = sqlite3.connect(_read_only_uri(snapshots[0]), uri=True)
+        destination = sqlite3.connect(temporary)
+        try:
+            base.backup(destination)
+        finally:
+            base.close()
+        columns = _entry_columns(destination)
+        if not set(IDENTITY_COLUMNS) <= set(columns):
+            raise RuntimeError("merged snapshot is missing canonical identity columns")
+        mutable_columns = tuple(
+            column for column in columns if column not in set(IDENTITY_COLUMNS)
+        )
+        if not mutable_columns:
+            raise RuntimeError("canonical snapshot has no mutable entry columns")
+        assignments = ",".join(f'"{column}"=?' for column in mutable_columns)
+        destination.execute("BEGIN IMMEDIATE")
+        for shard_index, snapshot in enumerate(snapshots):
+            source = sqlite3.connect(_read_only_uri(snapshot), uri=True)
+            try:
+                source.execute("BEGIN")
+                if _entry_columns(source) != columns:
+                    raise RuntimeError(
+                        f"canonical entry schema mismatch for shard {shard_index}"
+                    )
+                cursor = source.execute(
+                    "SELECT "
+                    + ",".join(("id", *mutable_columns))
+                    + " FROM entries WHERE (id % ?) = ? ORDER BY id",
+                    (shard_count, shard_index),
+                )
+                copied = 0
+                while page := cursor.fetchmany(batch_size):
+                    destination.executemany(
+                        f"UPDATE entries SET {assignments} WHERE id=?",
+                        ((*tuple(row[1:]), row[0]) for row in page),
+                    )
+                    copied += len(page)
+                expected_rows = int(
+                    source.execute(
+                        "SELECT count(*) FROM entries WHERE (id % ?) = ?",
+                        (shard_count, shard_index),
+                    ).fetchone()[0]
+                )
+                if copied != expected_rows:
+                    raise RuntimeError(
+                        f"owner row copy mismatch for shard {shard_index}: "
+                        f"expected={expected_rows} copied={copied}"
+                    )
+                source.rollback()
+            finally:
+                source.close()
+        _rebuild_optional_fts(destination)
+        destination.commit()
+        destination.execute("PRAGMA journal_mode=DELETE")
+        destination.execute("PRAGMA optimize")
+        destination.commit()
+        _quick_check(destination)
+
+        owner_digests: list[str] = []
+        for shard_index, snapshot in enumerate(snapshots):
+            source = sqlite3.connect(_read_only_uri(snapshot), uri=True)
+            try:
+                source.execute("BEGIN")
+                expected_digest = _owner_content_digest(
+                    source,
+                    columns=columns,
+                    shard_index=shard_index,
+                    shard_count=shard_count,
+                )
+                source.rollback()
+            finally:
+                source.close()
+            actual_digest = _owner_content_digest(
+                destination,
+                columns=columns,
+                shard_index=shard_index,
+                shard_count=shard_count,
+            )
+            if actual_digest != expected_digest:
+                raise RuntimeError(
+                    f"owner content digest mismatch for shard {shard_index}"
+                )
+            owner_digests.append(actual_digest)
+        destination.close()
+        destination = None
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        merged = database_manifest(temporary, include_file=True)
+        if canonical_identity(merged) != expected_identity:
+            raise RuntimeError("merged canonical identity changed before publication")
+        # Hard-link publication preserves the already checked inode and refuses
+        # to replace any destination created concurrently.
+        _publish_new(temporary, output)
+        return {
+            "merged": True,
+            "shardCount": shard_count,
+            "ownerContentSha256": owner_digests,
+            **expected_identity,
+            "database": merged["database"],
+        }
+    finally:
+        if destination is not None:
+            destination.close()
+        temporary.unlink(missing_ok=True)
+
+
 def verify_snapshot(database: Path, manifest_path: Path) -> dict[str, Any]:
     expected = load_manifest(manifest_path)
     actual = database_manifest(database, include_file=True)
@@ -272,6 +465,12 @@ def main() -> None:
     compare = subparsers.add_parser("compare")
     compare.add_argument("--manifests", type=Path, nargs="+", required=True)
 
+    merge = subparsers.add_parser("merge-owned")
+    merge.add_argument("--snapshots", type=Path, nargs="+", required=True)
+    merge.add_argument("--output", type=Path, required=True)
+    merge.add_argument("--shard-count", type=int, required=True)
+    merge.add_argument("--batch-size", type=int, default=1024)
+
     identity = subparsers.add_parser("identity")
     identity.add_argument("--database", type=Path, required=True)
 
@@ -288,6 +487,13 @@ def main() -> None:
         result = verify_snapshot(args.database, args.manifest)
     elif args.command == "compare":
         result = compare_manifests(args.manifests)
+    elif args.command == "merge-owned":
+        result = merge_owned_snapshots(
+            args.snapshots,
+            args.output,
+            shard_count=args.shard_count,
+            batch_size=args.batch_size,
+        )
     else:
         result = database_manifest(args.database, include_file=False)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

@@ -32,6 +32,7 @@ from fast20k_repair_delta import (  # noqa: E402
     validate_delta_union,
 )
 from package_offline_lexicons import main as package_main  # noqa: E402
+from sqlite_snapshot_manifest import merge_owned_snapshots  # noqa: E402
 from top20k_quality import quality_report  # noqa: E402
 from write_top20k_quality_snapshot import write_quality_snapshot  # noqa: E402
 
@@ -163,6 +164,76 @@ def mark_rows_as_candidate_repaired(
 
 
 class Fast20kPipelineTest(unittest.TestCase):
+    def test_runtime_ready_marker_is_atomic_and_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "state" / "runtime.json"
+            value = {
+                "format": "lexora-top20k-runtime-ready-v1",
+                "releaseId": "release-1",
+                "candidateDigest": "a" * 64,
+                "selectedOwnerRows": 10_000,
+                "preflightRows": 12,
+                "shardCount": 2,
+                "shardIndex": 0,
+                "processId": 42,
+                "readyAt": "2026-08-19T00:00:00+00:00",
+            }
+
+            enrichment.write_runtime_ready_marker(marker, value)
+
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8")), value)
+            self.assertEqual(list(marker.parent.glob(".runtime.json.*.tmp")), [])
+
+    def test_owner_merged_candidate_uses_the_responsible_servers_gaps(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshots: list[Path] = []
+            for shard in range(2):
+                source = root / f"source-{shard}.sqlite"
+                database = create_source(source)
+                alpha = add_entry(database, "alpha", 1)
+                bravo = add_entry(database, "bravo", 2)
+                self.assertEqual((alpha, bravo), (1, 2))
+                if shard == 1:
+                    database.execute(
+                        "UPDATE entries SET pos='',definition='',definition_zh='',"
+                        "us_phonetic='',uk_phonetic='' WHERE id=?",
+                        (alpha,),
+                    )
+                    database.execute(
+                        "UPDATE entries SET definition='Non-owner drift.' WHERE id=?",
+                        (bravo,),
+                    )
+                database.commit()
+                database.close()
+                snapshots.append(source)
+
+            merged = root / "owned.sqlite"
+            candidate = root / "candidate.sqlite"
+            merge_owned_snapshots(snapshots, merged, shard_count=2)
+            build_candidate(
+                merged,
+                candidate,
+                limit=2,
+                phrase_target=0,
+                shard_count=2,
+            )
+
+            database = sqlite3.connect(candidate)
+            try:
+                queue = database.execute(
+                    "SELECT canonical_id,shard_owner,gaps_json "
+                    "FROM repair_queue ORDER BY canonical_id"
+                ).fetchall()
+                definitions = dict(
+                    database.execute("SELECT id,definition FROM entries ORDER BY id")
+                )
+            finally:
+                database.close()
+            self.assertEqual(queue[0][0:2], (alpha, 1))
+            self.assertIn("definition", json.loads(queue[0][2]))
+            self.assertEqual(definitions[bravo], "Definition of bravo.")
+
     def test_lexical_policy_preserves_real_dots_hyphens_and_apostrophes(self) -> None:
         self.assertIsNone(
             lexical_rejection_reason(
@@ -586,7 +657,9 @@ class Fast20kPipelineTest(unittest.TestCase):
             database.commit()
             database.close()
 
-            with self.assertRaisesRegex(ValueError, "repair queue provenance mismatch"):
+            with self.assertRaisesRegex(
+                ValueError, "repair queue (?:content )?provenance mismatch"
+            ):
                 asyncio.run(
                     enrichment.run(
                         source,
@@ -604,6 +677,58 @@ class Fast20kPipelineTest(unittest.TestCase):
                         repair_queue=candidate,
                     )
                 )
+
+    def test_preflight_checks_complete_selected_rows_for_the_fixed_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sqlite"
+            candidate = root / "candidate.sqlite"
+            database = create_source(source)
+            owner_one = add_entry(database, "alpha", 1)
+            owner_zero = add_entry(database, "bravo", 2)
+            self.assertEqual(owner_one % 2, 1)
+            self.assertEqual(owner_zero % 2, 0)
+            database.commit()
+            database.close()
+            build_candidate(
+                source,
+                candidate,
+                limit=2,
+                phrase_target=0,
+                shard_count=2,
+            )
+
+            database = sqlite3.connect(source)
+            database.execute(
+                "UPDATE entries SET definition='Owner one drifted.' WHERE id=?",
+                (owner_one,),
+            )
+            database.commit()
+            database.close()
+
+            dataset = sqlite3.connect(source)
+            queue = enrichment.open_repair_queue(candidate)
+            try:
+                rows, metadata = enrichment.preflight_repair_queue_shard(
+                    dataset,
+                    queue,
+                    shard_index=0,
+                    shard_count=2,
+                )
+                self.assertEqual(rows, [])
+                self.assertEqual(metadata["selected_owner_rows"], 1)
+                with self.assertRaisesRegex(
+                    ValueError, "differs from candidate baseline"
+                ):
+                    enrichment.preflight_repair_queue_shard(
+                        dataset,
+                        queue,
+                        shard_index=1,
+                        shard_count=2,
+                    )
+            finally:
+                queue.close()
+                dataset.close()
 
     def test_repair_queue_pages_are_disjoint_contiguous_id_shards(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

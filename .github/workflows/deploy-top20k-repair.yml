@@ -130,28 +130,58 @@ jobs:
           printf 'canonical_identity_sha256=%s\n' "$canonical_sha" \
             >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build the candidate once from the first online snapshot
+      - name: Build one candidate from both fixed-owner online snapshots
         shell: bash
         run: |
           set -euo pipefail
-          host=140.245.114.238
+          hosts=(140.245.114.238 134.185.82.7)
+          host=${hosts[0]}
           remote_tmp="/tmp/lexora-safe-${RELEASE_ID}-${GITHUB_RUN_ID}"
           ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
             -o ConnectTimeout=30 -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=30)
+          # The immutable identities are already proven equal.  Mutable fields
+          # may legitimately differ because each collector owns id % 2 for its
+          # shard, so stream shard 1's stable online snapshot through the
+          # runner and merge every row from its fixed owner before selection.
+          scp -3 "${ssh_opts[@]}" \
+            "opc@${hosts[1]}:$remote_tmp/canonical.sqlite" \
+            "opc@${hosts[0]}:$remote_tmp/canonical-shard-1.sqlite"
+          scp "${ssh_opts[@]}" deployment-receipts/canonical-1.json \
+            "opc@${hosts[0]}:$remote_tmp/canonical-shard-1.json"
           ssh "${ssh_opts[@]}" "opc@$host" \
-            "bash -se -- '$remote_tmp' '$RELEASE_ID'" <<'REMOTE'
+            "bash -se -- '$remote_tmp' '$RELEASE_ID' '$CANONICAL_SHA'" <<'REMOTE'
           set -euo pipefail
           remote_tmp=$1
           release_id=$2
+          canonical_sha=$3
           tools="/opt/lexora/deployments/repair/preparations/$release_id/tools"
+          python3 "$tools/sqlite_snapshot_manifest.py" verify \
+            --database "$remote_tmp/canonical.sqlite" \
+            --manifest "$remote_tmp/canonical.json" >/dev/null
+          python3 "$tools/sqlite_snapshot_manifest.py" verify \
+            --database "$remote_tmp/canonical-shard-1.sqlite" \
+            --manifest "$remote_tmp/canonical-shard-1.json" >/dev/null
+          python3 "$tools/sqlite_snapshot_manifest.py" merge-owned \
+            --snapshots "$remote_tmp/canonical.sqlite" \
+              "$remote_tmp/canonical-shard-1.sqlite" \
+            --output "$remote_tmp/canonical-owned.sqlite" --shard-count 2 \
+            > "$remote_tmp/canonical-owned.json"
+          python3 - "$remote_tmp/canonical-owned.json" "$canonical_sha" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert report["merged"] is True, report
+          assert report["shardCount"] == 2, report
+          assert report["identitySha256"] == sys.argv[2], report
+          assert len(report["ownerContentSha256"]) == 2, report
+          PY
           python3 "$tools/fast20k_pipeline.py" select \
-            --canonical "$remote_tmp/canonical.sqlite" \
+            --canonical "$remote_tmp/canonical-owned.sqlite" \
             --output "$remote_tmp/candidate.sqlite" \
             --limit 20000 --phrase-target 4000
           set +e
           python3 "$tools/fast20k_pipeline.py" validate \
-            --canonical "$remote_tmp/canonical.sqlite" \
+            --canonical "$remote_tmp/canonical-owned.sqlite" \
             --candidate "$remote_tmp/candidate.sqlite" \
             --expected-rows 20000 > "$remote_tmp/candidate-report.json"
           validate_status=$?
@@ -168,6 +198,9 @@ jobs:
           scp "${ssh_opts[@]}" \
             "opc@$host:$remote_tmp/candidate.sqlite" \
             deployment-receipts/candidate.sqlite
+          scp "${ssh_opts[@]}" \
+            "opc@$host:$remote_tmp/canonical-owned.json" \
+            deployment-receipts/canonical-owned.json
           candidate_sha=$(sha256sum deployment-receipts/candidate.sqlite \
             | awk '{print $1}')
           printf 'CANDIDATE_SHA=%s\n' "$candidate_sha" >> "$GITHUB_ENV"
@@ -221,7 +254,11 @@ jobs:
             --canonical-identity-sha256 "$canonical_sha"
           rm -f -- "$remote_tmp/candidate-upload.sqlite" \
             "$remote_tmp/candidate.sqlite" "$remote_tmp/candidate-report.json" \
-            "$remote_tmp/canonical.sqlite"
+            "$remote_tmp/canonical.sqlite" \
+            "$remote_tmp/canonical-shard-1.sqlite" \
+            "$remote_tmp/canonical-shard-1.json" \
+            "$remote_tmp/canonical-owned.sqlite" \
+            "$remote_tmp/canonical-owned.json"
           REMOTE
           done
           python3 - "$CANDIDATE_SHA" "$CANONICAL_SHA" \

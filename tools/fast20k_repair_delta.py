@@ -176,6 +176,11 @@ def export_repair_delta(
             queue,
             shard_index=shard_index,
             shard_count=shard_count,
+            # Export may run after the repair unit restored the ordinary
+            # collector.  Unqueued complete entries can then be enriched
+            # legitimately; the delta contract only authorizes and verifies
+            # exact queued IDs.
+            validate_selected_owner=False,
         )
         unresolved = [
             (row[0], row[2])

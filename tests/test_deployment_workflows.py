@@ -21,6 +21,10 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertIn("canonical-0.json", workflow)
         self.assertIn("canonical-1.json", workflow)
         self.assertIn("compare \\", workflow)
+        self.assertIn("merge-owned", workflow)
+        self.assertIn("canonical-shard-1.sqlite", workflow)
+        self.assertIn("canonical-owned.sqlite", workflow)
+        self.assertIn("scp -3", workflow)
         self.assertIn("fast20k_repair_delta", workflow)
         self.assertIn("candidate_sha256", workflow)
         self.assertIn("structuralReady", workflow)
@@ -71,6 +75,14 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertIn("candidate.env", dropin)
         self.assertIn("${LEXORA_CANDIDATE_DIGEST}", dropin)
         self.assertIn("preflight_repair_queue.py", dropin)
+        self.assertIn("--success-marker", dropin)
+        self.assertIn("--ready-marker", dropin)
+        self.assertIn("runtime-ready-shard-%i.json", dropin)
+        self.assertIn("${LEXORA_RELEASE_ID}", dropin)
+        self.assertLess(
+            dropin.index("/usr/bin/rm -f"),
+            dropin.index("preflight_repair_queue.py"),
+        )
         self.assertNotIn("fast20k-repair-shard-%i.sqlite", dropin)
         self.assertIn("lexora-enrich-micro@", state)
         self.assertIn("lexora-enrich@${shard}.service", state)
@@ -99,7 +111,12 @@ class DeploymentWorkflowTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("restore_writer_snapshot", control)
-        self.assertIn('substate" == start', control)
+        self.assertIn("marker_valid", control)
+        self.assertIn("validate_preflight_marker.py", control)
+        self.assertIn("--kind preflight", control)
+        self.assertIn("--kind runtime", control)
+        self.assertIn("ExecMainStartTimestampMonotonic", control)
+        self.assertIn('consecutive" -ge 3', control)
         self.assertIn("seq 1 180", control)
 
     def test_deployment_shell_helpers_have_valid_syntax(self) -> None:

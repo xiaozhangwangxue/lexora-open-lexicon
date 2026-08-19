@@ -448,6 +448,7 @@ def seal_release(
                 + destination_report["candidateDigest"]
                 + "\n"
             )
+            stream.write("LEXORA_RELEASE_ID=" + release_id + "\n")
             stream.flush()
             os.fsync(stream.fileno())
 

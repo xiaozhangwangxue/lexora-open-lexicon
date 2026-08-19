@@ -110,6 +110,7 @@ class DeploymentConfigTest(unittest.TestCase):
         self.assertIn("TimeoutStartSec=12min", service)
         self.assertIn("top20k-quality-shard-%i.json", service)
         self.assertIn("OnUnitActiveSec=60min", timer)
+        self.assertNotIn("After=lexora-progress-snapshot@", service)
 
     def test_progress_deploy_requires_a_current_atomic_quality_snapshot(self) -> None:
         workflow = (

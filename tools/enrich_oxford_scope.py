@@ -17,6 +17,7 @@ import os
 import random
 import re
 import sqlite3
+import tempfile
 import time
 import unicodedata
 from html.parser import HTMLParser
@@ -76,6 +77,29 @@ def repair_payload_digest(row: dict[str, Any]) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def write_runtime_ready_marker(path: Path, value: dict[str, Any]) -> None:
+    """Atomically prove repair initialization finished before any HTTP work."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -877,7 +901,7 @@ def fetch_repair_queue_batch(
     return selected, ids[-1]
 
 
-def verify_repair_page_content(
+def verify_selected_owner_page_content(
     dataset: sqlite3.Connection,
     queue: sqlite3.Connection,
     entry_ids: list[int],
@@ -889,10 +913,11 @@ def verify_repair_page_content(
         return
     placeholders = ",".join("?" for _ in entry_ids)
     expected = {
-        int(row[0]): str(row[1])
+        int(row[0]): (str(row[1]), bool(row[2]))
         for row in queue.execute(
-            "SELECT p.canonical_id,p.canonical_content_sha256 "
-            "FROM fast20k_provenance p JOIN repair_queue q "
+            "SELECT p.canonical_id,p.canonical_content_sha256,"
+            "CASE WHEN q.canonical_id IS NULL THEN 0 ELSE 1 END "
+            "FROM fast20k_provenance p LEFT JOIN repair_queue q "
             "ON q.canonical_id=p.canonical_id "
             f"WHERE p.canonical_id IN ({placeholders})",
             entry_ids,
@@ -911,14 +936,16 @@ def verify_repair_page_content(
             raise ValueError(
                 f"repair queue content provenance mismatch: id={entry_id} missing"
             )
-        if canonical_content_digest(row) == expected[entry_id]:
+        expected_content, is_queued = expected[entry_id]
+        if canonical_content_digest(row) == expected_content:
             continue
         try:
             marker = json.loads(str(row.get("enrichment_json") or "{}"))
         except json.JSONDecodeError:
             marker = {}
         if (
-            not isinstance(marker, dict)
+            not is_queued
+            or not isinstance(marker, dict)
             or str(marker.get("repairCandidateDigest") or "") != candidate_digest
             or int(marker.get("repairShardOwner", -1)) != shard_owner
             or str(marker.get("repairPayloadDigest") or "")
@@ -930,6 +957,24 @@ def verify_repair_page_content(
             )
 
 
+def verify_repair_page_content(
+    dataset: sqlite3.Connection,
+    queue: sqlite3.Connection,
+    entry_ids: list[int],
+    *,
+    candidate_digest: str,
+    shard_owner: int,
+) -> None:
+    """Compatibility wrapper for callers exporting only queued repair rows."""
+    verify_selected_owner_page_content(
+        dataset,
+        queue,
+        entry_ids,
+        candidate_digest=candidate_digest,
+        shard_owner=shard_owner,
+    )
+
+
 def preflight_repair_queue_shard(
     dataset: sqlite3.Connection,
     queue: sqlite3.Connection,
@@ -937,8 +982,9 @@ def preflight_repair_queue_shard(
     shard_index: int,
     shard_count: int,
     batch_size: int = 512,
+    validate_selected_owner: bool = True,
 ) -> tuple[list[tuple[Any, ...]], dict[str, Any]]:
-    """Validate every queued identity for one fixed shard before networking."""
+    """Validate every selected owner row, then return its queued repair rows."""
     metadata = repair_queue_metadata(queue)
     if shard_count != int(metadata["shard_count"]):
         raise ValueError(
@@ -964,9 +1010,49 @@ def preflight_repair_queue_shard(
         ).fetchone()[0]
     )
     rows: list[tuple[Any, ...]] = []
-    after_id: int | None = None
     dataset.execute("BEGIN")
     try:
+        # Validate the complete selected owner baseline, not just incomplete
+        # queue rows.  Otherwise a term that is complete on the candidate-build
+        # host but incomplete on its actual owner can silently escape repair.
+        selected_expected = int(
+            queue.execute(
+                "SELECT count(*) FROM fast20k_provenance "
+                "WHERE (canonical_id % ?) = ?",
+                (shard_count, shard_index),
+            ).fetchone()[0]
+        )
+        if validate_selected_owner:
+            selected_seen = 0
+            selected_after = -1
+            while True:
+                selected_ids = [
+                    int(row[0])
+                    for row in queue.execute(
+                        "SELECT canonical_id FROM fast20k_provenance "
+                        "WHERE (canonical_id % ?) = ? AND canonical_id > ? "
+                        "ORDER BY canonical_id LIMIT ?",
+                        (shard_count, shard_index, selected_after, batch_size),
+                    ).fetchall()
+                ]
+                if not selected_ids:
+                    break
+                verify_selected_owner_page_content(
+                    dataset,
+                    queue,
+                    selected_ids,
+                    candidate_digest=str(metadata["candidate_digest"]),
+                    shard_owner=shard_index,
+                )
+                selected_seen += len(selected_ids)
+                selected_after = selected_ids[-1]
+            if selected_seen != selected_expected:
+                raise ValueError(
+                    "repair selected-owner preflight count mismatch: "
+                    f"expected={selected_expected} actual={selected_seen}"
+                )
+
+        after_id: int | None = None
         while True:
             page, next_id = fetch_repair_queue_batch(
                 dataset,
@@ -994,6 +1080,8 @@ def preflight_repair_queue_shard(
         raise ValueError(
             f"repair queue preflight count mismatch: expected={expected} actual={len(rows)}"
         )
+    metadata = dict(metadata)
+    metadata["selected_owner_rows"] = selected_expected
     return rows, metadata
 
 
@@ -2169,6 +2257,8 @@ async def run(
     max_frequency_rank: int | None = None,
     quality_repair_only: bool = False,
     repair_queue: Path | None = None,
+    ready_marker: Path | None = None,
+    release_id: str = "",
 ) -> None:
     if repair_queue is not None and not quality_repair_only:
         raise ValueError("--repair-queue requires --quality-repair-only")
@@ -2181,6 +2271,8 @@ async def run(
         raise ValueError("--repair-queue requires --shard-index")
     if repair_queue is not None and (start_id is not None or end_id is not None):
         raise ValueError("--repair-queue uses fixed shard_owner, not ID bounds")
+    if ready_marker is not None and (repair_queue is None or not release_id):
+        raise ValueError("--ready-marker requires a repair queue and release id")
     workers = max(1, workers)
     profile = "deep" if profile == "deep" else "core"
     state: sqlite3.Connection | None = None
@@ -2249,6 +2341,22 @@ async def run(
             if EDGE_BASE
             else None
         )
+        if ready_marker is not None:
+            assert queue_metadata is not None and shard_index is not None
+            write_runtime_ready_marker(
+                ready_marker,
+                {
+                    "format": "lexora-top20k-runtime-ready-v1",
+                    "candidateDigest": str(queue_metadata["candidate_digest"]),
+                    "releaseId": release_id,
+                    "selectedOwnerRows": int(queue_metadata["selected_owner_rows"]),
+                    "preflightRows": len(prevalidated_repair_rows or []),
+                    "shardCount": shard_count,
+                    "shardIndex": int(shard_index),
+                    "processId": os.getpid(),
+                    "readyAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+                },
+            )
         processed = 0
         async def process_row(row: tuple[Any, ...]) -> tuple[str, str]:
             entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, phrases_json, phrase_entries_json, related_json, related_entries_json, freq, diff, enrich_json, pos = row
@@ -2594,6 +2702,16 @@ def main() -> None:
             "its exact repair_queue IDs (including replacements ranked above 20,000)"
         ),
     )
+    ap.add_argument(
+        "--ready-marker",
+        type=Path,
+        help="atomic runtime-readiness marker for a fixed repair release",
+    )
+    ap.add_argument(
+        "--release-id",
+        default=os.environ.get("LEXORA_RELEASE_ID", ""),
+        help="immutable deployment release id written into readiness evidence",
+    )
     args = ap.parse_args()
     if args.shard_index is not None and (args.start_id is not None or args.end_id is not None):
         ap.error("use either --shard-index/--shard-count or --start-id/--end-id, not both")
@@ -2620,6 +2738,8 @@ def main() -> None:
                 max_frequency_rank=args.max_frequency_rank,
                 quality_repair_only=args.quality_repair_only,
                 repair_queue=args.repair_queue,
+                ready_marker=args.ready_marker,
+                release_id=args.release_id,
             )
         )
 
