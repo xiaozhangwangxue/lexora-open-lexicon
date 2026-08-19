@@ -342,6 +342,25 @@ class Fast20kPipelineTest(unittest.TestCase):
             (15_000, 5_000),
         )
 
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sqlite"
+            candidate = root / "candidate.sqlite"
+            database = create_source(source)
+            add_entry(database, "alpha", 1)
+            database.commit()
+            database.close()
+            build_candidate(source, candidate, limit=1, phrase_target=0)
+
+            report = candidate_quality_report(
+                candidate,
+                source,
+                expected_rows=20_000,
+            )
+            self.assertFalse(report["structuralReady"])
+            self.assertEqual(report["issues"]["minimum_word_count"], 1)
+            self.assertEqual(report["terms"], {"words": 1, "phrases": 0})
+
     def test_failed_replace_keeps_previous_candidate_byte_for_byte(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
