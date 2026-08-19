@@ -27,6 +27,7 @@ def write_quality_snapshot(
     shard_count: int,
     unresolved_limit: int = 8,
 ) -> dict[str, object]:
+    dataset_before = dataset.stat()
     report = quality_report(
         dataset,
         max_frequency_rank=20_000,
@@ -34,11 +35,16 @@ def write_quality_snapshot(
         shard_count=shard_count,
         unresolved_limit=max(0, unresolved_limit),
     )
-    dataset_stat = dataset.stat()
+    dataset_after = dataset.stat()
+    if (
+        dataset_before.st_dev != dataset_after.st_dev
+        or dataset_before.st_ino != dataset_after.st_ino
+    ):
+        raise RuntimeError("dataset was replaced during the quality scan")
     report["qualityGateVersion"] = 1
     report["datasetIdentity"] = {
-        "device": dataset_stat.st_dev,
-        "inode": dataset_stat.st_ino,
+        "device": dataset_after.st_dev,
+        "inode": dataset_after.st_ino,
     }
     report["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
     output.parent.mkdir(parents=True, exist_ok=True)

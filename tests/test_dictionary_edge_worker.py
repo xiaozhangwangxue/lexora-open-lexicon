@@ -1804,6 +1804,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
                 ? "2026-08-19T01:00:00+00:00"
                 : "2026-08-19T01:01:00+00:00",
               top20k: {{
+                qualityGateVersion: 1,
                 total: 10000,
                 complete: primary ? 9000 : 9999,
                 incomplete: primary ? 1000 : 1,
@@ -1871,6 +1872,7 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
               total: 10,
               updatedAt: "2026-08-19T01:00:00+00:00",
               top20k: {{
+                qualityGateVersion: 1,
                 total: 10000,
                 complete: 9000,
                 incomplete: 1000,

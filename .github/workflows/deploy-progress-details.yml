@@ -95,7 +95,15 @@ jobs:
           quality_unit="lexora-top20k-quality-snapshot@${shard}.service"
           quality_timer="lexora-top20k-quality-snapshot@${shard}.timer"
           quality_path="/opt/lexora/state/top20k-quality-shard-${shard}.json"
+          timer_needs_restart=0
+          restart_quality_timer() {
+            if [ "$timer_needs_restart" = 1 ]; then
+              sudo systemctl start "$quality_timer" || true
+            fi
+          }
+          trap restart_quality_timer EXIT
           sudo systemctl stop "$quality_timer" || true
+          timer_needs_restart=1
           sudo systemctl enable "$quality_timer"
           for attempt in $(seq 1 60); do
             if ! systemctl is-active --quiet "$quality_unit"; then break; fi
@@ -119,6 +127,7 @@ jobs:
           test -n "$after_digest"
           test "$after_digest" != "$before_digest"
           sudo systemctl start "$quality_timer"
+          timer_needs_restart=0
 
           if systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
             | grep -q lexora-lexicon-micro; then
@@ -127,13 +136,19 @@ jobs:
             api_unit=lexora-lexicon.service
           fi
           sudo systemctl restart "$api_unit"
+          health_ok=0
           for attempt in $(seq 1 20); do
             if curl --fail --silent --max-time 3 \
                 http://127.0.0.1:8080/health >/tmp/lexora-health.json; then
+              health_ok=1
               break
             fi
             sleep 1
           done
+          if [ "$health_ok" != 1 ]; then
+            sudo journalctl -u "$api_unit" -n 120 --no-pager
+            exit 1
+          fi
           test -s "$quality_path"
           cat /tmp/lexora-health.json
           python3 - <<PY
@@ -162,4 +177,5 @@ jobs:
             active:inactive|inactive:active|inactive:activating) ;;
             *) echo "unexpected collection state"; exit 1 ;;
           esac
+          trap - EXIT
           REMOTE

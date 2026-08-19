@@ -319,7 +319,15 @@ async function combinedProgressResponse(request, env) {
     (sum, shard) => sum + Number(shard.incomplete || 0),
     0,
   );
-  const qualityAvailable = qualityShards.length === origins.length;
+  const qualityGateVersions = new Set(
+    qualityShards.map((shard) => Number(shard.qualityGateVersion || 0)),
+  );
+  const qualityGateVersion =
+    qualityGateVersions.size === 1 ? [...qualityGateVersions][0] : null;
+  const qualityAvailable =
+    qualityShards.length === origins.length &&
+    Number.isInteger(qualityGateVersion) &&
+    qualityGateVersion > 0;
   const top20k = {
     available: qualityAvailable,
     ready:
@@ -327,6 +335,7 @@ async function combinedProgressResponse(request, env) {
       qualityTotal === 20000 &&
       qualityIncomplete === 0,
     total: qualityTotal,
+    qualityGateVersion,
     complete: qualityComplete,
     incomplete: qualityIncomplete,
     percent:
