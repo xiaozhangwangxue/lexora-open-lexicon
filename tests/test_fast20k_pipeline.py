@@ -321,6 +321,27 @@ class Fast20kPipelineTest(unittest.TestCase):
             self.assertEqual(result["selection"]["phraseTarget"], 1)
             self.assertIn("not globally comparable", result["selection"]["policy"])
 
+    def test_fast20k_rejects_fewer_than_fifteen_thousand_words(self) -> None:
+        from fast20k_pipeline import _choose_counts
+
+        with self.assertRaisesRegex(ValueError, "at least 15000 words"):
+            _choose_counts(
+                limit=20_000,
+                phrase_target=6_000,
+                words=20_000,
+                phrases=6_000,
+            )
+
+        self.assertEqual(
+            _choose_counts(
+                limit=20_000,
+                phrase_target=5_000,
+                words=20_000,
+                phrases=5_000,
+            ),
+            (15_000, 5_000),
+        )
+
     def test_failed_replace_keeps_previous_candidate_byte_for_byte(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

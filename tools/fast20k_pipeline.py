@@ -44,6 +44,7 @@ from fast20k_contract import (
 
 DEFAULT_LIMIT = 20_000
 DEFAULT_PHRASE_TARGET = 4_000
+MIN_FAST20K_WORDS = 15_000
 DEFAULT_BATCH_SIZE = 512
 EXAMPLE_LIMIT = 20
 
@@ -91,6 +92,7 @@ ISSUE_MESSAGES = {
     "missing_table": "候选数据库缺少协议要求的数据表",
     "metadata": "候选选择元数据缺失或版本不匹配",
     "selection_counts": "候选中的单词和短语数量与选择元数据不一致",
+    "minimum_word_count": "20,000 极速词库中的常用单词少于 15,000 个",
     "ranking_policy": "候选词条的排名证据与选择策略不一致",
     "stream_order": "单词或短语流没有保持 canonical 排名顺序",
     "row_count": "候选词条数量不是要求的数量",
@@ -465,6 +467,11 @@ def _choose_counts(
         raise ValueError(
             "insufficient eligible candidates: "
             f"required={limit} words={words} reliable_phrases={phrases}"
+        )
+    if limit == DEFAULT_LIMIT and word_count < MIN_FAST20K_WORDS:
+        raise ValueError(
+            "fast-20k requires at least "
+            f"{MIN_FAST20K_WORDS} words: words={word_count} phrases={phrase_count}"
         )
     return word_count, phrase_count
 
@@ -1252,6 +1259,7 @@ def candidate_quality_report(
     metadata: dict[str, Any] = {}
     candidate_integrity = "not-run"
     canonical_integrity = "not-run"
+    actual_kinds: Counter[str] = Counter()
     phase = "candidate"
     try:
         candidate_db = sqlite3.connect(f"file:{candidate.resolve()}?mode=ro", uri=True)
@@ -1340,7 +1348,6 @@ def candidate_quality_report(
         canonical_integrity = _quick_check(canonical_db, issues, "canonical_integrity")
 
         expected_queue: dict[int, tuple[int, int, str, str, list[str], int]] = {}
-        actual_kinds: Counter[str] = Counter()
         last_kind_rank: dict[str, int] = {}
         phase = "comparison"
         cursor = candidate_db.execute(
@@ -1466,6 +1473,15 @@ def candidate_quality_report(
                 f"actual={actual_kinds['word']}/{actual_kinds['phrase']}",
             )
 
+        if (
+            expected_rows == DEFAULT_LIMIT
+            and actual_kinds["word"] < MIN_FAST20K_WORDS
+        ):
+            issues.add(
+                "minimum_word_count",
+                f"required={MIN_FAST20K_WORDS} actual={actual_kinds['word']}",
+            )
+
         if metadata:
             actual_selection_digest = selection_digest(candidate_db)
             if actual_selection_digest != str(metadata.get("selection_digest", "")):
@@ -1565,6 +1581,10 @@ def candidate_quality_report(
         "structuralReady": structural_ready,
         "candidateQuickCheck": candidate_integrity,
         "canonicalQuickCheck": canonical_integrity,
+        "terms": {
+            "words": actual_kinds["word"],
+            "phrases": actual_kinds["phrase"],
+        },
         "issues": counts,
         "examples": examples,
         "diagnostics": diagnostics,

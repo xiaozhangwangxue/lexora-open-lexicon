@@ -84,8 +84,11 @@ python tools/fast20k_pipeline.py select \
   --repair-shards 2
 ```
 
-The default policy keeps 16,000 words and up to 4,000 reliable phrases. Words
-retain their single-token `wordfreq` order. Phrases require explicit dictionary
+The default policy keeps 16,000 words and up to 4,000 reliable phrases. A
+fail-closed quality gate additionally requires at least 15,000 words in every
+20,000-entry release, so a configuration change cannot silently let phrases
+dominate the offline edition. Words retain their single-token `wordfreq` order.
+Phrases require explicit dictionary
 evidence, are ranked only within a bounded phrase stream, and are interleaved
 deterministically. Canonical phrase rank is recorded only as an auditable
 tie-breaker; it is not treated as globally comparable frequency evidence.
