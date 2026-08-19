@@ -31,6 +31,7 @@ full_collector="lexora-enrich@${shard}.service"
 backup="$track_root/systemd-backups/$release_id"
 state_file="$backup/state.env"
 started_file="$backup/activation-started"
+rollback_file="$backup/rollback-in-progress"
 candidate_digest=""
 if [[ -f "$release/candidate.env" ]]; then
   candidate_digest=$(sed -n 's/^LEXORA_CANDIDATE_DIGEST=//p' \
@@ -52,6 +53,65 @@ dropin_target="$dropin_dir/10-current-release.conf"
 
 run_systemctl() {
   sudo systemctl "$@"
+}
+
+write_durable_marker() {
+  local target=$1 marker_kind=$2
+  python3 - "$target" "$marker_kind" "$release_id" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+target = Path(sys.argv[1])
+target.parent.mkdir(parents=True, exist_ok=True)
+descriptor, name = tempfile.mkstemp(
+    prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+)
+temporary = Path(name)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(
+            {"format": "lexora-release-control-marker-v1", "kind": sys.argv[2],
+             "releaseId": sys.argv[3]},
+            stream,
+            sort_keys=True,
+        )
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, target)
+    directory = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+}
+
+fsync_rollback_material() {
+  python3 - "$backup" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+for path in directory.iterdir():
+    if path.is_file() and not path.is_symlink():
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+descriptor = os.open(directory, os.O_RDONLY)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
 }
 
 marker_valid() {
@@ -174,7 +234,8 @@ PY
 rollback_impl() {
   local activation_phase
   activation_phase=$(release_activation_phase)
-  if [[ ! -f "$started_file" && "$activation_phase" != requested ]]; then
+  if [[ ! -f "$started_file" && ! -f "$rollback_file" \
+    && "$activation_phase" != requested ]]; then
     if [[ "$activation_phase" == missing || "$activation_phase" == other ]]; then
       # The coordinator records a host before entering SSH so it can recover a
       # lost connection after a switch.  If SSH never began, this release has
@@ -189,6 +250,25 @@ rollback_impl() {
   if [[ ! -f "$state_file" ]]; then
     echo "release activation exists without saved system state; refusing mutation" >&2
     return 1
+  fi
+  case "$activation_phase" in
+    requested) ;;
+    missing|other)
+      [[ -f "$rollback_file" || -f "$started_file" ]] || {
+        echo "rollback continuation marker is missing; refusing mutation" >&2
+        return 1
+      }
+      ;;
+    *)
+      echo "invalid activation journal; refusing transactional rollback" >&2
+      return 1
+      ;;
+  esac
+  # Persist continuation intent before stopping the repair service or changing
+  # the active release.  If a later unit/timer restore fails, a retry can
+  # finish it even though the transaction already points at the predecessor.
+  if [[ ! -f "$rollback_file" ]]; then
+    write_durable_marker "$rollback_file" rollback-in-progress
   fi
   set +e
   local rollback_status=0
@@ -224,7 +304,8 @@ rollback_impl() {
   fi
   set -e
   if [[ "$rollback_status" == 0 ]]; then
-    rm -f -- "$started_file" "$preflight_marker" "$runtime_marker"
+    rm -f -- "$started_file" "$rollback_file" \
+      "$preflight_marker" "$runtime_marker"
   fi
   return "$rollback_status"
 }
@@ -280,11 +361,14 @@ printf 'service_active_before=%q\ntimer_active_before=%q\ntimer_enabled_before=%
   "$service_active_before" "$timer_active_before" "$timer_enabled_before" \
   "$micro_active_before" "$full_active_before" \
   > "$state_file"
-: > "$started_file"
 save_one "$main_target" main.service
 save_one "$timer_target" main.timer
 sudo install -d -m 0755 "$dropin_dir"
 save_one "$dropin_target" current.conf
+# The marker is published only after the complete rollback material exists,
+# but still before the first service stop or release switch.
+fsync_rollback_material
+write_durable_marker "$started_file" activation-started
 
 set +e
 (

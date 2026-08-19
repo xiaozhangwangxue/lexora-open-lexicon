@@ -16,7 +16,9 @@ micro_recover="lexora-enrich-recover@${shard}.service"
 full_watch="lexora-enrich-full-watch@${shard}.service"
 full_watch_timer="lexora-enrich-full-watch@${shard}.timer"
 full_recover="lexora-enrich-full-recover@${shard}.service"
-marker="/run/lexora-top20k-repair-${shard}.collector-state"
+run_root=${LEXORA_RUN_ROOT:-/run}
+state_root=${LEXORA_STATE_ROOT:-/opt/lexora/state}
+marker="$run_root/lexora-top20k-repair-${shard}.collector-state"
 
 unit_state() {
   systemctl is-active "$1" 2>/dev/null || true
@@ -31,13 +33,25 @@ restore_unit_state() {
   fi
 }
 
+validate_unit_states() {
+  local value
+  for value in "$@"; do
+    case "$value" in
+      active|activating|inactive|failed|deactivating|unknown) ;;
+      *) echo "invalid or unavailable collector unit state" >&2; return 1 ;;
+    esac
+  done
+}
+
 if [[ "$action" == capture ]]; then
   temporary="${marker}.tmp-$$"
+  # A failed capture must never leave an older run's snapshot for
+  # ExecStopPost to replay.  Until the new atomic marker exists, restore is a
+  # strict no-op.
+  rm -f -- "$marker" "$temporary"
   [[ "${LEXORA_CANDIDATE_DIGEST:-}" =~ ^[0-9a-f]{64}$ ]] || {
     echo "candidate digest is missing or invalid" >&2; exit 1;
   }
-  install -d -o opc -g opc -m 0750 \
-    "/opt/lexora/state/fast20k/$LEXORA_CANDIDATE_DIGEST"
   micro_state=$(unit_state "$micro_collector")
   full_state=$(unit_state "$full_collector")
   micro_watch_state=$(unit_state "$micro_watch")
@@ -46,6 +60,13 @@ if [[ "$action" == capture ]]; then
   full_watch_state=$(unit_state "$full_watch")
   full_watch_timer_state=$(unit_state "$full_watch_timer")
   full_recover_state=$(unit_state "$full_recover")
+  validate_unit_states \
+    "$micro_state" "$full_state" \
+    "$micro_watch_state" "$micro_watch_timer_state" "$micro_recover_state" \
+    "$full_watch_state" "$full_watch_timer_state" "$full_recover_state"
+  install -d -m 0750 "$run_root"
+  install -d -o opc -g opc -m 0750 \
+    "$state_root/fast20k/$LEXORA_CANDIDATE_DIGEST"
   printf '%s\n' \
     "micro=$micro_state" \
     "full=$full_state" \
@@ -56,6 +77,21 @@ if [[ "$action" == capture ]]; then
     "full_watch_timer=$full_watch_timer_state" \
     "full_recover=$full_recover_state" > "$temporary"
   mv -f -- "$temporary" "$marker"
+  python3 - "$marker" "$run_root" <<'PY'
+import os
+import sys
+
+file_descriptor = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(file_descriptor)
+finally:
+    os.close(file_descriptor)
+directory_descriptor = os.open(sys.argv[2], os.O_RDONLY)
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
+PY
   # Quiesce every known unit that can write or restart a writer.  Timers and
   # watchdogs are stopped first so they cannot race the collector stop.
   for unit in \
@@ -75,34 +111,35 @@ if [[ "$action" == capture ]]; then
   exit
 fi
 
-micro_state=inactive
-full_state=inactive
-micro_watch_state=inactive
-micro_watch_timer_state=inactive
-micro_recover_state=inactive
-full_watch_state=inactive
-full_watch_timer_state=inactive
-full_recover_state=inactive
-if [[ -f "$marker" ]]; then
-  while IFS='=' read -r name value; do
-    case "$name" in
-      micro) micro_state=$value ;;
-      full) full_state=$value ;;
-      micro_watch) micro_watch_state=$value ;;
-      micro_watch_timer) micro_watch_timer_state=$value ;;
-      micro_recover) micro_recover_state=$value ;;
-      full_watch) full_watch_state=$value ;;
-      full_watch_timer) full_watch_timer_state=$value ;;
-      full_recover) full_recover_state=$value ;;
-    esac
-  done < "$marker"
+if [[ ! -f "$marker" ]]; then
+  echo "collector_state_restore=noop shard=$shard reason=missing-capture-marker"
+  exit 0
 fi
-for value in \
+micro_state=
+full_state=
+micro_watch_state=
+micro_watch_timer_state=
+micro_recover_state=
+full_watch_state=
+full_watch_timer_state=
+full_recover_state=
+while IFS='=' read -r name value; do
+  case "$name" in
+    micro) micro_state=$value ;;
+    full) full_state=$value ;;
+    micro_watch) micro_watch_state=$value ;;
+    micro_watch_timer) micro_watch_timer_state=$value ;;
+    micro_recover) micro_recover_state=$value ;;
+    full_watch) full_watch_state=$value ;;
+    full_watch_timer) full_watch_timer_state=$value ;;
+    full_recover) full_recover_state=$value ;;
+    *) echo "invalid collector state key: $name" >&2; exit 1 ;;
+  esac
+done < "$marker"
+validate_unit_states \
   "$micro_state" "$full_state" \
   "$micro_watch_state" "$micro_watch_timer_state" "$micro_recover_state" \
-  "$full_watch_state" "$full_watch_timer_state" "$full_recover_state"; do
-  case "$value" in active|activating|inactive|failed|deactivating|unknown) ;; *) exit 1 ;; esac
-done
+  "$full_watch_state" "$full_watch_timer_state" "$full_recover_state"
 # Restore writers first and guardian timers last.  This reproduces the exact
 # active/inactive snapshot without letting a watchdog race restoration.
 restore_unit_state "$micro_collector" "$micro_state"
