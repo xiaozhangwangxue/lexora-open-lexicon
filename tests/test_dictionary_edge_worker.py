@@ -1849,6 +1849,79 @@ class DictionaryEdgeWorkerTest(unittest.TestCase):
         self.assertEqual(body["top20k"]["missing"]["definition"], 901)
         self.assertEqual(body["top20k"]["updatedAt"], "2026-08-19T01:03:00+00:00")
 
+    def test_progress_head_never_poisons_get_cache(self) -> None:
+        script = f"""
+          const cache = new Map();
+          globalThis.caches = {{
+            default: {{
+              match: async (request) => {{
+                const value = cache.get(request.url);
+                return value ? value.clone() : null;
+              }},
+              put: async (request, response) => {{
+                cache.set(request.url, response.clone());
+              }},
+            }},
+          }};
+          globalThis.fetch = async (input) => {{
+            const host = new URL(String(input)).hostname;
+            return Response.json({{
+              shard: host === "primary.example" ? 0 : 1,
+              finished: 5,
+              total: 10,
+              updatedAt: "2026-08-19T01:00:00+00:00",
+              top20k: {{
+                total: 10000,
+                complete: 9000,
+                incomplete: 1000,
+                percent: 90,
+                updatedAt: "2026-08-19T01:00:00+00:00",
+              }},
+            }});
+          }};
+          const {{ default: worker }} = await import(
+            {json.dumps(WORKER.as_uri())}
+          );
+          const env = {{
+            ORIGIN_TOKEN: "test-token",
+            PRIMARY_ORIGIN: "https://primary.example",
+            SECONDARY_ORIGIN: "https://secondary.example",
+          }};
+          const pending = [];
+          const ctx = {{ waitUntil: (value) => pending.push(value) }};
+          const head = await worker.fetch(
+            new Request("https://dict.example/v1/progress?cache-bust=1", {{
+              method: "HEAD",
+            }}),
+            env,
+            ctx,
+          );
+          await Promise.all(pending);
+          const get = await worker.fetch(
+            new Request("https://dict.example/v1/progress?different=1"),
+            env,
+            {{ waitUntil: () => undefined }},
+          );
+          const body = await get.json();
+          console.log(JSON.stringify({{
+            headStatus: head.status,
+            headBody: await head.text(),
+            getStatus: get.status,
+            getCache: get.headers.get("X-Lexora-Cache"),
+            finished: body.finished,
+            topTotal: body.top20k.total,
+            cacheEntries: cache.size,
+          }}));
+        """
+        result = self.run_node(script)
+        self.assertEqual(result["headStatus"], 200)
+        self.assertEqual(result["headBody"], "")
+        self.assertEqual(result["getStatus"], 200)
+        self.assertEqual(result["getCache"], "HIT")
+        self.assertEqual(result["finished"], 10)
+        self.assertEqual(result["topTotal"], 20000)
+        self.assertEqual(result["cacheEntries"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

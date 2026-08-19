@@ -69,6 +69,8 @@ class Top20kQualitySnapshotTest(unittest.TestCase):
             self.assertEqual(value["incomplete"], 1)
             self.assertEqual(value["missing"]["definition"], 1)
             self.assertIn("updatedAt", value)
+            self.assertEqual(value["qualityGateVersion"], 1)
+            self.assertEqual(value["datasetIdentity"]["inode"], dataset.stat().st_ino)
             saved = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(saved["total"], 2)
             self.assertFalse(any(root.glob(".quality.json.tmp-*")))

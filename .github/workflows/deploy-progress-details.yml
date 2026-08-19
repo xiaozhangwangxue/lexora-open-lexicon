@@ -1,4 +1,4 @@
-name: Deploy detailed collection progress
+name: Deploy detailed progress origins
 
 on:
   workflow_dispatch:
@@ -92,10 +92,33 @@ jobs:
             /opt/lexora/tools/top20k_quality.py \
             /opt/lexora/tools/write_top20k_quality_snapshot.py
           sudo systemctl daemon-reload
-          sudo systemctl enable --now \
-            "lexora-top20k-quality-snapshot@${shard}.timer"
-          sudo systemctl start --no-block \
-            "lexora-top20k-quality-snapshot@${shard}.service"
+          quality_unit="lexora-top20k-quality-snapshot@${shard}.service"
+          quality_timer="lexora-top20k-quality-snapshot@${shard}.timer"
+          quality_path="/opt/lexora/state/top20k-quality-shard-${shard}.json"
+          sudo systemctl stop "$quality_timer" || true
+          sudo systemctl enable "$quality_timer"
+          for attempt in $(seq 1 60); do
+            if ! systemctl is-active --quiet "$quality_unit"; then break; fi
+            sleep 5
+          done
+          if systemctl is-active --quiet "$quality_unit"; then
+            echo "previous quality snapshot is still running"
+            exit 1
+          fi
+          before_digest=$(sha256sum "$quality_path" 2>/dev/null \
+            | awk '{print $1}' || true)
+          if ! sudo systemctl start "$quality_unit"; then
+            sudo journalctl -u "$quality_unit" -n 120 --no-pager
+            exit 1
+          fi
+          result=$(systemctl show "$quality_unit" -p Result --value)
+          exit_status=$(systemctl show "$quality_unit" -p ExecMainStatus --value)
+          test "$result" = success
+          test "$exit_status" = 0
+          after_digest=$(sha256sum "$quality_path" | awk '{print $1}')
+          test -n "$after_digest"
+          test "$after_digest" != "$before_digest"
+          sudo systemctl start "$quality_timer"
 
           if systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
             | grep -q lexora-lexicon-micro; then
@@ -104,15 +127,14 @@ jobs:
             api_unit=lexora-lexicon.service
           fi
           sudo systemctl restart "$api_unit"
-          for attempt in $(seq 1 60); do
-            if [ -s "/opt/lexora/state/top20k-quality-shard-${shard}.json" ] \
-              && curl --fail --silent --max-time 3 \
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent --max-time 3 \
                 http://127.0.0.1:8080/health >/tmp/lexora-health.json; then
               break
             fi
-            sleep 5
+            sleep 1
           done
-          test -s "/opt/lexora/state/top20k-quality-shard-${shard}.json"
+          test -s "$quality_path"
           cat /tmp/lexora-health.json
           python3 - <<PY
           import json

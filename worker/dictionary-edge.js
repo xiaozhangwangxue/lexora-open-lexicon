@@ -1500,20 +1500,43 @@ export default {
       url.pathname === "/v1/progress"
     ) {
       const progressCache = caches.default;
-      const progressKey = new Request(url.toString(), { method: "GET" });
+      const normalizedProgressUrl = new URL(url.origin);
+      normalizedProgressUrl.pathname = "/v1/progress";
+      const progressKey = new Request(normalizedProgressUrl.toString(), {
+        method: "GET",
+      });
       const cached = await progressCache.match(progressKey);
       if (cached) {
+        const headers = new Headers(cached.headers);
+        headers.set("X-Lexora-Cache", "HIT");
         if (request.method === "HEAD") {
           return new Response(null, {
             status: cached.status,
             statusText: cached.statusText,
-            headers: cached.headers,
+            headers,
           });
         }
-        return cached;
+        return new Response(cached.body, {
+          status: cached.status,
+          statusText: cached.statusText,
+          headers,
+        });
       }
-      const progress = await combinedProgressResponse(request, env);
-      if (progress.ok) ctx.waitUntil(progressCache.put(progressKey, progress.clone()));
+      const fullRequest = new Request(request.url, {
+        method: "GET",
+        headers: request.headers,
+      });
+      const progress = await combinedProgressResponse(fullRequest, env);
+      if (progress.ok) {
+        ctx.waitUntil(progressCache.put(progressKey, progress.clone()));
+      }
+      if (request.method === "HEAD") {
+        return new Response(null, {
+          status: progress.status,
+          statusText: progress.statusText,
+          headers: progress.headers,
+        });
+      }
       return progress;
     }
     const allowedMethod =

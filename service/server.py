@@ -7,7 +7,7 @@ import hashlib
 import re
 import threading
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -163,6 +163,20 @@ def collection_progress() -> dict[str, Any]:
     quality_path = STATE / f"top20k-quality-shard-{shard}.json"
     try:
         quality = json.loads(quality_path.read_text(encoding="utf-8"))
+        quality_updated_at = datetime.fromisoformat(
+            str(quality["updatedAt"]).replace("Z", "+00:00")
+        )
+        if quality_updated_at.tzinfo is None:
+            quality_updated_at = quality_updated_at.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - quality_updated_at).total_seconds() > 3 * 3600:
+            raise ValueError("quality snapshot is stale")
+        identity = quality["datasetIdentity"]
+        dataset_stat = (BUILD / "lexora-open-oxford-scope.sqlite").stat()
+        if (
+            int(identity["device"]) != dataset_stat.st_dev
+            or int(identity["inode"]) != dataset_stat.st_ino
+        ):
+            raise ValueError("quality snapshot belongs to a different dataset")
         quality_total = max(0, int(quality["total"]))
         quality_complete = max(0, int(quality["complete"]))
         quality_incomplete = max(0, int(quality["incomplete"]))
@@ -183,6 +197,7 @@ def collection_progress() -> dict[str, Any]:
             "entryStatus": quality.get("entryStatus", {}),
             "unresolved": quality.get("unresolved", []),
             "updatedAt": quality.get("updatedAt"),
+            "qualityGateVersion": int(quality.get("qualityGateVersion", 1)),
         }
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         result["top20k"] = None

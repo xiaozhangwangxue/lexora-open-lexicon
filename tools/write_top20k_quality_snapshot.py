@@ -34,6 +34,12 @@ def write_quality_snapshot(
         shard_count=shard_count,
         unresolved_limit=max(0, unresolved_limit),
     )
+    dataset_stat = dataset.stat()
+    report["qualityGateVersion"] = 1
+    report["datasetIdentity"] = {
+        "device": dataset_stat.st_dev,
+        "inode": dataset_stat.st_ino,
+    }
     report["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.tmp-{os.getpid()}")
