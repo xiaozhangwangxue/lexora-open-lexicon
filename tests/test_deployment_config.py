@@ -106,7 +106,7 @@ class DeploymentConfigTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("Nice=19", service)
         self.assertIn("IOSchedulingClass=idle", service)
-        self.assertIn("TimeoutStartSec=5min", service)
+        self.assertIn("TimeoutStartSec=12min", service)
         self.assertIn("top20k-quality-shard-%i.json", service)
         self.assertIn("OnUnitActiveSec=60min", timer)
 
