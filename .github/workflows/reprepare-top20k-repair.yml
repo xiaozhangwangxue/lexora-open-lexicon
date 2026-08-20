@@ -129,7 +129,8 @@ jobs:
           python3 "$transaction" --root "$root" --track repair \
             --release-id "$release_id" prepare-code \
             --archive "$remote_tmp/code.tar.gz" --archive-sha256 "$code_sha" \
-            --imports enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot,fast20k_contract,fast20k_pipeline,fast20k_repair_delta
+            --imports enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot,fast20k_contract,fast20k_pipeline,fast20k_repair_delta \
+            >/dev/null
           preparation="$root/deployments/repair/preparations/$release_id"
           PYTHONPATH="$preparation/tools" python3 -c \
             'import enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot,fast20k_contract,fast20k_pipeline,fast20k_repair_delta'

@@ -69,6 +69,7 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertIn('--candidate-sha256 "$candidate_sha"', workflow)
         self.assertIn('--canonical-identity-sha256 "$canonical_sha"', workflow)
         self.assertIn("prepare-code", workflow)
+        self.assertIn("fast20k_pipeline,fast20k_repair_delta \\\n            >/dev/null", workflow)
         self.assertIn("preflight_repair_queue.py", workflow)
         self.assertIn('--shard-index "$shard" --shard-count 2', workflow)
         self.assertIn('assert report["terms"] == {"words": 16_000, "phrases": 4_000}', workflow)
