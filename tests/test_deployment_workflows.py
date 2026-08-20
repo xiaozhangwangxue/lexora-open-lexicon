@@ -162,6 +162,23 @@ class DeploymentWorkflowTest(unittest.TestCase):
         ]
         self.assertEqual(direct_systemctl, [])
 
+    def test_repair_status_check_uses_system_bus_and_fixed_candidate(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "check-top20k-repair.yml"
+        ).read_text(encoding="utf-8")
+        direct_systemctl = [
+            line
+            for line in workflow.splitlines()
+            if re.search(r"(?<![A-Za-z0-9_])systemctl\s", line)
+            and "sudo systemctl" not in line
+        ]
+        self.assertEqual(direct_systemctl, [])
+        self.assertIn(
+            "--candidate /opt/lexora/deployments/repair/current/build/"
+            "lexora-open-oxford-safe-20k.sqlite",
+            workflow,
+        )
+
     def test_web_parity_deploys_progress_validator_with_server(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "deploy-web-parity-api.yml"
