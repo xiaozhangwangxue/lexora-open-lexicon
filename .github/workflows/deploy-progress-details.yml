@@ -89,13 +89,13 @@ jobs:
           quality_dropin=/etc/systemd/system/lexora-top20k-quality-snapshot@.service.d/10-current-release.conf
           quality_unit="lexora-top20k-quality-snapshot@${shard}.service"
           quality_timer="lexora-top20k-quality-snapshot@${shard}.timer"
-          if systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
+          if sudo systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
             | grep -q lexora-lexicon-micro; then
             api_unit=lexora-lexicon-micro.service
           else
             api_unit=lexora-lexicon.service
           fi
-          api_active_before=$(systemctl is-active "$api_unit" || true)
+          api_active_before=$(sudo systemctl is-active "$api_unit" || true)
           save_one() {
             target=$1
             name=$2
@@ -125,8 +125,8 @@ jobs:
           save_one "$quality_main" quality.service
           save_one "$quality_timer_file" quality.timer
           save_one "$quality_dropin" quality.conf
-          timer_active_before=$(systemctl is-active "$quality_timer" || true)
-          timer_enabled_before=$(systemctl is-enabled "$quality_timer" || true)
+          timer_active_before=$(sudo systemctl is-active "$quality_timer" || true)
+          timer_enabled_before=$(sudo systemctl is-enabled "$quality_timer" || true)
           rollback_progress() {
             status=$?
             trap - ERR
@@ -161,9 +161,9 @@ jobs:
           collector="lexora-enrich-micro@${shard}.service"
           full_collector="lexora-enrich@${shard}.service"
           repair="lexora-top20k-repair@${shard}.service"
-          collector_before=$(systemctl is-active "$collector" || true)
-          full_collector_before=$(systemctl is-active "$full_collector" || true)
-          repair_before=$(systemctl is-active "$repair" || true)
+          collector_before=$(sudo systemctl is-active "$collector" || true)
+          full_collector_before=$(sudo systemctl is-active "$full_collector" || true)
+          repair_before=$(sudo systemctl is-active "$repair" || true)
 
           sudo install -o opc -g opc -m 0644 "$release/service/server.py" \
             "$server_target"
@@ -191,13 +191,13 @@ jobs:
           PYTHONPATH=/opt/lexora/deployments/progress/current/tools \
             python3 -c 'import enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot'
           sudo systemctl daemon-reload
-          quality_active_after_reload=$(systemctl show "$quality_unit" \
+          quality_active_after_reload=$(sudo systemctl show "$quality_unit" \
             -p ActiveState --value || true)
-          quality_sub_after_reload=$(systemctl show "$quality_unit" \
+          quality_sub_after_reload=$(sudo systemctl show "$quality_unit" \
             -p SubState --value || true)
-          quality_job_after_reload=$(systemctl show "$quality_unit" \
+          quality_job_after_reload=$(sudo systemctl show "$quality_unit" \
             -p Job --value || true)
-          quality_main_pid_after_reload=$(systemctl show "$quality_unit" \
+          quality_main_pid_after_reload=$(sudo systemctl show "$quality_unit" \
             -p MainPID --value || true)
           printf 'quality_active_after_reload=%s\n' "$quality_active_after_reload"
           printf 'quality_sub_after_reload=%s\n' "$quality_sub_after_reload"
@@ -212,7 +212,7 @@ jobs:
                   echo "canceling stale queued quality snapshot job"
                   sudo systemctl stop "$quality_unit" || true
                   sudo systemctl reset-failed "$quality_unit" || true
-                  quality_job_after_cancel=$(systemctl show "$quality_unit" \
+                  quality_job_after_cancel=$(sudo systemctl show "$quality_unit" \
                     -p Job --value || true)
                   printf 'quality_job_after_cancel=%s\n' \
                     "$quality_job_after_cancel"
@@ -252,7 +252,7 @@ jobs:
             # oneshot synchronously; its unit-level 12 minute timeout remains
             # the upper bound.
             deadline=$((SECONDS + 750))
-            while systemctl is-active --quiet "$quality_unit"; do
+            while sudo systemctl is-active --quiet "$quality_unit"; do
               if (( SECONDS >= deadline )); then
                 echo "existing quality scan exceeded deployment wait" >&2
                 exit 1
@@ -308,11 +308,11 @@ jobs:
               "percent": value["percent"],
           }, sort_keys=True))
           PY
-          systemctl show "$quality_unit" -p ActiveState -p SubState -p Result
-          systemctl is-active "$api_unit"
-          collector_after=$(systemctl is-active "$collector" || true)
-          full_collector_after=$(systemctl is-active "$full_collector" || true)
-          repair_after=$(systemctl is-active "$repair" || true)
+          sudo systemctl show "$quality_unit" -p ActiveState -p SubState -p Result
+          sudo systemctl is-active "$api_unit"
+          collector_after=$(sudo systemctl is-active "$collector" || true)
+          full_collector_after=$(sudo systemctl is-active "$full_collector" || true)
+          repair_after=$(sudo systemctl is-active "$repair" || true)
           printf 'collector_before=%s\ncollector_after=%s\n' \
             "$collector_before" "$collector_after"
           printf 'repair_before=%s\nrepair_after=%s\n' \
