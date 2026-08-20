@@ -2257,6 +2257,7 @@ async def run(
     max_frequency_rank: int | None = None,
     quality_repair_only: bool = False,
     repair_queue: Path | None = None,
+    preflight_marker: Path | None = None,
     ready_marker: Path | None = None,
     release_id: str = "",
 ) -> None:
@@ -2271,8 +2272,12 @@ async def run(
         raise ValueError("--repair-queue requires --shard-index")
     if repair_queue is not None and (start_id is not None or end_id is not None):
         raise ValueError("--repair-queue uses fixed shard_owner, not ID bounds")
-    if ready_marker is not None and (repair_queue is None or not release_id):
-        raise ValueError("--ready-marker requires a repair queue and release id")
+    if (preflight_marker is not None or ready_marker is not None) and (
+        repair_queue is None or not release_id
+    ):
+        raise ValueError(
+            "readiness markers require a repair queue and release id"
+        )
     workers = max(1, workers)
     profile = "deep" if profile == "deep" else "core"
     state: sqlite3.Connection | None = None
@@ -2341,22 +2346,39 @@ async def run(
             if EDGE_BASE
             else None
         )
-        if ready_marker is not None:
+        if preflight_marker is not None or ready_marker is not None:
             assert queue_metadata is not None and shard_index is not None
-            write_runtime_ready_marker(
-                ready_marker,
-                {
-                    "format": "lexora-top20k-runtime-ready-v1",
-                    "candidateDigest": str(queue_metadata["candidate_digest"]),
-                    "releaseId": release_id,
-                    "selectedOwnerRows": int(queue_metadata["selected_owner_rows"]),
-                    "preflightRows": len(prevalidated_repair_rows or []),
-                    "shardCount": shard_count,
-                    "shardIndex": int(shard_index),
-                    "processId": os.getpid(),
-                    "readyAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-                },
-            )
+            marker_base = {
+                "candidateDigest": str(queue_metadata["candidate_digest"]),
+                "releaseId": release_id,
+                "selectedOwnerRows": int(queue_metadata["selected_owner_rows"]),
+                "preflightRows": len(prevalidated_repair_rows or []),
+                "shardCount": shard_count,
+                "shardIndex": int(shard_index),
+                "processId": os.getpid(),
+            }
+            if preflight_marker is not None:
+                write_runtime_ready_marker(
+                    preflight_marker,
+                    {
+                        "format": "lexora-top20k-preflight-v1",
+                        **marker_base,
+                        "completedAt": dt.datetime.now(
+                            dt.timezone.utc
+                        ).isoformat(),
+                    },
+                )
+            if ready_marker is not None:
+                write_runtime_ready_marker(
+                    ready_marker,
+                    {
+                        "format": "lexora-top20k-runtime-ready-v1",
+                        **marker_base,
+                        "readyAt": dt.datetime.now(
+                            dt.timezone.utc
+                        ).isoformat(),
+                    },
+                )
         processed = 0
         async def process_row(row: tuple[Any, ...]) -> tuple[str, str]:
             entry_id, word, term, definition, definition_zh, us, uk, synonyms_json, antonyms_json, examples_json, phrases_json, phrase_entries_json, related_json, related_entries_json, freq, diff, enrich_json, pos = row
@@ -2703,6 +2725,14 @@ def main() -> None:
         ),
     )
     ap.add_argument(
+        "--preflight-marker",
+        type=Path,
+        help=(
+            "atomic fixed-owner preflight marker written by the worker after "
+            "its single complete local validation"
+        ),
+    )
+    ap.add_argument(
         "--ready-marker",
         type=Path,
         help="atomic runtime-readiness marker for a fixed repair release",
@@ -2738,6 +2768,7 @@ def main() -> None:
                 max_frequency_rank=args.max_frequency_rank,
                 quality_repair_only=args.quality_repair_only,
                 repair_queue=args.repair_queue,
+                preflight_marker=args.preflight_marker,
                 ready_marker=args.ready_marker,
                 release_id=args.release_id,
             )

@@ -504,6 +504,8 @@ class Fast20kPipelineTest(unittest.TestCase):
             source = root / "source.sqlite"
             candidate = root / "candidate.sqlite"
             state = root / "state.sqlite"
+            preflight_marker = root / "preflight.json"
+            runtime_marker = root / "runtime.json"
             database = create_source(source)
             add_entry(database, "complete", 1)
             ignored_id = add_entry(
@@ -585,10 +587,19 @@ class Fast20kPipelineTest(unittest.TestCase):
                         1,
                         quality_repair_only=True,
                         repair_queue=candidate,
+                        preflight_marker=preflight_marker,
+                        ready_marker=runtime_marker,
+                        release_id="single-preflight-test",
                     )
                 )
 
             self.assertEqual(attempted, ["backfill"])
+            preflight = json.loads(preflight_marker.read_text(encoding="utf-8"))
+            runtime = json.loads(runtime_marker.read_text(encoding="utf-8"))
+            self.assertEqual(preflight["format"], "lexora-top20k-preflight-v1")
+            self.assertEqual(runtime["format"], "lexora-top20k-runtime-ready-v1")
+            self.assertEqual(preflight["candidateDigest"], runtime["candidateDigest"])
+            self.assertEqual(preflight["processId"], runtime["processId"])
             database = sqlite3.connect(source)
             repaired = database.execute(
                 "SELECT definition,definition_zh FROM entries WHERE id=?",

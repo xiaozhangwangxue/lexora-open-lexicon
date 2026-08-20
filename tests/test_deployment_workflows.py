@@ -148,8 +148,8 @@ class DeploymentWorkflowTest(unittest.TestCase):
         )
         self.assertIn("candidate.env", dropin)
         self.assertIn("${LEXORA_CANDIDATE_DIGEST}", dropin)
-        self.assertIn("preflight_repair_queue.py", dropin)
-        self.assertIn("--success-marker", dropin)
+        self.assertNotIn("preflight_repair_queue.py", dropin)
+        self.assertIn("--preflight-marker", dropin)
         self.assertIn("--ready-marker", dropin)
         self.assertIn("runtime-ready-shard-%i.json", dropin)
         self.assertIn("${LEXORA_RELEASE_ID}", dropin)
@@ -159,7 +159,7 @@ class DeploymentWorkflowTest(unittest.TestCase):
         )
         self.assertLess(
             dropin.index("/usr/bin/rm -f"),
-            dropin.index("preflight_repair_queue.py"),
+            dropin.index("--preflight-marker"),
         )
         self.assertNotIn("fast20k-repair-shard-%i.sqlite", dropin)
         self.assertIn("lexora-enrich-micro@", state)
