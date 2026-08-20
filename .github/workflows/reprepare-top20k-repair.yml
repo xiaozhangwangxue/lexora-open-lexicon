@@ -44,7 +44,7 @@ jobs:
           CONFIRMATION: ${{ inputs.confirmation }}
           SOURCE_RELEASE_ID: ${{ inputs.source_release_id }}
           RELEASE_ID: ${{ inputs.release_id }}
-          CANDIDATE_SHA: ${{ inputs.candidate_sha256 }}
+          SOURCE_CANDIDATE_SHA: ${{ inputs.candidate_sha256 }}
           CANONICAL_SHA: ${{ inputs.canonical_identity_sha256 }}
         run: |
           set -euo pipefail
@@ -52,10 +52,10 @@ jobs:
           [[ "$SOURCE_RELEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
           [[ "$RELEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
           test "$SOURCE_RELEASE_ID" != "$RELEASE_ID"
-          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$SOURCE_CANDIDATE_SHA" =~ ^[0-9a-f]{64}$ ]]
           [[ "$CANONICAL_SHA" =~ ^[0-9a-f]{64}$ ]]
-          printf 'SOURCE_RELEASE_ID=%s\nRELEASE_ID=%s\nCANDIDATE_SHA=%s\nCANONICAL_SHA=%s\n' \
-            "$SOURCE_RELEASE_ID" "$RELEASE_ID" "$CANDIDATE_SHA" "$CANONICAL_SHA" \
+          printf 'SOURCE_RELEASE_ID=%s\nRELEASE_ID=%s\nSOURCE_CANDIDATE_SHA=%s\nCANONICAL_SHA=%s\n' \
+            "$SOURCE_RELEASE_ID" "$RELEASE_ID" "$SOURCE_CANDIDATE_SHA" "$CANONICAL_SHA" \
             >> "$GITHUB_ENV"
 
       - name: Prepare SSH credentials
@@ -88,12 +88,12 @@ jobs:
           printf 'source_release_id=%s\nnew_release_id=%s\ncode_sha256=%s\n' \
             "$SOURCE_RELEASE_ID" "$RELEASE_ID" "$code_sha" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Verify, preflight and reseal on both servers
+      - name: Verify the source and stage current code on both servers
         shell: bash
         run: |
           set -euo pipefail
           hosts=(140.245.114.238 134.185.82.7)
-          reprepare_one() {
+          stage_one() {
             local shard=$1
             local host=${hosts[$shard]}
             local remote_tmp="/tmp/lexora-reprepare-${RELEASE_ID}-${GITHUB_RUN_ID}"
@@ -104,8 +104,7 @@ jobs:
             scp "${ssh_opts[@]}" deployment-receipts/code.tar.gz \
               deploy/deployment_transaction.py "opc@$host:$remote_tmp/"
             ssh "${ssh_opts[@]}" "opc@$host" \
-              "bash -se -- '$remote_tmp' '$SOURCE_RELEASE_ID' '$RELEASE_ID' '$CODE_SHA' '$CANDIDATE_SHA' '$CANONICAL_SHA' '$shard'" \
-              > "deployment-receipts/sealed-$shard.json" <<'REMOTE'
+              "bash -se -- '$remote_tmp' '$SOURCE_RELEASE_ID' '$RELEASE_ID' '$CODE_SHA' '$SOURCE_CANDIDATE_SHA' '$CANONICAL_SHA'" <<'REMOTE'
           set -euo pipefail
           remote_tmp=$1
           source_release_id=$2
@@ -113,7 +112,6 @@ jobs:
           code_sha=$4
           candidate_sha=$5
           canonical_sha=$6
-          shard=$7
           root=/opt/lexora
           source_release="$root/deployments/repair/releases/$source_release_id"
           source_candidate="$source_release/build/lexora-open-oxford-safe-20k.sqlite"
@@ -151,25 +149,108 @@ jobs:
               stream.write("\n")
           PY
 
+          REMOTE
+          }
+
+          pids=()
+          for shard in 0 1; do
+            stage_one "$shard" &
+            pids+=("$!")
+          done
+          status=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || status=1
+          done
+          exit "$status"
+
+      - name: Refresh the fixed selection from both live owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          hosts=(140.245.114.238 134.185.82.7)
+          ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=30)
+          remote_tmp="/tmp/lexora-reprepare-${RELEASE_ID}-${GITHUB_RUN_ID}"
+          source_candidate="/opt/lexora/deployments/repair/releases/$SOURCE_RELEASE_ID/build/lexora-open-oxford-safe-20k.sqlite"
+          preparation="/opt/lexora/deployments/repair/preparations/$RELEASE_ID"
+
+          # Keep the exact 20,000 selected ids.  Refresh only mutable dictionary
+          # fields owned by shard 0, then shard 1, so no live improvement is lost.
+          ssh "${ssh_opts[@]}" "opc@${hosts[0]}" \
+            "python3 '$preparation/tools/fast20k_pipeline.py' refresh-owner \
+              --canonical /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+              --template '$source_candidate' \
+              --output '$remote_tmp/candidate-owner0.sqlite' \
+              --shard-index 0 --shard-count 2 --skip-canonical-quick-check \
+              > '$remote_tmp/refresh-owner-0.json'"
+          scp "${ssh_opts[@]}" \
+            "opc@${hosts[0]}:$remote_tmp/candidate-owner0.sqlite" \
+            deployment-receipts/candidate-owner0.sqlite
+          scp "${ssh_opts[@]}" deployment-receipts/candidate-owner0.sqlite \
+            "opc@${hosts[1]}:$remote_tmp/candidate-owner0.sqlite"
+
+          ssh "${ssh_opts[@]}" "opc@${hosts[1]}" \
+            "python3 '$preparation/tools/fast20k_pipeline.py' refresh-owner \
+              --canonical /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+              --template '$remote_tmp/candidate-owner0.sqlite' \
+              --output '$remote_tmp/candidate-final.sqlite' \
+              --shard-index 1 --shard-count 2 --skip-canonical-quick-check \
+              > '$remote_tmp/refresh-owner-1.json'"
+          scp "${ssh_opts[@]}" \
+            "opc@${hosts[1]}:$remote_tmp/candidate-final.sqlite" \
+            deployment-receipts/candidate-final.sqlite
+          scp "${ssh_opts[@]}" deployment-receipts/candidate-final.sqlite \
+            "opc@${hosts[0]}:$remote_tmp/candidate-final.sqlite"
+          candidate_sha=$(sha256sum deployment-receipts/candidate-final.sqlite \
+            | awk '{print $1}')
+          printf 'CANDIDATE_SHA=%s\n' "$candidate_sha" >> "$GITHUB_ENV"
+          printf 'source_candidate_sha256=%s\nrefreshed_candidate_sha256=%s\n' \
+            "$SOURCE_CANDIDATE_SHA" "$candidate_sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preflight, validate and seal the refreshed candidate on both servers
+        shell: bash
+        run: |
+          set -euo pipefail
+          hosts=(140.245.114.238 134.185.82.7)
+          seal_one() {
+            local shard=$1
+            local host=${hosts[$shard]}
+            local remote_tmp="/tmp/lexora-reprepare-${RELEASE_ID}-${GITHUB_RUN_ID}"
+            local -a ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=30)
+            ssh "${ssh_opts[@]}" "opc@$host" \
+              "bash -se -- '$remote_tmp' '$RELEASE_ID' '$CANDIDATE_SHA' '$CANONICAL_SHA' '$shard'" \
+              > "deployment-receipts/sealed-$shard.json" <<'REMOTE'
+          set -euo pipefail
+          remote_tmp=$1
+          release_id=$2
+          candidate_sha=$3
+          canonical_sha=$4
+          shard=$5
+          root=/opt/lexora
+          candidate="$remote_tmp/candidate-final.sqlite"
+          preparation="$root/deployments/repair/preparations/$release_id"
+          transaction="$remote_tmp/deployment_transaction.py"
+
           candidate_digest=$(PYTHONPATH="$preparation/tools" python3 -c \
             'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("SELECT candidate_digest FROM fast20k_metadata WHERE id=1").fetchone()[0])' \
-            "$source_candidate")
+            "$candidate")
           LEXORA_CANDIDATE_DIGEST="$candidate_digest" \
             python3 "$preparation/deploy/preflight_repair_queue.py" \
               --dataset "$root/build/lexora-open-oxford-scope.sqlite" \
-              --repair-queue "$source_candidate" \
-              --shard-index "$shard" --shard-count 2 \
+              --repair-queue "$candidate" --shard-index "$shard" --shard-count 2 \
               --tools "$preparation/tools" >/dev/null
-
           set +e
           python3 "$preparation/tools/fast20k_pipeline.py" validate \
             --canonical "$root/build/lexora-open-oxford-scope.sqlite" \
-            --candidate "$source_candidate" --expected-rows 20000 \
+            --candidate "$candidate" --expected-rows 20000 \
             --canonical-shard-index "$shard" --canonical-shard-count 2 \
-            --skip-canonical-quick-check > "$remote_tmp/candidate-report.json"
+            --skip-canonical-quick-check > "$remote_tmp/candidate-report-$shard.json"
           validate_status=$?
           set -e
-          python3 - "$remote_tmp/candidate-report.json" "$validate_status" <<'PY'
+          python3 - "$remote_tmp/candidate-report-$shard.json" "$validate_status" <<'PY'
           import json, sys
           report = json.load(open(sys.argv[1], encoding="utf-8"))
           assert report["structuralReady"] is True, report
@@ -178,9 +259,8 @@ jobs:
           assert report["candidateQuickCheck"] == "ok", report
           assert int(sys.argv[2]) in (0, 2)
           PY
-
           python3 "$transaction" --root "$root" --track repair \
-            --release-id "$release_id" seal --candidate "$source_candidate" \
+            --release-id "$release_id" seal --candidate "$candidate" \
             --candidate-sha256 "$candidate_sha" \
             --canonical-manifest "$remote_tmp/canonical.json" >/dev/null
           python3 "$transaction" --root "$root" --track repair \
@@ -189,10 +269,9 @@ jobs:
             --canonical-identity-sha256 "$canonical_sha"
           REMOTE
           }
-
           pids=()
           for shard in 0 1; do
-            reprepare_one "$shard" &
+            seal_one "$shard" &
             pids+=("$!")
           done
           status=0
