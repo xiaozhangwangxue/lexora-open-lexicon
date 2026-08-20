@@ -46,6 +46,41 @@ jobs:
             -p MainPID -p ActiveState -p SubState -p Result
           systemctl list-timers \
             lexora-top20k-repair@'${{ matrix.shard }}'.timer --no-pager || true
+          echo "database_diagnostics_begin=$(date -u +%FT%TZ)"
+          database=/opt/lexora/build/lexora-open-oxford-scope.sqlite
+          stat --printf='database_bytes=%s database_mtime=%y\n' "$database"
+          for sidecar in "$database-wal" "$database-shm"; do
+            if [ -e "$sidecar" ]; then
+              stat --printf='sidecar=%n bytes=%s mtime=%y\n' "$sidecar"
+            fi
+          done
+          df -B1 --output=size,used,avail,pcent,target /opt/lexora/build
+          du -s -B1 /opt/lexora/build
+          find /tmp -maxdepth 1 -type d -name 'lexora-safe-*' \
+            -printf 'temporary_snapshot_dir=%p\n' 2>/dev/null || true
+          python3 - "$database" <<'PY'
+          import json
+          import sqlite3
+          import sys
+
+          path = sys.argv[1]
+          database = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+          try:
+              result = {
+                  "pageSize": database.execute("PRAGMA page_size").fetchone()[0],
+                  "pageCount": database.execute("PRAGMA page_count").fetchone()[0],
+                  "freePages": database.execute("PRAGMA freelist_count").fetchone()[0],
+                  "journalMode": database.execute("PRAGMA journal_mode").fetchone()[0],
+              }
+              count, minimum, maximum = database.execute(
+                  "SELECT count(*), min(id), max(id) FROM entries"
+              ).fetchone()
+              result.update({"rows": count, "minId": minimum, "maxId": maximum})
+              print("database_sqlite=" + json.dumps(result, sort_keys=True))
+          finally:
+              database.close()
+          PY
+          echo "database_diagnostics_end=$(date -u +%FT%TZ)"
           echo "quality_report_begin=$(date -u +%FT%TZ)"
           timeout 300s python3 /opt/lexora/tools/top20k_quality.py \
             --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
