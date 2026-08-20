@@ -39,20 +39,21 @@ jobs:
             -o ServerAliveCountMax=8 "opc@${{ matrix.host }}" \
             'bash -se' <<'REMOTE'
           set -euo pipefail
-          echo "repair_state=$(systemctl is-active lexora-top20k-repair@'${{ matrix.shard }}'.service || true)"
-          echo "collector_state=$(systemctl is-active lexora-enrich-micro@'${{ matrix.shard }}'.service || true)"
-          echo "timer_state=$(systemctl is-enabled lexora-top20k-repair@'${{ matrix.shard }}'.timer || true)"
-          systemctl show lexora-top20k-repair@'${{ matrix.shard }}'.service \
+          echo "repair_state=$(sudo systemctl is-active lexora-top20k-repair@'${{ matrix.shard }}'.service || true)"
+          echo "collector_state=$(sudo systemctl is-active lexora-enrich-micro@'${{ matrix.shard }}'.service || true)"
+          echo "timer_state=$(sudo systemctl is-enabled lexora-top20k-repair@'${{ matrix.shard }}'.timer || true)"
+          sudo systemctl show lexora-top20k-repair@'${{ matrix.shard }}'.service \
             -p MainPID -p ActiveState -p SubState -p Result
-          systemctl list-timers \
+          sudo systemctl list-timers \
             lexora-top20k-repair@'${{ matrix.shard }}'.timer --no-pager || true
           echo "quality_report_begin=$(date -u +%FT%TZ)"
           timeout 300s python3 /opt/lexora/tools/top20k_quality.py \
             --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+            --candidate /opt/lexora/deployments/repair/current/build/lexora-open-oxford-safe-20k.sqlite \
             --shard-index '${{ matrix.shard }}' --shard-count 2 \
             --unresolved-limit 200 --json || \
             echo "quality_report=busy_or_timed_out"
           echo "quality_report_end=$(date -u +%FT%TZ)"
-          timeout 10s journalctl -u lexora-top20k-repair@'${{ matrix.shard }}'.service \
+          timeout 10s sudo journalctl -u lexora-top20k-repair@'${{ matrix.shard }}'.service \
             -n 12 --no-pager || echo "journal=busy_or_timed_out"
           REMOTE
