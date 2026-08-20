@@ -1160,6 +1160,33 @@ class Fast20kPipelineTest(unittest.TestCase):
                 )
             self.assertFalse(refreshed.exists())
 
+    def test_owner_validation_can_reuse_prior_corpus_integrity_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sqlite"
+            candidate = root / "candidate.sqlite"
+            database = create_source(source)
+            add_entry(database, "alpha", 1)
+            add_entry(database, "bravo", 2)
+            database.commit()
+            database.close()
+            build_candidate(source, candidate, limit=2, phrase_target=0)
+
+            report = candidate_quality_report(
+                candidate,
+                source,
+                expected_rows=2,
+                canonical_shard_index=0,
+                canonical_shard_count=2,
+                verify_canonical_integrity=False,
+            )
+
+            self.assertTrue(report["ready"])
+            self.assertEqual(
+                report["canonicalQuickCheck"],
+                "verified-by-corpus-identity-step",
+            )
+
     def test_repair_delta_union_is_exact_and_applies_to_new_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

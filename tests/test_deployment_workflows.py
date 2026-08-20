@@ -45,6 +45,7 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertIn("structuralReady", workflow)
         self.assertIn('{"words": 16_000, "phrases": 4_000}', workflow)
         self.assertIn("--phrase-target 4000", workflow)
+        self.assertGreaterEqual(workflow.count("--skip-canonical-quick-check"), 3)
         self.assertNotIn("systemctl start", workflow)
         self.assertNotIn("systemctl enable", workflow)
 
