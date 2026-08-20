@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -223,6 +224,17 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertIn("ExecMainStartTimestampMonotonic", control)
         self.assertIn('consecutive" -ge 3', control)
         self.assertIn("seq 1 180", control)
+        # The coordinator runs as the unprivileged deployment user.  Every
+        # system service query must use the root systemd bus through the same
+        # wrapper as mutations; plain `systemctl` otherwise targets an
+        # unavailable user bus and falsely reports a healthy service as down.
+        direct_systemctl = [
+            line
+            for line in control.splitlines()
+            if re.search(r"(?<![A-Za-z0-9_])systemctl\s", line)
+            and "sudo systemctl" not in line
+        ]
+        self.assertEqual(direct_systemctl, [])
 
     def test_deployment_shell_helpers_have_valid_syntax(self) -> None:
         for path in (

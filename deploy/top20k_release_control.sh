@@ -129,14 +129,14 @@ marker_valid() {
 service_ready_once() {
   local state substate main_pid exec_started result exec_code exec_status
   marker_valid || return 1
-  state=$(systemctl is-active "$service" || true)
-  substate=$(systemctl show "$service" -p SubState --value || true)
-  main_pid=$(systemctl show "$service" -p MainPID --value || true)
-  exec_started=$(systemctl show "$service" \
+  state=$(run_systemctl is-active "$service" || true)
+  substate=$(run_systemctl show "$service" -p SubState --value || true)
+  main_pid=$(run_systemctl show "$service" -p MainPID --value || true)
+  exec_started=$(run_systemctl show "$service" \
     -p ExecMainStartTimestampMonotonic --value || true)
-  result=$(systemctl show "$service" -p Result --value || true)
-  exec_code=$(systemctl show "$service" -p ExecMainCode --value || true)
-  exec_status=$(systemctl show "$service" -p ExecMainStatus --value || true)
+  result=$(run_systemctl show "$service" -p Result --value || true)
+  exec_code=$(run_systemctl show "$service" -p ExecMainCode --value || true)
+  exec_status=$(run_systemctl show "$service" -p ExecMainStatus --value || true)
   [[ "$main_pid" =~ ^[0-9]+$ && "$exec_started" =~ ^[0-9]+$ \
     && "$exec_status" =~ ^-?[0-9]+$ ]] || return 1
   # The runtime marker PID must match the live MainPID.  Type=oneshot may also
@@ -154,7 +154,7 @@ confirm_service_ready() {
   local attempts=${1:-3} consecutive=0
   for _ in $(seq 1 "$attempts"); do
     if service_ready_once; then
-      if [[ "$(systemctl is-active "$service" || true)" == inactive ]]; then
+      if [[ "$(run_systemctl is-active "$service" || true)" == inactive ]]; then
         return 0
       fi
       consecutive=$((consecutive + 1))
@@ -353,11 +353,11 @@ if [[ -e "$backup" ]]; then
   exit 1
 fi
 install -d -m 0750 "$backup"
-service_active_before=$(systemctl is-active "$service" || true)
-timer_active_before=$(systemctl is-active "$timer" || true)
-timer_enabled_before=$(systemctl is-enabled "$timer" || true)
-micro_active_before=$(systemctl is-active "$micro_collector" || true)
-full_active_before=$(systemctl is-active "$full_collector" || true)
+service_active_before=$(run_systemctl is-active "$service" || true)
+timer_active_before=$(run_systemctl is-active "$timer" || true)
+timer_enabled_before=$(run_systemctl is-enabled "$timer" || true)
+micro_active_before=$(run_systemctl is-active "$micro_collector" || true)
+full_active_before=$(run_systemctl is-active "$full_collector" || true)
 printf 'service_active_before=%q\ntimer_active_before=%q\ntimer_enabled_before=%q\nmicro_active_before=%q\nfull_active_before=%q\n' \
   "$service_active_before" "$timer_active_before" "$timer_enabled_before" \
   "$micro_active_before" "$full_active_before" \
@@ -398,7 +398,7 @@ set +e
   # to finish instead of treating a healthy low-power OCI host as failed.
   for attempt in $(seq 1 180); do
     if service_ready_once; then
-      if [[ "$(systemctl is-active "$service" || true)" == inactive ]]; then
+      if [[ "$(run_systemctl is-active "$service" || true)" == inactive ]]; then
         started=1
         break
       fi
@@ -410,7 +410,7 @@ set +e
     else
       consecutive=0
     fi
-    state=$(systemctl is-active "$service" || true)
+    state=$(run_systemctl is-active "$service" || true)
     if [[ "$state" == failed || "$state" == inactive ]]; then
       break
     fi
