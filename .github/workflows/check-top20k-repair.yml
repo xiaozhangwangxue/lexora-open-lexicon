@@ -59,9 +59,11 @@ jobs:
           find /tmp -maxdepth 1 -type d -name 'lexora-safe-*' \
             -printf 'temporary_snapshot_dir=%p\n' 2>/dev/null || true
           python3 - "$database" <<'PY'
+          import hashlib
           import json
           import sqlite3
           import sys
+          import time
 
           path = sys.argv[1]
           database = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
@@ -77,6 +79,40 @@ jobs:
               ).fetchone()
               result.update({"rows": count, "minId": minimum, "maxId": maximum})
               print("database_sqlite=" + json.dumps(result, sort_keys=True))
+              started = time.monotonic()
+              digest = hashlib.sha256(b"lexora-canonical-identity-v1\\0")
+              encoded_bytes = 0
+              sampled = 0
+              rows = database.execute(
+                  "SELECT id,word,normalized_word,frequency_rank,source_json,scope_json "
+                  "FROM entries ORDER BY id LIMIT 20000"
+              )
+              for row in rows:
+                  sampled += 1
+                  for value in row:
+                      encoded = json.dumps(
+                          value,
+                          ensure_ascii=False,
+                          allow_nan=False,
+                          separators=(",", ":"),
+                      ).encode("utf-8")
+                      encoded_bytes += len(encoded)
+                      digest.update(len(encoded).to_bytes(8, "big"))
+                      digest.update(encoded)
+              elapsed = time.monotonic() - started
+              print(
+                  "identity_sample="
+                  + json.dumps(
+                      {
+                          "rows": sampled,
+                          "encodedBytes": encoded_bytes,
+                          "seconds": round(elapsed, 3),
+                          "rowsPerSecond": round(sampled / elapsed, 3),
+                          "sha256": digest.hexdigest(),
+                      },
+                      sort_keys=True,
+                  )
+              )
           finally:
               database.close()
           PY
