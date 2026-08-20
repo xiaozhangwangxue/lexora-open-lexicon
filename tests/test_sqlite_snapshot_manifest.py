@@ -91,7 +91,7 @@ class SqliteSnapshotManifestTest(unittest.TestCase):
             self.assertTrue(result["compatible"])
             self.assertEqual(result["replicas"], 2)
 
-    def test_compare_rejects_candidate_source_provenance_drift(self) -> None:
+    def test_compare_allows_owner_enrichment_provenance_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifests: list[Path] = []
@@ -100,6 +100,29 @@ class SqliteSnapshotManifestTest(unittest.TestCase):
                 snapshot = root / f"snapshot-{index}.sqlite"
                 manifest = root / f"snapshot-{index}.json"
                 make_canonical(source, source=source_value)
+                snapshot_manifest.backup_with_manifest(source, snapshot, manifest)
+                manifests.append(manifest)
+
+            result = snapshot_manifest.compare_manifests(manifests)
+            self.assertTrue(result["compatible"])
+
+    def test_compare_rejects_frequency_rank_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifests: list[Path] = []
+            for index, rank in enumerate((1, 3)):
+                source = root / f"source-{index}.sqlite"
+                snapshot = root / f"snapshot-{index}.sqlite"
+                manifest = root / f"snapshot-{index}.json"
+                make_canonical(source)
+                database = sqlite3.connect(source)
+                try:
+                    database.execute(
+                        "UPDATE entries SET frequency_rank=? WHERE id=1", (rank,)
+                    )
+                    database.commit()
+                finally:
+                    database.close()
                 snapshot_manifest.backup_with_manifest(source, snapshot, manifest)
                 manifests.append(manifest)
 
@@ -176,7 +199,13 @@ class SqliteSnapshotManifestTest(unittest.TestCase):
             second = root / "second.sqlite"
             output = root / "owned.sqlite"
             make_canonical(first)
-            make_canonical(second, source='["kaikki"]')
+            make_canonical(second)
+            database = sqlite3.connect(second)
+            try:
+                database.execute("UPDATE entries SET frequency_rank=3 WHERE id=1")
+                database.commit()
+            finally:
+                database.close()
 
             with self.assertRaisesRegex(RuntimeError, "canonical identity mismatch"):
                 snapshot_manifest.merge_owned_snapshots(

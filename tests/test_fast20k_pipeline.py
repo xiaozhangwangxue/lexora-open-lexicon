@@ -24,6 +24,7 @@ from fast20k_pipeline import (  # noqa: E402
     candidate_quality_report,
     lexical_rejection_reason,
     refresh_candidate,
+    refresh_candidate_owner,
     term_key,
 )
 from fast20k_repair_delta import (  # noqa: E402
@@ -140,7 +141,8 @@ def mark_rows_as_candidate_repaired(
     try:
         for entry_id in entry_ids:
             row = database.execute(
-                "SELECT " + ",".join(enrichment.REPAIR_PAYLOAD_COLUMNS)
+                "SELECT "
+                + ",".join(enrichment.REPAIR_PAYLOAD_COLUMNS)
                 + ",enrichment_json FROM entries WHERE id=?",
                 (entry_id,),
             ).fetchone()
@@ -149,9 +151,7 @@ def mark_rows_as_candidate_repaired(
                 {
                     "repairCandidateDigest": candidate_digest,
                     "repairShardOwner": entry_id % shard_count,
-                    "repairPayloadDigest": enrichment.repair_payload_digest(
-                        dict(row)
-                    ),
+                    "repairPayloadDigest": enrichment.repair_payload_digest(dict(row)),
                 }
             )
             database.execute(
@@ -470,9 +470,7 @@ class Fast20kPipelineTest(unittest.TestCase):
             database.close()
             build_candidate(source, candidate, limit=1, phrase_target=0)
             database = sqlite3.connect(candidate)
-            database.execute(
-                "UPDATE repair_queue SET shard_owner=1-shard_owner"
-            )
+            database.execute("UPDATE repair_queue SET shard_owner=1-shard_owner")
             database.commit()
             database.close()
             report = candidate_quality_report(candidate, source, expected_rows=1)
@@ -652,8 +650,12 @@ class Fast20kPipelineTest(unittest.TestCase):
             self.assertEqual(sum(report["total"] for report in reports), 2)
             self.assertEqual(sum(report["incomplete"] for report in reports), 1)
             self.assertEqual(len({report["candidateDigest"] for report in reports}), 1)
-            self.assertTrue(all(report["maxFrequencyRank"] is None for report in reports))
-            self.assertEqual(reports[backfill_id % 2]["unresolved"][0]["term"], "backfill")
+            self.assertTrue(
+                all(report["maxFrequencyRank"] is None for report in reports)
+            )
+            self.assertEqual(
+                reports[backfill_id % 2]["unresolved"][0]["term"], "backfill"
+            )
             snapshot = write_quality_snapshot(
                 source,
                 root / "quality.json",
@@ -966,9 +968,7 @@ class Fast20kPipelineTest(unittest.TestCase):
                     ],
                 ),
             ):
-                with self.assertRaisesRegex(
-                    ValueError, "canonical_content_mismatch"
-                ):
+                with self.assertRaisesRegex(ValueError, "canonical_content_mismatch"):
                     package_main()
             self.assertFalse(release.exists())
 
@@ -1063,6 +1063,103 @@ class Fast20kPipelineTest(unittest.TestCase):
                 refresh_candidate(source, candidate, refreshed)
             self.assertFalse(refreshed.exists())
 
+    def test_owner_refresh_updates_only_fixed_owner_and_rebuilds_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.sqlite"
+            second = root / "second.sqlite"
+            candidate = root / "candidate.sqlite"
+            refreshed = root / "refreshed.sqlite"
+            database = create_source(first)
+            alpha = add_entry(
+                database,
+                "alpha",
+                1,
+                pos="",
+                definition="",
+                translation="",
+                us="",
+            )
+            bravo = add_entry(database, "bravo", 2, definition="Host zero value.")
+            database.commit()
+            database.close()
+            database = create_source(second)
+            self.assertEqual(add_entry(database, "alpha", 1), alpha)
+            self.assertEqual(
+                add_entry(database, "bravo", 2, definition="Non-owner drift."),
+                bravo,
+            )
+            database.execute(
+                "UPDATE entries SET source_json='[\"kaikki\"]',"
+                "definition='First letter.',definition_zh='第一个字母。',"
+                "pos='noun',us_phonetic='ælfə' WHERE id=?",
+                (alpha,),
+            )
+            database.commit()
+            database.close()
+
+            build_candidate(
+                first,
+                candidate,
+                limit=2,
+                phrase_target=0,
+                shard_count=2,
+            )
+            report = refresh_candidate_owner(
+                second,
+                candidate,
+                refreshed,
+                shard_index=1,
+                shard_count=2,
+            )
+
+            database = sqlite3.connect(refreshed)
+            try:
+                values = dict(database.execute("SELECT id,definition FROM entries"))
+                queue_rows = database.execute(
+                    "SELECT count(*) FROM repair_queue"
+                ).fetchone()[0]
+                words, phrases = database.execute(
+                    "SELECT word_count,phrase_count FROM fast20k_metadata WHERE id=1"
+                ).fetchone()
+            finally:
+                database.close()
+            self.assertEqual(values[alpha], "First letter.")
+            self.assertEqual(values[bravo], "Host zero value.")
+            self.assertEqual(queue_rows, 0)
+            self.assertEqual((words, phrases), (2, 0))
+            self.assertEqual(report["ownerRowsRefreshed"], 1)
+            self.assertTrue(report["quality"]["ready"])
+
+    def test_owner_refresh_rejects_fixed_term_identity_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sqlite"
+            owner = root / "owner.sqlite"
+            candidate = root / "candidate.sqlite"
+            refreshed = root / "refreshed.sqlite"
+            database = create_source(source)
+            entry_id = add_entry(database, "alpha", 1)
+            database.commit()
+            database.close()
+            database = create_source(owner)
+            self.assertEqual(add_entry(database, "changed", 1), entry_id)
+            database.commit()
+            database.close()
+            build_candidate(source, candidate, limit=1, phrase_target=0)
+
+            with self.assertRaisesRegex(
+                ValueError, "fixed owner selection identity changed"
+            ):
+                refresh_candidate_owner(
+                    owner,
+                    candidate,
+                    refreshed,
+                    shard_index=1,
+                    shard_count=2,
+                )
+            self.assertFalse(refreshed.exists())
+
     def test_repair_delta_union_is_exact_and_applies_to_new_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1150,7 +1247,9 @@ class Fast20kPipelineTest(unittest.TestCase):
                 merged_db.close()
             self.assertEqual(complete, 4)
 
-    def test_delta_apply_preserves_newer_central_fields_and_rejects_conflicts(self) -> None:
+    def test_delta_apply_preserves_newer_central_fields_and_rejects_conflicts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             baseline = root / "baseline.sqlite"
@@ -1271,16 +1370,10 @@ class Fast20kPipelineTest(unittest.TestCase):
             state_path = root / "state.sqlite"
             state = enrichment.init_state(state_path)
             try:
-                enrichment.bind_state_candidate(
-                    state, "candidate-a", shard_owner=0
-                )
-                enrichment.bind_state_candidate(
-                    state, "candidate-a", shard_owner=0
-                )
+                enrichment.bind_state_candidate(state, "candidate-a", shard_owner=0)
+                enrichment.bind_state_candidate(state, "candidate-a", shard_owner=0)
                 with self.assertRaisesRegex(ValueError, "candidate digest or shard"):
-                    enrichment.bind_state_candidate(
-                        state, "candidate-b", shard_owner=0
-                    )
+                    enrichment.bind_state_candidate(state, "candidate-b", shard_owner=0)
             finally:
                 state.close()
 
@@ -1294,9 +1387,7 @@ class Fast20kPipelineTest(unittest.TestCase):
                 )
                 state.commit()
                 with self.assertRaisesRegex(ValueError, "fresh --state"):
-                    enrichment.bind_state_candidate(
-                        state, "candidate-a", shard_owner=0
-                    )
+                    enrichment.bind_state_candidate(state, "candidate-a", shard_owner=0)
             finally:
                 state.close()
 

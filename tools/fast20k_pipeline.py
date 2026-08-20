@@ -12,6 +12,7 @@ interleaves the two streams deterministically.  Canonical rank is retained as
 an auditable within-stream tie-breaker, never as proof that a phrase is more
 frequent than a word.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -319,10 +320,7 @@ def lexical_rejection_reason(
         if (
             "." in token
             and dot_evidence
-            and (
-                INITIALISM.fullmatch(token)
-                or SHORT_ABBREVIATION.fullmatch(token)
-            )
+            and (INITIALISM.fullmatch(token) or SHORT_ABBREVIATION.fullmatch(token))
         ):
             continue
         return "unsupported_punctuation"
@@ -930,9 +928,7 @@ def refresh_candidate(
     output: sqlite3.Connection | None = None
     published = False
     try:
-        template_db = sqlite3.connect(
-            f"file:{template.resolve()}?mode=ro", uri=True
-        )
+        template_db = sqlite3.connect(f"file:{template.resolve()}?mode=ro", uri=True)
         template_db.row_factory = sqlite3.Row
         template_db.execute("PRAGMA query_only=ON")
         template_db.execute("BEGIN")
@@ -954,8 +950,7 @@ def refresh_candidate(
         template_queue_digest = repair_queue_digest(template_db)
         if (
             template_selection_digest != str(metadata["selection_digest"])
-            or template_baseline_digest
-            != str(metadata["baseline_content_digest"])
+            or template_baseline_digest != str(metadata["baseline_content_digest"])
             or template_queue_digest != str(metadata["repair_queue_digest"])
             or candidate_contract_digest(
                 template_selection_digest,
@@ -1118,6 +1113,256 @@ def refresh_candidate(
             _cleanup_sqlite(partial)
 
 
+def refresh_candidate_owner(
+    canonical: Path,
+    template: Path,
+    destination: Path,
+    *,
+    shard_index: int,
+    shard_count: int,
+    replace: bool = False,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> dict[str, Any]:
+    """Refresh only one fixed owner's rows in an existing candidate.
+
+    The selected IDs, selected ranks and word/phrase classification stay fixed.
+    Mutable dictionary content is replaced only for ``id % shard_count`` rows
+    owned by this canonical replica.  The candidate is rebuilt in a sibling
+    temporary file and published atomically after its complete internal and
+    owner-baseline checks pass.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ValueError("shard_index must be within [0, shard_count)")
+    if destination.exists() and not replace:
+        raise FileExistsError(f"refusing to overwrite {destination}")
+    if destination.resolve() in {canonical.resolve(), template.resolve()}:
+        raise ValueError("owner refresh output must differ from its inputs")
+
+    partial = _atomic_temp_path(destination)
+    source: sqlite3.Connection | None = None
+    template_db: sqlite3.Connection | None = None
+    output: sqlite3.Connection | None = None
+    published = False
+    try:
+        template_db = sqlite3.connect(f"file:{template.resolve()}?mode=ro", uri=True)
+        template_db.row_factory = sqlite3.Row
+        template_db.execute("PRAGMA query_only=ON")
+        template_db.execute("BEGIN")
+        if str(template_db.execute("PRAGMA quick_check").fetchone()[0]) != "ok":
+            raise ValueError("template candidate failed SQLite quick_check")
+        metadata_row = template_db.execute(
+            "SELECT * FROM fast20k_metadata WHERE id=1"
+        ).fetchone()
+        if metadata_row is None:
+            raise ValueError("template candidate metadata is missing")
+        metadata = dict(metadata_row)
+        if (
+            int(metadata["selection_version"]) != SELECTION_VERSION
+            or str(metadata["policy_name"]) != POLICY_NAME
+            or int(metadata["shard_count"]) != shard_count
+        ):
+            raise ValueError("template candidate contract version mismatch")
+        template_selection = selection_digest(template_db)
+        template_baseline = baseline_content_digest(template_db)
+        template_queue = repair_queue_digest(template_db)
+        if (
+            template_selection != str(metadata["selection_digest"])
+            or template_baseline != str(metadata["baseline_content_digest"])
+            or template_queue != str(metadata["repair_queue_digest"])
+            or candidate_contract_digest(
+                template_selection,
+                template_baseline,
+                template_queue,
+                shard_count=shard_count,
+            )
+            != str(metadata["candidate_digest"])
+        ):
+            raise ValueError("template candidate digest mismatch")
+
+        source = sqlite3.connect(f"file:{canonical.resolve()}?mode=ro", uri=True)
+        source.row_factory = sqlite3.Row
+        source.execute("PRAGMA query_only=ON")
+        source.execute("BEGIN")
+        available = {
+            str(row[1]) for row in source.execute("PRAGMA table_info(entries)")
+        }
+        projection_sql = _entry_projection(available)
+
+        output = sqlite3.connect(partial)
+        output.row_factory = sqlite3.Row
+        template_db.backup(output)
+        output.execute("PRAGMA temp_store=FILE")
+        owner_rows = output.execute(
+            "SELECT count(*) FROM fast20k_provenance WHERE (canonical_id % ?) = ?",
+            (shard_count, shard_index),
+        ).fetchone()[0]
+        cursor = output.execute(
+            "SELECT canonical_id,selected_rank,canonical_frequency_rank,"
+            "normalized_word,term_key,kind,ranking_evidence,phrase_evidence "
+            "FROM fast20k_provenance WHERE (canonical_id % ?) = ? "
+            "ORDER BY canonical_id",
+            (shard_count, shard_index),
+        )
+        refreshed = 0
+        update_columns = ",".join(f"{column}=?" for column in ENTRY_COLUMNS)
+        while True:
+            provenance_rows = cursor.fetchmany(batch_size)
+            if not provenance_rows:
+                break
+            ids = [int(row[0]) for row in provenance_rows]
+            marks = ",".join("?" for _ in ids)
+            source_rows = source.execute(
+                f"SELECT id,{projection_sql} FROM entries WHERE id IN ({marks})",
+                ids,
+            ).fetchall()
+            by_id = {int(row["id"]): dict(row) for row in source_rows}
+            for provenance in provenance_rows:
+                entry_id = int(provenance["canonical_id"])
+                row = by_id.get(entry_id)
+                if row is None:
+                    raise ValueError(f"owner canonical row is missing: id={entry_id}")
+                key = term_key(row["normalized_word"])
+                if (
+                    int(row["frequency_rank"])
+                    != int(provenance["canonical_frequency_rank"])
+                    or key != term_key(provenance["normalized_word"])
+                    or key != str(provenance["term_key"])
+                    or key != term_key(row["word"])
+                ):
+                    raise ValueError(
+                        f"fixed owner selection identity changed: id={entry_id}"
+                    )
+                sources = _json_list(row["source_json"])
+                scope = _json_dict(row["scope_json"])
+                if sources is None or not sources or scope is None:
+                    raise ValueError(
+                        f"owner source provenance is invalid: id={entry_id}"
+                    )
+                lexical = lexical_rejection_reason(key, row["pos"], sources, scope)
+                if lexical:
+                    raise ValueError(
+                        f"fixed owner selection is no longer lexical: "
+                        f"id={entry_id} reason={lexical}"
+                    )
+                kind = "phrase" if is_phrase(key, row["pos"]) else "word"
+                if kind != str(provenance["kind"]):
+                    raise ValueError(
+                        f"fixed owner selection kind changed: id={entry_id}"
+                    )
+                evidence = phrase_evidence(key, row["pos"], sources, scope)
+                if kind == "phrase" and not evidence:
+                    raise ValueError(
+                        f"fixed owner phrase lost dictionary evidence: id={entry_id}"
+                    )
+                values = [row[column] for column in ENTRY_COLUMNS]
+                values[ENTRY_COLUMNS.index("frequency_rank")] = int(
+                    provenance["selected_rank"]
+                )
+                output.execute(
+                    f"UPDATE entries SET {update_columns} WHERE id=?",
+                    (*values, entry_id),
+                )
+                output.execute(
+                    "UPDATE fast20k_provenance SET normalized_word=?,"
+                    "phrase_evidence=?,canonical_content_sha256=?,"
+                    "canonical_identity_sha256=? WHERE canonical_id=?",
+                    (
+                        row["normalized_word"],
+                        evidence or "",
+                        canonical_content_digest(row),
+                        canonical_identity_digest(row),
+                        entry_id,
+                    ),
+                )
+                refreshed += 1
+        cursor.close()
+        if refreshed != int(owner_rows):
+            raise ValueError(
+                f"owner refresh count mismatch: expected={owner_rows} "
+                f"actual={refreshed}"
+            )
+
+        rebuild_fts(output)
+        output.execute("DELETE FROM repair_queue")
+        repair_rows = _populate_repair_queue(output, shard_count=shard_count)
+        selected_digest = selection_digest(output)
+        baseline_digest = baseline_content_digest(output)
+        queue_digest = repair_queue_digest(output)
+        contract_digest = candidate_contract_digest(
+            selected_digest,
+            baseline_digest,
+            queue_digest,
+            shard_count=shard_count,
+        )
+        canonical_stat = canonical.stat()
+        output.execute(
+            "UPDATE fast20k_metadata SET canonical_path=?,canonical_bytes=?,"
+            "canonical_mtime_ns=?,selection_digest=?,baseline_content_digest=?,"
+            "repair_queue_digest=?,candidate_digest=?,created_at=? WHERE id=1",
+            (
+                str(canonical.resolve()),
+                canonical_stat.st_size,
+                canonical_stat.st_mtime_ns,
+                selected_digest,
+                baseline_digest,
+                queue_digest,
+                contract_digest,
+                dt.datetime.now(dt.timezone.utc).isoformat(),
+            ),
+        )
+        output.commit()
+        output.execute("PRAGMA journal_mode=DELETE")
+        output.execute("PRAGMA optimize")
+        output.commit()
+        output.close()
+        output = None
+        source.rollback()
+        source.close()
+        source = None
+        template_db.rollback()
+        template_db.close()
+        template_db = None
+
+        report = candidate_quality_report(
+            partial,
+            canonical,
+            expected_rows=int(metadata["expected_rows"]),
+            canonical_shard_index=shard_index,
+            canonical_shard_count=shard_count,
+        )
+        if not report["structuralReady"]:
+            raise ValueError(
+                "owner-refreshed candidate structural gate failed: "
+                + json.dumps(report, ensure_ascii=False, sort_keys=True)
+            )
+        _fsync_file_and_parent(partial)
+        _publish_candidate(partial, destination, replace=replace)
+        _fsync_file_and_parent(destination)
+        published = True
+        report["candidate"] = str(destination)
+        return {
+            "candidate": str(destination),
+            "owner": {"shardIndex": shard_index, "shardCount": shard_count},
+            "ownerRowsRefreshed": refreshed,
+            "selectionDigest": selected_digest,
+            "baselineContentDigest": baseline_digest,
+            "repairQueueDigest": queue_digest,
+            "candidateDigest": contract_digest,
+            "repairQueueRows": repair_rows,
+            "quality": report,
+        }
+    finally:
+        for database in (output, source, template_db):
+            if database is not None:
+                if database.in_transaction:
+                    database.rollback()
+                database.close()
+        if not published:
+            _cleanup_sqlite(partial)
+
+
 def output_count_beyond_rank(candidate: Path, original_limit: int) -> int:
     database = sqlite3.connect(f"file:{candidate.resolve()}?mode=ro", uri=True)
     try:
@@ -1202,8 +1447,7 @@ def _canonical_rows(
 ) -> dict[int, dict[str, Any]]:
     marks = ",".join("?" for _ in ids)
     rows = database.execute(
-        f"SELECT id,{_entry_projection(available)} "
-        f"FROM entries WHERE id IN ({marks})",
+        f"SELECT id,{_entry_projection(available)} FROM entries WHERE id IN ({marks})",
         ids,
     ).fetchall()
     return {int(row["id"]): dict(row) for row in rows}
@@ -1250,7 +1494,19 @@ def candidate_quality_report(
     *,
     expected_rows: int = DEFAULT_LIMIT,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    canonical_shard_index: int | None = None,
+    canonical_shard_count: int | None = None,
 ) -> dict[str, Any]:
+    if (canonical_shard_index is None) != (canonical_shard_count is None):
+        raise ValueError(
+            "canonical_shard_index and canonical_shard_count must be used together"
+        )
+    if canonical_shard_count is not None and (
+        canonical_shard_count < 1
+        or canonical_shard_index is None
+        or not 0 <= canonical_shard_index < canonical_shard_count
+    ):
+        raise ValueError("canonical shard selection is invalid")
     issues = _Issues()
     candidate_db: sqlite3.Connection | None = None
     canonical_db: sqlite3.Connection | None = None
@@ -1363,11 +1619,20 @@ def candidate_quality_report(
             rows = cursor.fetchmany(batch_size)
             if not rows:
                 break
-            ids = [int(row["id"]) for row in rows]
-            canonical_by_id = _canonical_rows(
-                canonical_db,
-                ids,
-                canonical_columns,
+            ids = [
+                int(row["id"])
+                for row in rows
+                if canonical_shard_count is None
+                or int(row["id"]) % canonical_shard_count == canonical_shard_index
+            ]
+            canonical_by_id = (
+                _canonical_rows(
+                    canonical_db,
+                    ids,
+                    canonical_columns,
+                )
+                if ids
+                else {}
             )
             for raw in rows:
                 row = dict(raw)
@@ -1437,6 +1702,12 @@ def candidate_quality_report(
                         entry_id % max(1, int(metadata.get("shard_count", 0))),
                     )
 
+                compare_canonical = (
+                    canonical_shard_count is None
+                    or entry_id % canonical_shard_count == canonical_shard_index
+                )
+                if not compare_canonical:
+                    continue
                 canonical_row = canonical_by_id.get(entry_id)
                 if canonical_row is None:
                     issues.add("canonical_missing", entry_id)
@@ -1473,10 +1744,7 @@ def candidate_quality_report(
                 f"actual={actual_kinds['word']}/{actual_kinds['phrase']}",
             )
 
-        if (
-            expected_rows == DEFAULT_LIMIT
-            and actual_kinds["word"] < MIN_FAST20K_WORDS
-        ):
+        if expected_rows == DEFAULT_LIMIT and actual_kinds["word"] < MIN_FAST20K_WORDS:
             issues.add(
                 "minimum_word_count",
                 f"required={MIN_FAST20K_WORDS} actual={actual_kinds['word']}",
@@ -1619,9 +1887,7 @@ def main() -> None:
     select.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     select.add_argument("--phrase-target", type=int, default=DEFAULT_PHRASE_TARGET)
     select.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    select.add_argument(
-        "--repair-shards", type=int, default=DEFAULT_REPAIR_SHARDS
-    )
+    select.add_argument("--repair-shards", type=int, default=DEFAULT_REPAIR_SHARDS)
     select.add_argument("--replace", action="store_true")
     refresh = commands.add_parser("refresh")
     refresh.add_argument("--canonical", type=Path, required=True)
@@ -1629,10 +1895,20 @@ def main() -> None:
     refresh.add_argument("--output", type=Path, required=True)
     refresh.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     refresh.add_argument("--replace", action="store_true")
+    refresh_owner = commands.add_parser("refresh-owner")
+    refresh_owner.add_argument("--canonical", type=Path, required=True)
+    refresh_owner.add_argument("--template", type=Path, required=True)
+    refresh_owner.add_argument("--output", type=Path, required=True)
+    refresh_owner.add_argument("--shard-index", type=int, required=True)
+    refresh_owner.add_argument("--shard-count", type=int, required=True)
+    refresh_owner.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    refresh_owner.add_argument("--replace", action="store_true")
     validate = commands.add_parser("validate")
     validate.add_argument("--canonical", type=Path, required=True)
     validate.add_argument("--candidate", type=Path, required=True)
     validate.add_argument("--expected-rows", type=int, default=DEFAULT_LIMIT)
+    validate.add_argument("--canonical-shard-index", type=int)
+    validate.add_argument("--canonical-shard-count", type=int)
     args = parser.parse_args()
     if args.command == "select":
         report = build_candidate(
@@ -1656,10 +1932,24 @@ def main() -> None:
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
+    if args.command == "refresh-owner":
+        report = refresh_candidate_owner(
+            args.canonical,
+            args.template,
+            args.output,
+            shard_index=args.shard_index,
+            shard_count=args.shard_count,
+            replace=args.replace,
+            batch_size=args.batch_size,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
     report = candidate_quality_report(
         args.candidate,
         args.canonical,
         expected_rows=args.expected_rows,
+        canonical_shard_index=args.canonical_shard_index,
+        canonical_shard_count=args.canonical_shard_count,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if not report["ready"]:
