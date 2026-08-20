@@ -30,7 +30,7 @@ concurrency:
 jobs:
   activate:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
     steps:
       - name: Validate immutable activation inputs
         shell: bash
@@ -66,12 +66,13 @@ jobs:
           set -euo pipefail
           mkdir -p activation-receipts
           hosts=(140.245.114.238 134.185.82.7)
-          for shard in 0 1; do
-            host=${hosts[$shard]}
-            release="/opt/lexora/deployments/repair/releases/$RELEASE_ID"
+          verify_one() {
+            local shard=$1
+            local host=${hosts[$shard]}
+            local release="/opt/lexora/deployments/repair/releases/$RELEASE_ID"
             ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
               -o ConnectTimeout=30 -o ServerAliveInterval=15 \
-              -o ServerAliveCountMax=8 "opc@$host" \
+              -o ServerAliveCountMax=120 "opc@$host" \
               "bash -se -- '$release' '$RELEASE_ID' '$CANDIDATE_SHA' '$CANONICAL_SHA'" \
               > "activation-receipts/preflight-$shard.json" <<'REMOTE'
           set -euo pipefail
@@ -89,7 +90,17 @@ jobs:
             verify-release --candidate-sha256 "$candidate_sha" \
             --canonical-identity-sha256 "$canonical_sha"
           REMOTE
+          }
+          pids=()
+          for shard in 0 1; do
+            verify_one "$shard" &
+            pids+=("$!")
           done
+          status=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || status=1
+          done
+          test "$status" = 0
           python3 - "$CANDIDATE_SHA" "$CANONICAL_SHA" \
             activation-receipts/preflight-0.json activation-receipts/preflight-1.json <<'PY'
           import json, sys
