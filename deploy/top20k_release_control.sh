@@ -115,14 +115,15 @@ PY
 }
 
 marker_valid() {
+  [[ -f "$preflight_marker" && -f "$runtime_marker" ]] || return 1
   python3 "$release/deploy/validate_preflight_marker.py" \
     --marker "$preflight_marker" --release-id "$release_id" \
     --candidate-digest "$candidate_digest" --shard-index "$shard" \
-    --shard-count 2 --kind preflight >/dev/null \
+    --shard-count 2 --kind preflight >/dev/null 2>&1 \
     && python3 "$release/deploy/validate_preflight_marker.py" \
       --marker "$runtime_marker" --release-id "$release_id" \
       --candidate-digest "$candidate_digest" --shard-index "$shard" \
-      --shard-count 2 --kind runtime >/dev/null
+      --shard-count 2 --kind runtime >/dev/null 2>&1
 }
 
 service_ready_once() {
