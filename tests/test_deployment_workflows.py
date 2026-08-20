@@ -154,6 +154,13 @@ class DeploymentWorkflowTest(unittest.TestCase):
         )
         self.assertIn("trap - ERR", workflow)
         self.assertNotIn('sudo install -o opc -g opc -m 0755 "/tmp/$file"', workflow)
+        direct_systemctl = [
+            line
+            for line in workflow.splitlines()
+            if re.search(r"(?<![A-Za-z0-9_])systemctl\s", line)
+            and "sudo systemctl" not in line
+        ]
+        self.assertEqual(direct_systemctl, [])
 
     def test_web_parity_deploys_progress_validator_with_server(self) -> None:
         workflow = (
