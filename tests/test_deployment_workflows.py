@@ -58,6 +58,27 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertIn('wait "$pid" || status=1', workflow)
         self.assertNotIn("canonical-shard-1.sqlite", workflow)
 
+    def test_repreparation_reuses_only_a_verified_sealed_candidate(self) -> None:
+        workflow = (
+            ROOT / ".github" / "workflows" / "reprepare-top20k-repair.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("REPREPARE_SAFE_TOP20K", workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertIn('verify-release \\', workflow)
+        self.assertIn('--release-id "$source_release_id"', workflow)
+        self.assertIn('--candidate-sha256 "$candidate_sha"', workflow)
+        self.assertIn('--canonical-identity-sha256 "$canonical_sha"', workflow)
+        self.assertIn("prepare-code", workflow)
+        self.assertIn("preflight_repair_queue.py", workflow)
+        self.assertIn('--shard-index "$shard" --shard-count 2', workflow)
+        self.assertIn('assert report["terms"] == {"words": 16_000, "phrases": 4_000}', workflow)
+        self.assertIn('seal --candidate "$source_candidate"', workflow)
+        self.assertIn('reprepare_one "$shard" &', workflow)
+        self.assertIn('wait "$pid" || status=1', workflow)
+        self.assertNotIn("systemctl start", workflow)
+        self.assertNotIn("systemctl enable", workflow)
+        self.assertNotIn("sqlite_snapshot_manifest.py\" backup", workflow)
+
     def test_activation_verifies_both_before_switch_and_has_rollback(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "activate-top20k-repair.yml"
