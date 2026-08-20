@@ -1,0 +1,74 @@
+name: Ensure active top-20k repair schedule
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha256:
+        description: SHA-256 of the already activated sealed candidate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ensure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: 140.245.114.238
+            shard: 0
+          - host: 134.185.82.7
+            shard: 1
+    steps:
+      - name: Prepare SSH credentials
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.LEXORA_OCI_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LEXORA_OCI_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lexora_oci
+          chmod 0600 ~/.ssh/lexora_oci
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Verify candidate and ensure daily schedule
+        shell: bash
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{64}$ ]]
+          ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 "opc@${{ matrix.host }}" \
+            "CANDIDATE_SHA='$CANDIDATE_SHA' SHARD='${{ matrix.shard }}' bash -se" <<'REMOTE'
+          set -euo pipefail
+          candidate=/opt/lexora/deployments/repair/current/build/lexora-open-oxford-safe-20k.sqlite
+          service="lexora-top20k-repair@${SHARD}.service"
+          timer="lexora-top20k-repair@${SHARD}.timer"
+          test -f "$candidate"
+          actual=$(sha256sum "$candidate" | awk '{print $1}')
+          test "$actual" = "$CANDIDATE_SHA"
+          sudo systemctl enable --now "$timer"
+          timer_active=$(sudo systemctl is-active "$timer")
+          timer_enabled=$(sudo systemctl is-enabled "$timer")
+          repair_active=$(sudo systemctl is-active "$service" || true)
+          test "$timer_active" = active
+          test "$timer_enabled" = enabled
+          case "$repair_active" in
+            active|activating) ;;
+            *)
+              sudo systemctl start --no-block "$service"
+              repair_active=$(sudo systemctl is-active "$service" || true)
+              case "$repair_active" in active|activating) ;; *) exit 1 ;; esac
+              ;;
+          esac
+          printf 'shard=%s candidate_sha256=%s repair=%s timer=%s/%s\n' \
+            "$SHARD" "$actual" "$repair_active" "$timer_active" "$timer_enabled"
+          sudo systemctl list-timers "$timer" --no-pager
+          REMOTE
