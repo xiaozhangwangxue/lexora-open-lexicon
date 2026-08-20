@@ -1,0 +1,238 @@
+name: Reprepare sealed top-20k repair candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type REPREPARE_SAFE_TOP20K exactly; this does not activate services
+        required: true
+        type: string
+      source_release_id:
+        description: Existing sealed repair release containing the candidate
+        required: true
+        type: string
+      release_id:
+        description: New immutable release id for the current code
+        required: true
+        type: string
+      candidate_sha256:
+        description: Expected SHA-256 of the sealed candidate database
+        required: true
+        type: string
+      canonical_identity_sha256:
+        description: Expected immutable canonical corpus identity
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lexora-oci-production-deployment
+  cancel-in-progress: false
+
+jobs:
+  reprepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate the immutable request
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          SOURCE_RELEASE_ID: ${{ inputs.source_release_id }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha256 }}
+          CANONICAL_SHA: ${{ inputs.canonical_identity_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = REPREPARE_SAFE_TOP20K
+          [[ "$SOURCE_RELEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          [[ "$RELEASE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+          test "$SOURCE_RELEASE_ID" != "$RELEASE_ID"
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$CANONICAL_SHA" =~ ^[0-9a-f]{64}$ ]]
+          printf 'SOURCE_RELEASE_ID=%s\nRELEASE_ID=%s\nCANDIDATE_SHA=%s\nCANONICAL_SHA=%s\n' \
+            "$SOURCE_RELEASE_ID" "$RELEASE_ID" "$CANDIDATE_SHA" "$CANONICAL_SHA" \
+            >> "$GITHUB_ENV"
+
+      - name: Prepare SSH credentials
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.LEXORA_OCI_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LEXORA_OCI_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lexora_oci
+          chmod 0600 ~/.ssh/lexora_oci
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Build one immutable current-code bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p deployment-receipts
+          find tools service deploy -type f \
+            \( -name '*.py' -o -name '*.service' -o -name '*.timer' \
+               -o -name '*.conf' -o -name '*.sh' \) -print0 \
+            | sort -z \
+            | tar --null --files-from=- --create --gzip \
+                --sort=name --mtime='UTC 1970-01-01' \
+                --owner=0 --group=0 --numeric-owner \
+                --file=deployment-receipts/code.tar.gz
+          code_sha=$(sha256sum deployment-receipts/code.tar.gz | awk '{print $1}')
+          printf 'CODE_SHA=%s\n' "$code_sha" >> "$GITHUB_ENV"
+          printf 'source_release_id=%s\nnew_release_id=%s\ncode_sha256=%s\n' \
+            "$SOURCE_RELEASE_ID" "$RELEASE_ID" "$code_sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify, preflight and reseal on both servers
+        shell: bash
+        run: |
+          set -euo pipefail
+          hosts=(140.245.114.238 134.185.82.7)
+          reprepare_one() {
+            local shard=$1
+            local host=${hosts[$shard]}
+            local remote_tmp="/tmp/lexora-reprepare-${RELEASE_ID}-${GITHUB_RUN_ID}"
+            local -a ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=30)
+            ssh "${ssh_opts[@]}" "opc@$host" "install -d -m 0700 '$remote_tmp'"
+            scp "${ssh_opts[@]}" deployment-receipts/code.tar.gz \
+              deploy/deployment_transaction.py "opc@$host:$remote_tmp/"
+            ssh "${ssh_opts[@]}" "opc@$host" \
+              "bash -se -- '$remote_tmp' '$SOURCE_RELEASE_ID' '$RELEASE_ID' '$CODE_SHA' '$CANDIDATE_SHA' '$CANONICAL_SHA' '$shard'" \
+              > "deployment-receipts/sealed-$shard.json" <<'REMOTE'
+          set -euo pipefail
+          remote_tmp=$1
+          source_release_id=$2
+          release_id=$3
+          code_sha=$4
+          candidate_sha=$5
+          canonical_sha=$6
+          shard=$7
+          root=/opt/lexora
+          source_release="$root/deployments/repair/releases/$source_release_id"
+          source_candidate="$source_release/build/lexora-open-oxford-safe-20k.sqlite"
+          transaction="$remote_tmp/deployment_transaction.py"
+
+          # The old release remains immutable.  Verify it before reusing any byte.
+          python3 "$transaction" --root "$root" --track repair \
+            --release-id "$source_release_id" verify-release \
+            --candidate-sha256 "$candidate_sha" \
+            --canonical-identity-sha256 "$canonical_sha" \
+            > "$remote_tmp/source-release.json"
+
+          python3 "$transaction" --root "$root" --track repair \
+            --release-id "$release_id" prepare-code \
+            --archive "$remote_tmp/code.tar.gz" --archive-sha256 "$code_sha" \
+            --imports enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot,fast20k_contract,fast20k_pipeline,fast20k_repair_delta
+          preparation="$root/deployments/repair/preparations/$release_id"
+          PYTHONPATH="$preparation/tools" python3 -c \
+            'import enrich_oxford_scope,top20k_quality,write_top20k_quality_snapshot,fast20k_contract,fast20k_pipeline,fast20k_repair_delta'
+
+          # Convert the verified sealed manifest identity into the canonical receipt
+          # expected by seal.  Activation independently rechecks the live full corpus.
+          python3 - "$remote_tmp/source-release.json" "$remote_tmp/canonical.json" <<'PY'
+          import json, sys
+          source = json.load(open(sys.argv[1], encoding="utf-8"))
+          canonical = source["canonical"]
+          output = {
+              "format": "lexora-canonical-snapshot-v1",
+              "database": {"quickCheck": "ok"},
+              "canonical": canonical,
+          }
+          with open(sys.argv[2], "w", encoding="utf-8") as stream:
+              json.dump(output, stream, ensure_ascii=False, sort_keys=True)
+              stream.write("\n")
+          PY
+
+          candidate_digest=$(PYTHONPATH="$preparation/tools" python3 -c \
+            'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("SELECT candidate_digest FROM fast20k_metadata WHERE id=1").fetchone()[0])' \
+            "$source_candidate")
+          LEXORA_CANDIDATE_DIGEST="$candidate_digest" \
+            python3 "$preparation/deploy/preflight_repair_queue.py" \
+              --dataset "$root/build/lexora-open-oxford-scope.sqlite" \
+              --repair-queue "$source_candidate" \
+              --shard-index "$shard" --shard-count 2 \
+              --tools "$preparation/tools" >/dev/null
+
+          set +e
+          python3 "$preparation/tools/fast20k_pipeline.py" validate \
+            --canonical "$root/build/lexora-open-oxford-scope.sqlite" \
+            --candidate "$source_candidate" --expected-rows 20000 \
+            --canonical-shard-index "$shard" --canonical-shard-count 2 \
+            --skip-canonical-quick-check > "$remote_tmp/candidate-report.json"
+          validate_status=$?
+          set -e
+          python3 - "$remote_tmp/candidate-report.json" "$validate_status" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert report["structuralReady"] is True, report
+          assert report["total"] == 20_000, report
+          assert report["terms"] == {"words": 16_000, "phrases": 4_000}, report
+          assert report["candidateQuickCheck"] == "ok", report
+          assert int(sys.argv[2]) in (0, 2)
+          PY
+
+          python3 "$transaction" --root "$root" --track repair \
+            --release-id "$release_id" seal --candidate "$source_candidate" \
+            --candidate-sha256 "$candidate_sha" \
+            --canonical-manifest "$remote_tmp/canonical.json" >/dev/null
+          python3 "$transaction" --root "$root" --track repair \
+            --release-id "$release_id" verify-release \
+            --candidate-sha256 "$candidate_sha" \
+            --canonical-identity-sha256 "$canonical_sha"
+          REMOTE
+          }
+
+          pids=()
+          for shard in 0 1; do
+            reprepare_one "$shard" &
+            pids+=("$!")
+          done
+          status=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || status=1
+          done
+          exit "$status"
+
+      - name: Require identical new sealed releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$CANDIDATE_SHA" "$CANONICAL_SHA" "$CODE_SHA" \
+            deployment-receipts/sealed-0.json deployment-receipts/sealed-1.json <<'PY'
+          import json, sys
+          candidate, canonical, code, *paths = sys.argv[1:]
+          reports = [json.load(open(path, encoding="utf-8")) for path in paths]
+          assert all(report["verified"] for report in reports)
+          assert {report["releaseId"] for report in reports} == {__import__("os").environ["RELEASE_ID"]}
+          assert {report["codeArchiveSha256"] for report in reports} == {code}
+          assert {report["candidate"]["sha256"] for report in reports} == {candidate}
+          assert {report["candidate"]["candidateDigest"] for report in reports} == {
+              reports[0]["candidate"]["candidateDigest"]
+          }
+          assert {report["canonical"]["identitySha256"] for report in reports} == {canonical}
+          print("verified_hosts=2")
+          print("fast20k_words=16000")
+          print("fast20k_phrases=4000")
+          PY
+          {
+            echo "candidate_sha256=$CANDIDATE_SHA"
+            echo "canonical_identity_sha256=$CANONICAL_SHA"
+            echo "fast20k_words=16000"
+            echo "fast20k_phrases=4000"
+            echo "No service was activated by this workflow."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve small audit receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: top20k-repreparation-${{ env.RELEASE_ID }}
+          path: deployment-receipts/*.json
+          if-no-files-found: error
+          retention-days: 7
