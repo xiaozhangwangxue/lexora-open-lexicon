@@ -660,6 +660,7 @@ def build_candidate(
     replace: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
     shard_count: int = DEFAULT_REPAIR_SHARDS,
+    verify_canonical_integrity: bool = True,
 ) -> dict[str, Any]:
     if limit < 1:
         raise ValueError("limit must be positive")
@@ -851,7 +852,12 @@ def build_candidate(
         source.close()
         source = None
 
-        report = candidate_quality_report(partial, canonical, expected_rows=limit)
+        report = candidate_quality_report(
+            partial,
+            canonical,
+            expected_rows=limit,
+            verify_canonical_integrity=verify_canonical_integrity,
+        )
         if not report["structuralReady"]:
             raise ValueError(
                 "candidate structural gate failed: "
@@ -1122,6 +1128,7 @@ def refresh_candidate_owner(
     shard_count: int,
     replace: bool = False,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    verify_canonical_integrity: bool = True,
 ) -> dict[str, Any]:
     """Refresh only one fixed owner's rows in an existing candidate.
 
@@ -1331,6 +1338,7 @@ def refresh_candidate_owner(
             expected_rows=int(metadata["expected_rows"]),
             canonical_shard_index=shard_index,
             canonical_shard_count=shard_count,
+            verify_canonical_integrity=verify_canonical_integrity,
         )
         if not report["structuralReady"]:
             raise ValueError(
@@ -1496,6 +1504,7 @@ def candidate_quality_report(
     batch_size: int = DEFAULT_BATCH_SIZE,
     canonical_shard_index: int | None = None,
     canonical_shard_count: int | None = None,
+    verify_canonical_integrity: bool = True,
 ) -> dict[str, Any]:
     if (canonical_shard_index is None) != (canonical_shard_count is None):
         raise ValueError(
@@ -1601,7 +1610,12 @@ def candidate_quality_report(
             raise ValueError(
                 "canonical schema missing columns: " + ",".join(missing_canonical)
             )
-        canonical_integrity = _quick_check(canonical_db, issues, "canonical_integrity")
+        if verify_canonical_integrity:
+            canonical_integrity = _quick_check(
+                canonical_db, issues, "canonical_integrity"
+            )
+        else:
+            canonical_integrity = "verified-by-corpus-identity-step"
 
         expected_queue: dict[int, tuple[int, int, str, str, list[str], int]] = {}
         last_kind_rank: dict[str, int] = {}
@@ -1888,6 +1902,7 @@ def main() -> None:
     select.add_argument("--phrase-target", type=int, default=DEFAULT_PHRASE_TARGET)
     select.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     select.add_argument("--repair-shards", type=int, default=DEFAULT_REPAIR_SHARDS)
+    select.add_argument("--skip-canonical-quick-check", action="store_true")
     select.add_argument("--replace", action="store_true")
     refresh = commands.add_parser("refresh")
     refresh.add_argument("--canonical", type=Path, required=True)
@@ -1902,6 +1917,7 @@ def main() -> None:
     refresh_owner.add_argument("--shard-index", type=int, required=True)
     refresh_owner.add_argument("--shard-count", type=int, required=True)
     refresh_owner.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    refresh_owner.add_argument("--skip-canonical-quick-check", action="store_true")
     refresh_owner.add_argument("--replace", action="store_true")
     validate = commands.add_parser("validate")
     validate.add_argument("--canonical", type=Path, required=True)
@@ -1909,6 +1925,7 @@ def main() -> None:
     validate.add_argument("--expected-rows", type=int, default=DEFAULT_LIMIT)
     validate.add_argument("--canonical-shard-index", type=int)
     validate.add_argument("--canonical-shard-count", type=int)
+    validate.add_argument("--skip-canonical-quick-check", action="store_true")
     args = parser.parse_args()
     if args.command == "select":
         report = build_candidate(
@@ -1919,6 +1936,7 @@ def main() -> None:
             replace=args.replace,
             batch_size=args.batch_size,
             shard_count=args.repair_shards,
+            verify_canonical_integrity=not args.skip_canonical_quick_check,
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
@@ -1941,6 +1959,7 @@ def main() -> None:
             shard_count=args.shard_count,
             replace=args.replace,
             batch_size=args.batch_size,
+            verify_canonical_integrity=not args.skip_canonical_quick_check,
         )
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
@@ -1950,6 +1969,7 @@ def main() -> None:
         expected_rows=args.expected_rows,
         canonical_shard_index=args.canonical_shard_index,
         canonical_shard_count=args.canonical_shard_count,
+        verify_canonical_integrity=not args.skip_canonical_quick_check,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if not report["ready"]:

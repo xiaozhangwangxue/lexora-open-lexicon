@@ -161,6 +161,7 @@ jobs:
             --canonical /opt/lexora/build/lexora-open-oxford-scope.sqlite \
             --output "$remote_tmp/candidate-host0.sqlite" \
             --limit 20000 --phrase-target 4000 \
+            --skip-canonical-quick-check \
             > "$remote_tmp/select-host0.json"
           REMOTE
           scp "${ssh_opts[@]}" \
@@ -179,6 +180,7 @@ jobs:
             --template "$remote_tmp/candidate-host0.sqlite" \
             --output "$remote_tmp/candidate-final.sqlite" \
             --shard-index 1 --shard-count 2 \
+            --skip-canonical-quick-check \
             > "$remote_tmp/refresh-owner-1.json"
           REMOTE
           scp "${ssh_opts[@]}" \
@@ -236,6 +238,7 @@ jobs:
             --canonical /opt/lexora/build/lexora-open-oxford-scope.sqlite \
             --candidate "$candidate" --expected-rows 20000 \
             --canonical-shard-index "$shard" --canonical-shard-count 2 \
+            --skip-canonical-quick-check \
             > "$remote_tmp/candidate-report-$shard.json"
           validate_status=$?
           set -e
