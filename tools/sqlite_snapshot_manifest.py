@@ -6,6 +6,7 @@ digest intentionally covers only immutable entry identity fields, allowing two
 collector replicas to have different enrichment progress while still proving
 that an exact-ID repair queue belongs to the same canonical corpus.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -25,11 +26,10 @@ IDENTITY_COLUMNS = (
     "word",
     "normalized_word",
     "frequency_rank",
-    # These fields determine lexical acceptance, phrase evidence and the
-    # candidate identity contract.  They are not repair outputs and therefore
-    # must agree between replicas before one shared candidate can be used.
-    "source_json",
-    "scope_json",
+    # Source/scope provenance is enriched independently on the fixed owner
+    # replica.  It is selected and validated from that owner, but it is not a
+    # corpus identity field and therefore must not make healthy replicas look
+    # like different dictionaries.
 )
 
 
@@ -90,7 +90,7 @@ def database_manifest(database_path: Path, *, include_file: bool) -> dict[str, A
                 + ", ".join(sorted(missing))
             )
         row_count, minimum, maximum = database.execute(
-            "SELECT count(*),COALESCE(MIN(id),0),COALESCE(MAX(id),-1) " "FROM entries"
+            "SELECT count(*),COALESCE(MIN(id),0),COALESCE(MAX(id),-1) FROM entries"
         ).fetchone()
         identity_rows = database.execute(
             "SELECT " + ",".join(IDENTITY_COLUMNS) + " FROM entries ORDER BY id"

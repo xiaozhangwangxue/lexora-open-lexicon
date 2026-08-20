@@ -11,14 +11,15 @@ Run **Prepare top-20k repair deployment** and type
 1. archives the complete `tools/`, `service/` and deployment dependency set;
 2. stages that archive in an immutable release directory on both OCI hosts and
    performs real Python imports from the staged directory;
-3. exports each live canonical database through SQLite's online backup API;
-4. requires the two immutable canonical identity digests and schemas to match;
-5. builds one candidate from the first consistent snapshot, accepts it only if
-   the structural repair gate passes, and uploads that exact file to both hosts;
+3. streams only the immutable corpus identity from both live WAL databases;
+4. requires the two immutable identity digests and schemas to match;
+5. selects exactly 16,000 common words plus 4,000 reliable phrases, then
+   refreshes shard 1's fixed-owner rows from its live database without copying
+   either multi-gigabyte canonical database;
 6. checks the candidate file SHA-256, `PRAGMA quick_check`, v3 candidate digest,
    fixed two-shard contract and provenance count before sealing each release;
-7. runs the complete fixed-owner shard preflight against each host's online
-   snapshot, so a mutable baseline mismatch is rejected before activation.
+7. runs the complete fixed-owner shard preflight against each live host, so a
+   mutable baseline mismatch is rejected before activation.
 
 The preparation workflow never calls `systemctl` and never changes a `current`
 link.  Its summary prints the release ID, candidate SHA-256 and canonical
@@ -52,15 +53,13 @@ to the active repair candidate digest and fixed modulo shard; a missing, stale
 or malformed snapshot is regenerated synchronously under the unit's 12-minute
 timeout before the deployment can succeed.
 
-## Snapshot manifest CLI
+## Canonical identity CLI
 
-Create an auditable consistent snapshot while SQLite is live:
+Create an auditable identity receipt while SQLite is live:
 
 ```sh
-python3 tools/sqlite_snapshot_manifest.py backup \
-  --source canonical.sqlite \
-  --snapshot snapshot.sqlite \
-  --manifest snapshot.json
+python3 tools/sqlite_snapshot_manifest.py identity \
+  --database canonical.sqlite > canonical.json
 ```
 
 Compare canonical identity across replicas whose mutable enrichment fields may
@@ -71,6 +70,7 @@ python3 tools/sqlite_snapshot_manifest.py compare \
   --manifests host-0.json host-1.json
 ```
 
-The manifest contains the exact snapshot file SHA/size, `quick_check`, schema
-digest, row bounds and a streamed digest of immutable entry identity fields.
-Existing snapshot and manifest paths are never overwritten.
+The manifest contains `quick_check`, schema digest, row bounds and a streamed
+digest of immutable entry identity fields. Mutable source/scope/enrichment
+fields are intentionally excluded from cross-replica identity and are instead
+validated from their fixed owner before sealing and again before activation.

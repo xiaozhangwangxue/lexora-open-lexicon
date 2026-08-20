@@ -25,33 +25,37 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertNotIn("rm -", workflow)
         self.assertNotIn("134.185.82.7", workflow)
 
-    def test_preparation_is_non_activating_and_compares_two_snapshots(self) -> None:
+    def test_preparation_is_non_activating_and_merges_fixed_owners(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "deploy-top20k-repair.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("PREPARE_SAFE_TOP20K", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
-        self.assertIn('sqlite_snapshot_manifest.py" backup', workflow)
+        self.assertNotIn('sqlite_snapshot_manifest.py" backup', workflow)
         self.assertIn("canonical-0.json", workflow)
         self.assertIn("canonical-1.json", workflow)
         self.assertIn("compare \\", workflow)
-        self.assertIn("merge-owned", workflow)
-        self.assertIn("canonical-shard-1.sqlite", workflow)
-        self.assertIn("canonical-owned.sqlite", workflow)
-        self.assertIn("scp -3", workflow)
+        self.assertIn("refresh-owner", workflow)
+        self.assertIn("--shard-index 1 --shard-count 2", workflow)
+        self.assertIn("candidate-host0.sqlite", workflow)
+        self.assertIn("candidate-final.sqlite", workflow)
+        self.assertNotIn("scp -3", workflow)
         self.assertIn("fast20k_repair_delta", workflow)
         self.assertIn("candidate_sha256", workflow)
         self.assertIn("structuralReady", workflow)
+        self.assertIn('{"words": 16_000, "phrases": 4_000}', workflow)
+        self.assertIn("--phrase-target 4000", workflow)
         self.assertNotIn("systemctl start", workflow)
         self.assertNotIn("systemctl enable", workflow)
 
-    def test_preparation_exports_both_large_snapshots_in_parallel(self) -> None:
+    def test_preparation_captures_both_small_identities_in_parallel(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "deploy-top20k-repair.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("timeout-minutes: 120", workflow)
-        self.assertIn('snapshot_one "$shard" &', workflow)
+        self.assertIn('prepare_one "$shard" &', workflow)
         self.assertIn('wait "$pid" || status=1', workflow)
+        self.assertNotIn("canonical-shard-1.sqlite", workflow)
 
     def test_activation_verifies_both_before_switch_and_has_rollback(self) -> None:
         workflow = (
@@ -169,13 +173,18 @@ class DeploymentWorkflowTest(unittest.TestCase):
             ROOT / ".github" / "workflows" / "deploy-top20k-repair.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("preflight_repair_queue.py", workflow)
-        self.assertIn('--dataset "$remote_tmp/canonical.sqlite"', workflow)
+        self.assertIn(
+            "--dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite",
+            workflow,
+        )
         self.assertIn('--shard-index "$shard"', workflow)
 
         quality_dropin = (
             ROOT / "deploy" / "lexora-top20k-quality-current.conf"
         ).read_text(encoding="utf-8")
-        self.assertIn("--candidate /opt/lexora/deployments/repair/current/", quality_dropin)
+        self.assertIn(
+            "--candidate /opt/lexora/deployments/repair/current/", quality_dropin
+        )
 
         control = (ROOT / "deploy" / "top20k_release_control.sh").read_text(
             encoding="utf-8"
@@ -204,7 +213,7 @@ class DeploymentWorkflowTest(unittest.TestCase):
             calls = root / "systemctl-calls"
             fake_systemctl = binary / "systemctl"
             fake_systemctl.write_text(
-                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$CALLS\"\nexit 99\n",
+                '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "$CALLS"\nexit 99\n',
                 encoding="utf-8",
             )
             fake_systemctl.chmod(0o755)
@@ -289,7 +298,7 @@ class DeploymentWorkflowTest(unittest.TestCase):
             calls = root / "systemctl-calls"
             fake_systemctl = binary / "systemctl"
             fake_systemctl.write_text(
-                "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> \"$CALLS\"\nexit 99\n",
+                '#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "$CALLS"\nexit 99\n',
                 encoding="utf-8",
             )
             fake_systemctl.chmod(0o755)
@@ -364,12 +373,8 @@ class DeploymentWorkflowTest(unittest.TestCase):
                 env=environment,
             )
             self.assertEqual(unavailable_restore.returncode, 0)
-            self.assertIn(
-                "reason=missing-capture-marker", unavailable_restore.stdout
-            )
-            self.assertEqual(
-                calls.read_text(encoding="utf-8"), calls_before_restore
-            )
+            self.assertIn("reason=missing-capture-marker", unavailable_restore.stdout)
+            self.assertEqual(calls.read_text(encoding="utf-8"), calls_before_restore)
 
     def test_interrupted_release_rollback_resumes_after_transaction_switch(
         self,
@@ -395,9 +400,9 @@ class DeploymentWorkflowTest(unittest.TestCase):
             fake_systemctl = binary / "systemctl"
             fake_systemctl.write_text(
                 "#!/usr/bin/env bash\n"
-                "printf '%s\\n' \"$*\" >> \"$CALLS\"\n"
-                "if [[ \"$*\" == daemon-reload && -f \"$FAIL_ONCE\" ]]; then\n"
-                "  rm -f -- \"$FAIL_ONCE\"\n"
+                'printf \'%s\\n\' "$*" >> "$CALLS"\n'
+                'if [[ "$*" == daemon-reload && -f "$FAIL_ONCE" ]]; then\n'
+                '  rm -f -- "$FAIL_ONCE"\n'
                 "  exit 1\n"
                 "fi\n"
                 "exit 0\n",
@@ -405,9 +410,7 @@ class DeploymentWorkflowTest(unittest.TestCase):
             )
             fake_systemctl.chmod(0o755)
             fake_sudo = binary / "sudo"
-            fake_sudo.write_text(
-                "#!/usr/bin/env bash\nexec \"$@\"\n", encoding="utf-8"
-            )
+            fake_sudo.write_text('#!/usr/bin/env bash\nexec "$@"\n', encoding="utf-8")
             fake_sudo.chmod(0o755)
             fake_flock = binary / "flock"
             fake_flock.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
