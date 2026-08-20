@@ -178,6 +178,32 @@ class DeploymentWorkflowTest(unittest.TestCase):
             "lexora-open-oxford-safe-20k.sqlite",
             workflow,
         )
+        self.assertIn(
+            "python3 /opt/lexora/deployments/repair/current/tools/"
+            "top20k_quality.py",
+            workflow,
+        )
+
+    def test_repair_activation_and_recovery_keep_daily_timer_active(self) -> None:
+        control = (ROOT / "deploy" / "top20k_release_control.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('run_systemctl enable --now "$timer"', control)
+
+        workflow = (
+            ROOT / ".github" / "workflows" / "ensure-top20k-repair-schedule.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('test "$actual" = "$CANDIDATE_SHA"', workflow)
+        self.assertIn('sudo systemctl enable --now "$timer"', workflow)
+        self.assertIn('test "$timer_active" = active', workflow)
+        self.assertIn('test "$timer_enabled" = enabled', workflow)
+        direct_systemctl = [
+            line
+            for line in workflow.splitlines()
+            if re.search(r"(?<![A-Za-z0-9_])systemctl\s", line)
+            and "sudo systemctl" not in line
+        ]
+        self.assertEqual(direct_systemctl, [])
 
     def test_web_parity_deploys_progress_validator_with_server(self) -> None:
         workflow = (

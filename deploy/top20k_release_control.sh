@@ -384,7 +384,9 @@ set +e
   sudo install -m 0644 "$release/deploy/lexora-top20k-repair-current.conf" \
     "$dropin_target"
   run_systemctl daemon-reload
-  run_systemctl enable "$timer"
+  # Enabling a timer does not activate it.  Start it as part of the atomic
+  # switch so the next daily repair remains scheduled after this run exits.
+  run_systemctl enable --now "$timer"
   # Stopping the old repair unit may execute its historical unconditional
   # ExecStopPost.  Reset both possible writers to the exact pre-deploy state
   # before the new unit captures and temporarily stops them.

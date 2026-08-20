@@ -47,7 +47,7 @@ jobs:
           sudo systemctl list-timers \
             lexora-top20k-repair@'${{ matrix.shard }}'.timer --no-pager || true
           echo "quality_report_begin=$(date -u +%FT%TZ)"
-          timeout 300s python3 /opt/lexora/tools/top20k_quality.py \
+          timeout 300s python3 /opt/lexora/deployments/repair/current/tools/top20k_quality.py \
             --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
             --candidate /opt/lexora/deployments/repair/current/build/lexora-open-oxford-safe-20k.sqlite \
             --shard-index '${{ matrix.shard }}' --shard-count 2 \
