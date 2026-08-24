@@ -267,6 +267,18 @@ class Fast20kPipelineTest(unittest.TestCase):
             lexical_rejection_reason("c'", "noun", ["kaikki"], {}),
             "unsupported_punctuation",
         )
+        self.assertEqual(
+            lexical_rejection_reason("of.", "preposition", ["kaikki"], {}),
+            "unsupported_punctuation",
+        )
+        self.assertEqual(
+            lexical_rejection_reason("to'a", "noun", ["kaikki"], {}),
+            "unsupported_apostrophe",
+        )
+        self.assertIsNone(
+            lexical_rejection_reason("dr.", "abbreviation", ["kaikki"], {})
+        )
+        self.assertIsNone(lexical_rejection_reason("we're", "verb", ["kaikki"], {}))
         self.assertIsNone(lexical_rejection_reason("students'", "noun", ["kaikki"], {}))
         self.assertNotEqual(term_key("u.s."), term_key("us"))
         self.assertNotEqual(term_key("people-to-people"), term_key("people to people"))

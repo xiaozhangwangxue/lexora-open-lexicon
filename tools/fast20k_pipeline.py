@@ -64,6 +64,7 @@ AFFIX_POS = {
     "combining_form",
 }
 ABBREVIATION_POS = {"abbr", "abbreviation", "acronym", "initialism"}
+CONTRACTION_TAILS = {"s", "t", "re", "ve", "ll", "d", "m"}
 PHRASE_POS = {
     "phrase",
     "prep_phrase",
@@ -316,11 +317,22 @@ def lexical_rejection_reason(
     )
     for token in tokens:
         if PLAIN_TOKEN.fullmatch(token):
+            for part in token.split("-"):
+                if "'" not in part or part.endswith("s'"):
+                    continue
+                pieces = part.split("'")
+                if len(pieces) != 2 or pieces[1] not in CONTRACTION_TAILS:
+                    return "unsupported_apostrophe"
             continue
         if (
             "." in token
-            and dot_evidence
-            and (INITIALISM.fullmatch(token) or SHORT_ABBREVIATION.fullmatch(token))
+            and (
+                (dot_evidence and INITIALISM.fullmatch(token))
+                or (
+                    bool(names & ABBREVIATION_POS)
+                    and SHORT_ABBREVIATION.fullmatch(token)
+                )
+            )
         ):
             continue
         return "unsupported_punctuation"
