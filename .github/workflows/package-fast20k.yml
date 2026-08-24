@@ -1,0 +1,315 @@
+name: Package quality-gated Fast 20k
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type PACKAGE_READY_FAST20K exactly
+        required: true
+        type: string
+      version:
+        description: Package version used in filenames, for example 2026.08.25
+        required: true
+        type: string
+      candidate_sha256:
+        description: SHA-256 of the already activated sealed candidate file
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lexora-fast20k-package
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate immutable inputs
+        shell: bash
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          PACKAGE_VERSION: ${{ inputs.version }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = PACKAGE_READY_FAST20K
+          [[ "$PACKAGE_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{64}$ ]]
+          {
+            printf 'PACKAGE_VERSION=%s\n' "$PACKAGE_VERSION"
+            printf 'CANDIDATE_SHA=%s\n' "$CANDIDATE_SHA"
+            printf 'REMOTE_TMP=/tmp/lexora-fast20k-%s\n' "$GITHUB_RUN_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare SSH credentials
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.LEXORA_OCI_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LEXORA_OCI_KNOWN_HOSTS }}
+        run: |
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/lexora_oci
+          chmod 0600 ~/.ssh/lexora_oci
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 0600 ~/.ssh/known_hosts
+
+      - name: Capture and gate both immutable repair-owner snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package-inputs package-receipts
+          hosts=(140.245.114.238 134.185.82.7)
+          capture_one() {
+            local shard=$1 host=${hosts[$1]}
+            local -a ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 -o ServerAliveInterval=30 \
+              -o ServerAliveCountMax=30)
+            ssh "${ssh_opts[@]}" "opc@$host" \
+              "REMOTE_TMP='$REMOTE_TMP' SHARD='$shard' CANDIDATE_SHA='$CANDIDATE_SHA' bash -se" <<'REMOTE'
+          set -euo pipefail
+          install -d -m 0700 "$REMOTE_TMP"
+          current=/opt/lexora/deployments/repair/current
+          tools="$current/tools"
+          dataset=/opt/lexora/build/lexora-open-oxford-scope.sqlite
+          candidate="$current/build/lexora-open-oxford-safe-20k.sqlite"
+          repair="lexora-top20k-repair@${SHARD}.service"
+          test -f "$dataset"
+          test -f "$candidate"
+          test "$(sha256sum "$candidate" | awk '{print $1}')" = "$CANDIDATE_SHA"
+          test "$(sudo systemctl is-active "$repair" || true)" = inactive
+          test "$(sudo systemctl show "$repair" -p Result --value)" = success
+          db_bytes=$(stat -c %s "$dataset")
+          free_bytes=$(df --output=avail -B1 /opt/lexora | tail -n 1 | tr -d ' ')
+          # Each host holds one online snapshot plus small delta/package
+          # staging. Refuse to begin unless there is ample headroom.
+          required_bytes=$((db_bytes + 2147483648))
+          test "$free_bytes" -ge "$required_bytes"
+          nice -n 19 ionice -c3 python3 "$tools/sqlite_snapshot_manifest.py" backup \
+            --source "$dataset" \
+            --snapshot "$REMOTE_TMP/canonical-$SHARD.sqlite" \
+            --manifest "$REMOTE_TMP/canonical-$SHARD.json" \
+            --pages 1024 --sleep 0.01
+          nice -n 19 ionice -c3 python3 "$tools/top20k_quality.py" \
+            --dataset "$REMOTE_TMP/canonical-$SHARD.sqlite" \
+            --candidate "$candidate" \
+            --shard-index "$SHARD" --shard-count 2 \
+            --unresolved-limit 20 --json > "$REMOTE_TMP/quality-$SHARD.json"
+          python3 - "$REMOTE_TMP/quality-$SHARD.json" "$SHARD" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          shard = int(sys.argv[2])
+          assert report["shardIndex"] == shard, report
+          assert report["shardCount"] == 2, report
+          assert report["incomplete"] == 0, report
+          assert report["complete"] == report["total"], report
+          assert report["missing"] == {
+              "definition": 0,
+              "definition_zh": 0,
+              "phonetic": 0,
+              "pos": 0,
+          }, report
+          PY
+          nice -n 19 ionice -c3 python3 "$tools/fast20k_repair_delta.py" export \
+            --dataset "$REMOTE_TMP/canonical-$SHARD.sqlite" \
+            --candidate "$candidate" \
+            --output "$REMOTE_TMP/repair-$SHARD.sqlite" \
+            --shard-index "$SHARD" --shard-count 2 \
+            > "$REMOTE_TMP/delta-$SHARD.json"
+          repair_sha=$(sha256sum "$REMOTE_TMP/repair-$SHARD.sqlite" | awk '{print $1}')
+          printf '%s  repair-%s.sqlite\n' "$repair_sha" "$SHARD" \
+            > "$REMOTE_TMP/repair-$SHARD.sqlite.sha256"
+          REMOTE
+            scp "${ssh_opts[@]}" \
+              "opc@$host:$REMOTE_TMP/repair-$shard.sqlite" \
+              "package-inputs/repair-$shard.sqlite"
+            scp "${ssh_opts[@]}" \
+              "opc@$host:$REMOTE_TMP/repair-$shard.sqlite.sha256" \
+              "package-inputs/repair-$shard.sqlite.sha256"
+            scp "${ssh_opts[@]}" \
+              "opc@$host:$REMOTE_TMP/quality-$shard.json" \
+              "package-receipts/quality-$shard.json"
+            scp "${ssh_opts[@]}" \
+              "opc@$host:$REMOTE_TMP/canonical-$shard.json" \
+              "package-receipts/canonical-$shard.json"
+          }
+          pids=()
+          for shard in 0 1; do
+            capture_one "$shard" &
+            pids+=("$!")
+          done
+          status=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || status=1
+          done
+          test "$status" = 0
+          (cd package-inputs && sha256sum -c repair-0.sqlite.sha256)
+          (cd package-inputs && sha256sum -c repair-1.sqlite.sha256)
+
+      - name: Validate the exact two-owner delta union
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=30)
+          scp "${ssh_opts[@]}" \
+            "opc@140.245.114.238:/opt/lexora/deployments/repair/current/build/lexora-open-oxford-safe-20k.sqlite" \
+            package-inputs/candidate.sqlite
+          test "$(sha256sum package-inputs/candidate.sqlite | awk '{print $1}')" \
+            = "$CANDIDATE_SHA"
+          python3 tools/fast20k_repair_delta.py validate-union \
+            --candidate package-inputs/candidate.sqlite \
+            package-inputs/repair-0.sqlite package-inputs/repair-1.sqlite \
+            | tee package-receipts/delta-union.json
+          python3 - package-receipts/delta-union.json <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert report["ready"] is True, report
+          assert report["actualRows"] == report["expectedRows"], report
+          assert {item["shardOwner"] for item in report["shards"]} == {0, 1}, report
+          PY
+
+      - name: Merge, refresh, gate and package on the primary build host
+        shell: bash
+        run: |
+          set -euo pipefail
+          host=140.245.114.238
+          ssh_opts=(-i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=120)
+          scp "${ssh_opts[@]}" \
+            package-inputs/repair-0.sqlite package-inputs/repair-1.sqlite \
+            "opc@$host:$REMOTE_TMP/"
+          ssh "${ssh_opts[@]}" "opc@$host" \
+            "REMOTE_TMP='$REMOTE_TMP' PACKAGE_VERSION='$PACKAGE_VERSION' CANDIDATE_SHA='$CANDIDATE_SHA' bash -se" <<'REMOTE'
+          set -euo pipefail
+          current=/opt/lexora/deployments/repair/current
+          tools="$current/tools"
+          candidate="$current/build/lexora-open-oxford-safe-20k.sqlite"
+          test "$(sha256sum "$candidate" | awk '{print $1}')" = "$CANDIDATE_SHA"
+          nice -n 19 ionice -c3 python3 "$tools/fast20k_repair_delta.py" validate-union \
+            --candidate "$candidate" \
+            "$REMOTE_TMP/repair-0.sqlite" "$REMOTE_TMP/repair-1.sqlite" \
+            > "$REMOTE_TMP/delta-union-host.json"
+          # The sealed candidate is the exact cross-host selected baseline.
+          # Apply the exact two-owner repair union to that baseline instead of
+          # choosing either server's divergent non-owner mutable fields.
+          nice -n 19 ionice -c3 python3 "$tools/fast20k_repair_delta.py" apply-union \
+            --canonical "$candidate" \
+            --candidate "$candidate" \
+            --output "$REMOTE_TMP/candidate-repaired.sqlite" \
+            "$REMOTE_TMP/repair-0.sqlite" "$REMOTE_TMP/repair-1.sqlite" \
+            > "$REMOTE_TMP/apply-union.json"
+          nice -n 19 ionice -c3 python3 "$tools/fast20k_pipeline.py" refresh \
+            --canonical "$REMOTE_TMP/candidate-repaired.sqlite" \
+            --template "$candidate" \
+            --output "$REMOTE_TMP/candidate-refreshed.sqlite" \
+            > "$REMOTE_TMP/refresh.json"
+          nice -n 19 ionice -c3 python3 "$tools/fast20k_pipeline.py" validate \
+            --canonical "$REMOTE_TMP/candidate-repaired.sqlite" \
+            --candidate "$REMOTE_TMP/candidate-refreshed.sqlite" \
+            --expected-rows 20000 > "$REMOTE_TMP/validate.json"
+          python3 - "$REMOTE_TMP/validate.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert report["ready"] is True, report
+          assert report["total"] == 20_000, report
+          assert report["complete"] == 20_000, report
+          assert report["incomplete"] == 0, report
+          assert report["terms"] == {"words": 16_000, "phrases": 4_000}, report
+          assert report["candidateQuickCheck"] == "ok", report
+          assert report["canonicalQuickCheck"] == "ok", report
+          assert report["ftsConsistent"] is True, report
+          PY
+          nice -n 19 ionice -c3 python3 "$tools/package_offline_lexicons.py" \
+            --source "$REMOTE_TMP/candidate-repaired.sqlite" \
+            --fast-source "$REMOTE_TMP/candidate-refreshed.sqlite" \
+            --output-dir "$REMOTE_TMP/release" \
+            --version "$PACKAGE_VERSION" --fast-only \
+            > "$REMOTE_TMP/package.json"
+          (cd "$REMOTE_TMP/release" && sha256sum * > SHA256SUMS)
+          REMOTE
+          mkdir -p fast20k-release
+          scp "${ssh_opts[@]}" "opc@$host:$REMOTE_TMP/release/*" fast20k-release/
+          for receipt in apply-union refresh validate package; do
+            scp "${ssh_opts[@]}" \
+              "opc@$host:$REMOTE_TMP/$receipt.json" package-receipts/
+          done
+
+      - name: Verify the downloaded release independently
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd fast20k-release && sha256sum -c SHA256SUMS)
+          gzip -t "fast20k-release/lexora-offline-fast20k-$PACKAGE_VERSION.sqlite.gz"
+          python3 - "$PACKAGE_VERSION" <<'PY'
+          import gzip, hashlib, json, shutil, sqlite3, sys, tempfile
+          from pathlib import Path
+          version = sys.argv[1]
+          root = Path("fast20k-release")
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          package = manifest["packages"]["fast20k"]
+          assert manifest["mode"] == "fast20k-only", manifest
+          assert package["rows"] == 20_000, package
+          assert manifest["fast20kQuality"]["ready"] is True, manifest
+          assert manifest["fast20kQuality"]["terms"] == {
+              "words": 16_000, "phrases": 4_000
+          }, manifest
+          archive = root / package["archive"]["filename"]
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == package["archive"]["sha256"]
+          with tempfile.TemporaryDirectory() as directory:
+              database_path = Path(directory) / "fast20k.sqlite"
+              with gzip.open(archive, "rb") as source, database_path.open("wb") as target:
+                  shutil.copyfileobj(source, target)
+              database = sqlite3.connect(database_path)
+              try:
+                  assert database.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+                  assert database.execute("SELECT count(*) FROM entries").fetchone()[0] == 20_000
+                  assert database.execute("SELECT count(*) FROM entries_fts").fetchone()[0] == 20_000
+              finally:
+                  database.close()
+          PY
+
+      - name: Upload the verified Fast 20k package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lexora-fast20k-${{ env.PACKAGE_VERSION }}
+          path: |
+            fast20k-release/*
+            package-receipts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record the verified package
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          Fast 20k package passed all gates.
+
+          - version: \`$PACKAGE_VERSION\`
+          - entries: \`20,000\`
+          - words: \`16,000\`
+          - phrases: \`4,000\`
+          - candidate file SHA-256: \`$CANDIDATE_SHA\`
+
+          This workflow uploaded an artifact only. It did not publish to R2 or
+          replace an existing offline release.
+          EOF
+
+      - name: Remove only this run's remote staging directories
+        if: ${{ always() && env.REMOTE_TMP != '' }}
+        shell: bash
+        run: |
+          hosts=(140.245.114.238 134.185.82.7)
+          for host in "${hosts[@]}"; do
+            ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=15 "opc@$host" \
+              "case '$REMOTE_TMP' in /tmp/lexora-fast20k-$GITHUB_RUN_ID) rm -rf -- '$REMOTE_TMP' ;; *) exit 2 ;; esac" \
+              || true
+          done
