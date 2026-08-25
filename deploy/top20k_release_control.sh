@@ -398,7 +398,11 @@ set +e
   # The fail-closed full-shard preflight reads thousands of rows before the
   # network process becomes ExecStart.  Allow that bounded local validation
   # to finish instead of treating a healthy low-power OCI host as failed.
-  for attempt in $(seq 1 180); do
+  # The same read-only owner-baseline validation has taken a little over five
+  # minutes on the smallest OCI host while SQLite was checkpointing.  Keep the
+  # gate intact and wait for its marker instead of rolling back a healthy run.
+  # Fifteen minutes is still bounded by the 90-minute coordinator job timeout.
+  for attempt in $(seq 1 900); do
     if service_ready_once; then
       if [[ "$(run_systemctl is-active "$service" || true)" == inactive ]]; then
         started=1
