@@ -280,7 +280,7 @@ class DeploymentWorkflowTest(unittest.TestCase):
         self.assertIn("--kind runtime", control)
         self.assertIn("ExecMainStartTimestampMonotonic", control)
         self.assertIn('consecutive" -ge 3', control)
-        self.assertIn("seq 1 180", control)
+        self.assertIn("seq 1 900", control)
         # The coordinator runs as the unprivileged deployment user.  Every
         # system service query must use the root systemd bus through the same
         # wrapper as mutations; plain `systemctl` otherwise targets an
