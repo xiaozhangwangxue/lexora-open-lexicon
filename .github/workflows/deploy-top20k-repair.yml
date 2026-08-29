@@ -48,6 +48,34 @@ jobs:
           printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 0600 ~/.ssh/known_hosts
 
+      - name: Pause scheduled repair writers during snapshot preparation
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Set this before touching either host so an error after the first
+          # stop still makes the always() cleanup restore both timers.
+          echo 'TIMERS_PAUSED=1' >> "$GITHUB_ENV"
+          hosts=(140.245.114.238 134.185.82.7)
+          for shard in 0 1; do
+            host=${hosts[$shard]}
+            ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=4 "opc@$host" \
+              "bash -se -- '$shard'" <<'REMOTE'
+          set -euo pipefail
+          shard=$1
+          service="lexora-top20k-repair@${shard}.service"
+          timer="lexora-top20k-repair@${shard}.timer"
+          # Stop only future scheduled starts. Never interrupt a repair that is
+          # already writing; fail closed and let a later run retry naturally.
+          sudo systemctl stop "$timer"
+          repair_state=$(sudo systemctl is-active "$service" || true)
+          test "$repair_state" = inactive
+          printf 'shard=%s repair=%s timer=%s\n' \
+            "$shard" "$repair_state" "$(sudo systemctl is-active "$timer" || true)"
+          REMOTE
+          done
+
       - name: Build one immutable code bundle
         shell: bash
         env:
@@ -315,6 +343,19 @@ jobs:
           - candidate_sha256: \`$CANDIDATE_SHA\`
           - canonical_identity_sha256: \`$CANONICAL_SHA\`
           EOF
+
+      - name: Restore scheduled repair timers
+        if: ${{ always() && env.TIMERS_PAUSED == '1' }}
+        shell: bash
+        run: |
+          hosts=(140.245.114.238 134.185.82.7)
+          for shard in 0 1; do
+            host=${hosts[$shard]}
+            ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 "opc@$host" \
+              "sudo systemctl start lexora-top20k-repair@${shard}.timer" \
+              || true
+          done
 
       - name: Remove only this workflow's remote temporary snapshots
         if: ${{ always() && env.RELEASE_ID != '' }}
