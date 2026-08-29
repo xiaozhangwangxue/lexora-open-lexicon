@@ -22,7 +22,10 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # A full two-replica identity scan plus both fixed-owner validations can
+    # legitimately exceed two hours on the free OCI shapes. Keep every gate,
+    # but allow the final seal to finish instead of cancelling mid-validation.
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v5
 
