@@ -68,8 +68,16 @@ jobs:
           timer="lexora-top20k-repair@${shard}.timer"
           # Stop only future scheduled starts. Never interrupt a repair that is
           # already writing; fail closed and let a later run retry naturally.
+          # A failed oneshot has already stopped writing, but systemd reports
+          # its terminal state as `failed` rather than `inactive`. Clear only
+          # that terminal state after stopping the timer, preserving the
+          # journal and allowing a new immutable preparation to continue.
           sudo systemctl stop "$timer"
           repair_state=$(sudo systemctl is-active "$service" || true)
+          if [[ "$repair_state" == failed ]]; then
+            sudo systemctl reset-failed "$service"
+            repair_state=$(sudo systemctl is-active "$service" || true)
+          fi
           test "$repair_state" = inactive
           printf 'shard=%s repair=%s timer=%s\n' \
             "$shard" "$repair_state" "$(sudo systemctl is-active "$timer" || true)"
