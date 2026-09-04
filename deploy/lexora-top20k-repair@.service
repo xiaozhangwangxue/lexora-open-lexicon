@@ -12,12 +12,9 @@ WorkingDirectory=/opt/lexora
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/opt/lexora/.env
 Environment=LEXORA_EDGE_URL=https://dict.12323456.xyz/internal
-# The sandboxed service cannot always hand stdout back to journald on the
-# free OCI images. Keep a small, shard-specific diagnostic trail in the
-# already writable state directory so a failed strict repair remains
-# diagnosable instead of losing its Python error before rollback.
-StandardOutput=append:/opt/lexora/state/top20k-repair-shard-%i.log
-StandardError=append:/opt/lexora/state/top20k-repair-shard-%i.log
+# Do not use StandardOutput=file here: systemd opens that target before the
+# sandbox grants ReadWritePaths and rejects it on the free OCI image. The
+# current-release wrapper redirects only after it starts instead.
 ExecStart=/usr/bin/python3 /opt/lexora/tools/enrich_oxford_scope.py \
   --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
   --state /opt/lexora/state/top20k-repair-shard-%i.sqlite \
