@@ -60,6 +60,37 @@ jobs:
           printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 0600 ~/.ssh/known_hosts
 
+      - name: Pause scheduled repair writers for the sealed-candidate check
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A sealed candidate is a content snapshot, whereas the corpus
+          # identity intentionally excludes mutable dictionary fields.  Do not
+          # let a timer change those fields while the lengthy verification and
+          # startup gates run.  Never interrupt an already-writing repair: an
+          # operator can retry after its natural completion.
+          echo 'TIMERS_PAUSED=1' >> "$GITHUB_ENV"
+          hosts=(140.245.114.238 134.185.82.7)
+          for shard in 0 1; do
+            host=${hosts[$shard]}
+            ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=4 "opc@$host" \
+              "bash -se -- '$shard'" <<'REMOTE'
+          set -euo pipefail
+          shard=$1
+          service="lexora-top20k-repair@${shard}.service"
+          timer="lexora-top20k-repair@${shard}.timer"
+          sudo systemctl stop "$timer"
+          state=$(sudo systemctl is-active "$service" || true)
+          if [[ "$state" == failed ]]; then
+            sudo systemctl reset-failed "$service"
+            state=$(sudo systemctl is-active "$service" || true)
+          fi
+          test "$state" = inactive
+          REMOTE
+          done
+
       - name: Verify both sealed releases before changing either host
         shell: bash
         run: |
@@ -73,13 +104,14 @@ jobs:
             ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
               -o ConnectTimeout=30 -o ServerAliveInterval=15 \
               -o ServerAliveCountMax=120 "opc@$host" \
-              "bash -se -- '$release' '$RELEASE_ID' '$CANDIDATE_SHA' '$CANONICAL_SHA'" \
+              "bash -se -- '$release' '$RELEASE_ID' '$CANDIDATE_SHA' '$CANONICAL_SHA' '$shard'" \
               > "activation-receipts/preflight-$shard.json" <<'REMOTE'
           set -euo pipefail
           release=$1
           release_id=$2
           candidate_sha=$3
           canonical_sha=$4
+          shard=$5
           current_identity=$(python3 \
             "$release/tools/sqlite_snapshot_manifest.py" identity \
             --database /opt/lexora/build/lexora-open-oxford-scope.sqlite \
@@ -89,6 +121,18 @@ jobs:
             --root /opt/lexora --track repair --release-id "$release_id" \
             verify-release --candidate-sha256 "$candidate_sha" \
             --canonical-identity-sha256 "$canonical_sha"
+          candidate="$release/build/lexora-open-oxford-safe-20k.sqlite"
+          candidate_digest=$(PYTHONPATH="$release/tools" python3 -c \
+            'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); print(db.execute("SELECT candidate_digest FROM fast20k_metadata WHERE id=1").fetchone()[0])' \
+            "$candidate")
+          # Verify the live owner rows now, before either systemd unit is
+          # switched.  The service repeats this gate at startup as defence in
+          # depth; this earlier check makes a stale snapshot a harmless no-op.
+          LEXORA_CANDIDATE_DIGEST="$candidate_digest" \
+            python3 "$release/deploy/preflight_repair_queue.py" \
+              --dataset /opt/lexora/build/lexora-open-oxford-scope.sqlite \
+              --repair-queue "$candidate" --shard-index "$shard" \
+              --shard-count 2 --tools "$release/tools" >/dev/null
           REMOTE
           }
           pids=()
@@ -160,3 +204,15 @@ jobs:
           done
           trap - ERR
           printf 'activated_hosts=%s\n' "${activated[*]}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore scheduled repair timers
+        if: ${{ always() && env.TIMERS_PAUSED == '1' }}
+        shell: bash
+        run: |
+          hosts=(140.245.114.238 134.185.82.7)
+          for shard in 0 1; do
+            host=${hosts[$shard]}
+            ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+              -o ConnectTimeout=30 "opc@$host" \
+              "sudo systemctl start lexora-top20k-repair@${shard}.timer" || true
+          done
