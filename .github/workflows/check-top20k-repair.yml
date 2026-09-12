@@ -56,4 +56,9 @@ jobs:
           echo "quality_report_end=$(date -u +%FT%TZ)"
           timeout 10s sudo journalctl -u lexora-top20k-repair@'${{ matrix.shard }}'.service \
             -n 12 --no-pager || echo "journal=busy_or_timed_out"
+          echo "repair_log_tail_begin"
+          timeout 10s tail -n 80 \
+            "/opt/lexora/state/top20k-repair-shard-${{ matrix.shard }}.log" \
+            || echo "repair_log=unavailable"
+          echo "repair_log_tail_end"
           REMOTE
