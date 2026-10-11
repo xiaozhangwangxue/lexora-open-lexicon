@@ -58,7 +58,7 @@ jobs:
           shard='${{ matrix.shard }}'
           stamp=$(date -u +%Y%m%dT%H%M%SZ)
           collector="lexora-enrich-micro@${shard}.service"
-          collector_before=$(systemctl is-active "$collector" || true)
+          collector_before=$(sudo systemctl is-active "$collector" || true)
 
           sudo install -d -o opc -g opc -m 0755 /opt/lexora/service
           for file in server.py progress_validation.py web_documents.py web_pdf.py; do
@@ -82,7 +82,7 @@ jobs:
           (cd /opt/lexora && python3 -c \
             'import service.server; from service.progress_validation import validate_top20k_quality_snapshot')
 
-          if systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
+          if sudo systemctl list-unit-files lexora-lexicon-micro.service --no-legend \
             | grep -q lexora-lexicon-micro; then
             api_unit=lexora-lexicon-micro.service
           else
@@ -98,8 +98,8 @@ jobs:
             sleep 1
           done
           cat /tmp/lexora-health.json
-          systemctl is-active "$api_unit"
-          collector_after=$(systemctl is-active "$collector" || true)
+          sudo systemctl is-active "$api_unit"
+          collector_after=$(sudo systemctl is-active "$collector" || true)
           printf 'collector_before=%s\ncollector_after=%s\n' \
             "$collector_before" "$collector_after"
           test "$collector_before" = "$collector_after"
