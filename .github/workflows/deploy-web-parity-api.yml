@@ -104,3 +104,20 @@ jobs:
             "$collector_before" "$collector_after"
           test "$collector_before" = "$collector_after"
           REMOTE
+
+      - name: Diagnose non-systemd runtime
+        if: failure()
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/lexora_oci -o IdentitiesOnly=yes \
+            -o ConnectTimeout=30 "opc@${{ matrix.host }}" \
+            'bash -se' <<'REMOTE'
+          set -u
+          printf '%s\n' '--- pid 1 ---'
+          ps -p 1 -o pid=,ppid=,user=,lstart=,args= || true
+          printf '%s\n' '--- api processes ---'
+          ps -eo pid=,ppid=,user=,lstart=,args= \
+            | grep -E '[u]vicorn|[s]ervice\.server|[g]unicorn' || true
+          printf '%s\n' '--- listeners ---'
+          sudo ss -lntp '( sport = :8080 )' || true
+          REMOTE
