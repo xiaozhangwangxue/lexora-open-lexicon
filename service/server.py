@@ -231,6 +231,10 @@ def lookup(term: str = Query(min_length=1, max_length=120), dataset: str = "oxfo
 class PdfRequest(BaseModel):
     title: str = Field(default="My vocabulary book", max_length=60)
     terms: list[str] = Field(min_length=1)
+    # New clients resolve entries in parallel through Cloudflare and send the
+    # ready dictionary payload here. Older clients can omit this field and use
+    # the existing database lookup path below.
+    entries: list[dict[str, Any]] = Field(default_factory=list, max_length=2000)
     fontPreset: str = "medium"
     examples: int = Field(default=1, ge=0, le=3)
     format: str = "pdf"
@@ -273,6 +277,42 @@ class PdfRequest(BaseModel):
             raise ValueError("invalid page size")
         return value.lower()
 
+
+def resolve_pdf_entries(payload: PdfRequest) -> tuple[list[dict[str, Any]], list[str]]:
+    """Prefer client-prefetched entries and preserve the legacy lookup path."""
+    entries: list[dict[str, Any]] = []
+    missing: list[str] = []
+    supplied_entries: dict[str, dict[str, Any]] = {}
+    for raw_entry in payload.entries:
+        raw_term = str(
+            raw_entry.get("requested_term")
+            or raw_entry.get("normalized_word")
+            or raw_entry.get("word")
+            or ""
+        )
+        normalized_term = re.sub(r"\s+", " ", raw_term.strip().lower())
+        if normalized_term and raw_entry.get("definition"):
+            supplied_entries[normalized_term] = dict(raw_entry)
+    for term in payload.terms:
+        supplied = supplied_entries.get(term)
+        if supplied is not None:
+            supplied["requested_term"] = term
+            entries.append(supplied)
+            continue
+        if payload.entries:
+            missing.append(term)
+            continue
+        try:
+            entry = lookup_entry(term)
+            entry["requested_term"] = term
+            entries.append(entry)
+        except HTTPException as error:
+            if error.status_code == 404:
+                missing.append(term)
+            else:
+                raise
+    return entries, missing
+
 @app.get("/v1/web/quota")
 def web_quota(request: Request):
     identity = client_hash(request)
@@ -312,18 +352,7 @@ def web_generate(payload: PdfRequest, request: Request, background_tasks: Backgr
     if not PDF_SEMAPHORE.acquire(blocking=False):
         raise HTTPException(503, "PDF service is busy; please retry shortly")
     try:
-        entries = []
-        missing = []
-        for term in payload.terms:
-            try:
-                entry = lookup_entry(term)
-                entry["requested_term"] = term
-                entries.append(entry)
-            except HTTPException as error:
-                if error.status_code == 404:
-                    missing.append(term)
-                else:
-                    raise
+        entries, missing = resolve_pdf_entries(payload)
         if not entries:
             raise HTTPException(422, "no terms could be found")
         from service.web_documents import build_document
